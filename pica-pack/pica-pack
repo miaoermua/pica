@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PICA_VERSION_DEFAULT="0.0.1"
+
+msg() {
+  echo "==> $*"
+}
+
+msg2() {
+  echo "  -> $*"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pica-pack build <staging_dir> [--outdir DIR]
+
+staging_dir must contain:
+  - manifest
+  - binary/ (can be empty)
+  - cmd/    (can be empty)
+
+Package filename:
+  <pkgname>-<pkgver>-<platform>.pkg.tar.gz
+
+Manifest format (Arch-like key/value lines):
+  pkgname = demo
+  pkgver = 1.0.0-1
+  platform = ramips_24kec
+  pica = 0.0.1
+  (optional) pkgdesc/url/packager/builddate/size
+  (repeatable) opkg/binary/cmd/depend
+EOF
+}
+
+die() {
+  echo "pica-pack: $*" >&2
+  exit 1
+}
+
+manifest_get_first() {
+  local manifest_file="$1"
+  local key="$2"
+  awk -F'=' -v k="$key" '
+    $0 ~ /^[[:space:]]*#/ { next }
+    NF < 2 { next }
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+      if ($1 != k) next
+      v = $2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      print v
+      exit
+    }
+  ' "$manifest_file"
+}
+
+main_build() {
+  local staging_dir="$1"
+  shift
+
+  local outdir="."
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --outdir)
+        outdir="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown arg: $1"
+        ;;
+    esac
+  done
+
+  [[ -d "$staging_dir" ]] || die "not a directory: $staging_dir"
+  [[ -f "$staging_dir/manifest" ]] || die "missing manifest in $staging_dir"
+  [[ -d "$staging_dir/binary" ]] || die "missing binary/ in $staging_dir"
+  [[ -d "$staging_dir/cmd" ]] || die "missing cmd/ in $staging_dir"
+
+  local manifest_file="$staging_dir/manifest"
+  local pkgname pkgver platform pica
+  pkgname="$(manifest_get_first "$manifest_file" pkgname)"
+  pkgver="$(manifest_get_first "$manifest_file" pkgver)"
+  platform="$(manifest_get_first "$manifest_file" platform)"
+  pica="$(manifest_get_first "$manifest_file" pica)"
+
+  [[ -n "$pkgname" ]] || die "manifest missing pkgname"
+  [[ -n "$pkgver" ]] || die "manifest missing pkgver"
+  [[ -n "$platform" ]] || die "manifest missing platform"
+  [[ -n "$pica" ]] || die "manifest missing pica (expected ${PICA_VERSION_DEFAULT})"
+
+  local pkgfile="${pkgname}-${pkgver}-${platform}.pkg.tar.gz"
+  mkdir -p "$outdir"
+
+  # Keep archive root clean: only binary/, cmd/, manifest.
+  msg "Making package: $pkgname $pkgver ($platform)"
+  msg2 "Pica version: $pica"
+  msg2 "Creating archive..."
+  tar -C "$staging_dir" -czf "$outdir/$pkgfile" manifest binary cmd
+  msg "Finished: $outdir/$pkgfile"
+  echo "$outdir/$pkgfile"
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 2
+  fi
+
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    build)
+      [[ $# -ge 1 ]] || die "build requires <staging_dir>"
+      main_build "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

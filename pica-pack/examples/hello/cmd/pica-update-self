@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# Example "cmd/" helper: update/install a pica package from a local file.
+#
+# This mimics pacman -U usage: the caller passes a .pkg.tar.gz.
+
+if [ $# -lt 1 ]; then
+  echo "usage: pica-update-self <pkgfile>" >&2
+  exit 2
+fi
+
+pica -U "$1"
+exit $?
+

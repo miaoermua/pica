@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PICA_VERSION="0.0.1"
+
+PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
+PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
+
+PICA_STATE_DIR="${PICA_STATE_DIR:-/var/lib/pica}"
+PICA_DB_FILE="${PICA_DB_FILE:-${PICA_STATE_DIR}/db.json}"
+PICA_INDEX_FILE="${PICA_INDEX_FILE:-${PICA_STATE_DIR}/index.json}"
+PICA_CACHE_DIR="${PICA_CACHE_DIR:-${PICA_STATE_DIR}/cache}"
+PICA_REPOS_CACHE_DIR="${PICA_REPOS_CACHE_DIR:-${PICA_CACHE_DIR}/repos}"
+
+log_info() {
+  echo ":: $*"
+}
+
+log_warn() {
+  echo "warning: $*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pica -S                 Sync (download repo.json and update index)
+  pica -U <pkgfile>       Install/Update from .pkg.tar.gz
+  pica -R <pkgname>       Remove package (no dependency handling)
+  pica -Q                 List installed pica packages
+  pica --version
+
+Notes:
+  - Requires: opkg, jq, tar
+  - Config: /etc/pica/pica.json
+  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json
+EOF
+}
+
+die() {
+  echo "pica: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+need_any_cmd() {
+  local ok=1
+  local name
+  for name in "$@"; do
+    if command -v "$name" >/dev/null 2>&1; then
+      ok=0
+      break
+    fi
+  done
+  if [[ "$ok" -ne 0 ]]; then
+    die "missing required command (need one of: $*)"
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$PICA_ETC_DIR" "$PICA_STATE_DIR" "$PICA_CACHE_DIR" "$PICA_REPOS_CACHE_DIR"
+  if [[ ! -f "$PICA_CONF_FILE" ]]; then
+    cat >"$PICA_CONF_FILE" <<'JSON'
+{
+  "repos": []
+}
+JSON
+  fi
+
+  if [[ ! -f "$PICA_DB_FILE" ]]; then
+    cat >"$PICA_DB_FILE" <<'JSON'
+{
+  "schema": 1,
+  "installed": {}
+}
+JSON
+  fi
+
+  if [[ ! -f "$PICA_INDEX_FILE" ]]; then
+    cat >"$PICA_INDEX_FILE" <<'JSON'
+{
+  "schema": 1,
+  "repos": {}
+}
+JSON
+  fi
+}
+
+detect_platform() {
+  # Prefer OpenWrt release info; fall back to uname.
+  if [[ -f /etc/openwrt_release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/openwrt_release 2>/dev/null || true
+    if [[ -n "${DISTRIB_TARGET:-}" ]]; then
+      echo "$DISTRIB_TARGET"
+      return 0
+    fi
+  fi
+  uname -m
+}
+
+fetch_url() {
+  local url="$1"
+  if [[ "$url" == file://* ]]; then
+    cat "${url#file://}"
+    return $?
+  fi
+  if command -v uclient-fetch >/dev/null 2>&1; then
+    uclient-fetch -O - "$url"
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- "$url"
+    return $?
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url"
+    return $?
+  fi
+  die "no fetch tool found (need uclient-fetch, wget, or curl)"
+}
+
+db_set_installed() {
+  local pkgname="$1"
+  local manifest_json="$2"
+  local pkgfile="$3"
+  local now
+  now="$(date +%s)"
+
+  jq --arg pkgname "$pkgname" \
+     --arg pkgfile "$pkgfile" \
+     --arg now "$now" \
+     --argjson manifest "$manifest_json" \
+     '.installed[$pkgname] = {manifest: $manifest, pkgfile: $pkgfile, installed_at: ($now|tonumber)}' \
+     "$PICA_DB_FILE" >"$PICA_DB_FILE.tmp"
+  mv "$PICA_DB_FILE.tmp" "$PICA_DB_FILE"
+}
+
+db_del_installed() {
+  local pkgname="$1"
+  jq --arg pkgname "$pkgname" 'del(.installed[$pkgname])' "$PICA_DB_FILE" >"$PICA_DB_FILE.tmp"
+  mv "$PICA_DB_FILE.tmp" "$PICA_DB_FILE"
+}
+
+manifest_to_json() {
+  # Convert key = value lines (Arch-like) into JSON. Repeated keys become arrays.
+  local manifest_file="$1"
+  jq -Rn --slurpfile lines <(sed -e 's/\r$//' "$manifest_file") '
+    def trim: gsub("^\\s+|\\s+$"; "");
+    def parse_line($l):
+      ($l | sub("#.*$"; "") | trim) as $x
+      | if ($x|length)==0 then empty else $x end
+      | (capture("^(?<k>[^=]+)=(?<v>.*)$")?)
+      | if . == null then empty else {k:(.k|trim), v:(.v|trim)} end;
+
+    reduce ($lines[0][] | parse_line(.)) as $kv
+      ({};
+        if has($kv.k) then
+          .[$kv.k] = (
+            if (.[$kv.k] | type) == "array" then .[$kv.k] + [$kv.v]
+            else [.[ $kv.k ], $kv.v]
+            end
+          )
+        else
+          .[$kv.k] = $kv.v
+        end
+      )
+  '
+}
+
+manifest_get_first() {
+  local manifest_json="$1"
+  local key="$2"
+  jq -r --arg k "$key" '
+    .[$k] as $v |
+    if $v == null then ""
+    elif ($v|type)=="array" then ($v[0] // "")
+    else ($v|tostring)
+    end
+  ' <<<"$manifest_json"
+}
+
+manifest_get_array() {
+  local manifest_json="$1"
+  local key="$2"
+  jq -r --arg k "$key" '
+    .[$k] as $v |
+    if $v == null then empty
+    elif ($v|type)=="array" then .[$k][]
+    else (.[$k]|tostring)
+    end
+  ' <<<"$manifest_json"
+}
+
+sync_repos() {
+  ensure_dirs
+  log_info "Synchronizing package databases..."
+
+  local repo_count
+  repo_count="$(jq -r '.repos | length' "$PICA_CONF_FILE" 2>/dev/null || echo 0)"
+  if [[ "$repo_count" == "0" ]]; then
+    die "no repos configured in $PICA_CONF_FILE"
+  fi
+
+  local now platform
+  now="$(date +%s)"
+  platform="$(detect_platform)"
+
+  local i
+  for ((i=0; i<repo_count; i++)); do
+    local name url repo_platform repo_json_file tmp
+    name="$(jq -r --argjson i "$i" '.repos[$i].name // empty' "$PICA_CONF_FILE")"
+    url="$(jq -r --argjson i "$i" '.repos[$i].url // empty' "$PICA_CONF_FILE")"
+    repo_platform="$(jq -r --argjson i "$i" '.repos[$i].platform // empty' "$PICA_CONF_FILE")"
+
+    [[ -n "$name" ]] || die "repo[$i] missing name"
+    [[ -n "$url" ]] || die "repo[$i] missing url"
+
+    repo_json_file="$PICA_REPOS_CACHE_DIR/$name.json"
+    tmp="$repo_json_file.tmp"
+
+    log_info "$name downloading..."
+    if ! fetch_url "${url%/}/repo.json" >"$tmp"; then
+      rm -f "$tmp" || true
+      die "$name: failed to download repo.json"
+    fi
+    if ! jq -e . >/dev/null 2>&1 <"$tmp"; then
+      rm -f "$tmp" || true
+      die "$name: invalid repo.json"
+    fi
+    mv "$tmp" "$repo_json_file"
+
+    jq --arg name "$name" \
+       --arg url "$url" \
+       --arg platform "$platform" \
+       --arg repo_platform "$repo_platform" \
+       --arg now "$now" \
+       --slurpfile repo "$repo_json_file" '
+      .repos[$name] = {
+        name: $name,
+        url: $url,
+        updated_at: ($now|tonumber),
+        platform: (if ($repo_platform|length)>0 then $repo_platform else $platform end),
+        data: $repo[0]
+      }
+    ' "$PICA_INDEX_FILE" >"$PICA_INDEX_FILE.tmp"
+    mv "$PICA_INDEX_FILE.tmp" "$PICA_INDEX_FILE"
+
+    log_info "$name updated"
+  done
+}
+
+install_pkgfile() {
+  local pkgfile="$1"
+  [[ -f "$pkgfile" ]] || die "pkgfile not found: $pkgfile"
+
+  ensure_dirs
+
+  log_info "Loading package files..."
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  tar -xzf "$pkgfile" -C "$tmpdir"
+  [[ -f "$tmpdir/manifest" ]] || die "package missing manifest"
+  [[ -d "$tmpdir/binary" ]] || die "package missing binary/"
+  [[ -d "$tmpdir/cmd" ]] || die "package missing cmd/"
+
+  local manifest_json pkgname pica
+  manifest_json="$(manifest_to_json "$tmpdir/manifest")"
+  pkgname="$(manifest_get_first "$manifest_json" pkgname)"
+  pica="$(manifest_get_first "$manifest_json" pica)"
+  local pkg_platform
+  pkg_platform="$(manifest_get_first "$manifest_json" platform)"
+  [[ -n "$pkgname" ]] || die "manifest missing pkgname"
+  [[ -n "$pica" ]] || die "manifest missing pica"
+  [[ -n "$pkg_platform" ]] || die "manifest missing platform"
+  [[ "$pica" == "$PICA_VERSION" ]] || die "incompatible pica version: pkg=$pica cli=$PICA_VERSION"
+
+  local host_platform
+  host_platform="$(detect_platform)"
+  case "$pkg_platform" in
+    any|all|openwrt-any) : ;;
+    "$host_platform") : ;;
+    *)
+      die "unsupported platform: pkg=$pkg_platform host=$host_platform"
+      ;;
+  esac
+
+  log_info "Installing $pkgname..."
+
+  # 1) install opkg deps (best-effort, no dependency tracking)
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    opkg update >/dev/null 2>&1 || true
+    opkg install "$dep" || die "opkg install depend failed: $dep"
+  done < <(manifest_get_array "$manifest_json" depend || true)
+
+  # 2) install bundled ipks in binary/
+  local ipk
+  shopt -s nullglob
+  for ipk in "$tmpdir/binary"/*.ipk; do
+    opkg install "$ipk" || die "opkg install ipk failed: $ipk"
+  done
+  shopt -u nullglob
+
+  # 3) install cmd/ payload to /usr/bin
+  mkdir -p /usr/bin
+  if command -v cp >/dev/null 2>&1; then
+    cp -a "$tmpdir/cmd/." /usr/bin/
+  else
+    # very minimal fallback
+    tar -C "$tmpdir/cmd" -cf - . | tar -C /usr/bin -xf -
+  fi
+
+  db_set_installed "$pkgname" "$manifest_json" "$(readlink -f "$pkgfile" 2>/dev/null || echo "$pkgfile")"
+  log_info "Transaction completed"
+}
+
+remove_pkg() {
+  local pkgname="$1"
+  ensure_dirs
+
+  local manifest_json
+  manifest_json="$(jq -c --arg pkgname "$pkgname" '.installed[$pkgname].manifest // empty' "$PICA_DB_FILE")"
+  [[ -n "$manifest_json" ]] || die "not installed: $pkgname"
+
+  log_info "Removing $pkgname..."
+
+  # remove cmd files if listed, else do nothing (avoid deleting unknown files)
+  # We support optional 'cmd' entries in manifest listing relative filenames.
+  while IFS= read -r cmdpath; do
+    [[ -z "$cmdpath" ]] && continue
+    log_info "removing file: /usr/bin/$cmdpath"
+    rm -f "/usr/bin/$cmdpath" || true
+  done < <(manifest_get_array "$manifest_json" cmd || true)
+
+  # remove opkg packages if listed explicitly (optional)
+  while IFS= read -r opkg_name; do
+    [[ -z "$opkg_name" ]] && continue
+    log_info "removing opkg package: $opkg_name"
+    opkg remove "$opkg_name" || die "opkg remove failed: $opkg_name"
+  done < <(manifest_get_array "$manifest_json" opkg || true)
+
+  db_del_installed "$pkgname"
+  log_info "Transaction completed"
+}
+
+query_installed() {
+  ensure_dirs
+  jq -r '
+    .installed
+    | to_entries
+    | sort_by(.key)
+    | .[]
+    | "\(.key)\t\(.value.manifest.pkgver // \"\")\t\(.value.manifest.platform // \"\")"
+  ' "$PICA_DB_FILE"
+}
+
+main() {
+  need_cmd jq
+  need_cmd tar
+  need_any_cmd uclient-fetch wget curl
+
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 2
+  fi
+
+  case "$1" in
+    --version)
+      echo "$PICA_VERSION"
+      ;;
+    -S)
+      sync_repos
+      ;;
+    -U)
+      need_cmd opkg
+      [[ $# -ge 2 ]] || die "-U requires <pkgfile>"
+      install_pkgfile "$2"
+      ;;
+    -R)
+      need_cmd opkg
+      [[ $# -ge 2 ]] || die "-R requires <pkgname>"
+      remove_pkg "$2"
+      ;;
+    -Q)
+      query_installed
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "unknown arg: $1"
+      ;;
+  esac
+}
+
+main "$@"
+
+exit 0

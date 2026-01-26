@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Example "cmd/" helper: call pica to sync repos
+
+pica -S
+exit $?
+

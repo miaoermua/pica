@@ -1,0 +1,20 @@
+pkgname = hello
+pkgver = 0.1.0-1
+pkgdesc = Example package
+url = https://example.invalid
+packager = pica-pack
+builddate = 0
+size = 0
+
+platform = openwrt-any
+pica = 0.0.1
+
+# If your package needs opkg deps, list them (optional):
+depend = busybox
+
+# If you bundle opkg ipks in binary/, list them here (optional):
+# opkg = luci
+
+# Optional: if you want pica -R to delete installed /usr/bin files safely,
+# list them explicitly (relative paths under /usr/bin):
+cmd = hello
