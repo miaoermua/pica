@@ -15,6 +15,8 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 ## CLI（当前支持）
 
 - `pica -S`：同步 pica 仓库索引（repo.json -> index.json）
+- `pica -Su`：升级所有已安装的 pica 包（从 index.json 选择最新版本并安装）
+- `pica -Syu`：先 `-S` 再 `-Su`
 - `pica -Si <appname>`：按应用名安装（默认：如果 opkg 源有则询问，否则走 pica 源）
 - `pica -So <appname>`：强制走 opkg 安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
 - `pica -Sp <appname>`：强制走 pica 镜像源安装（从 repo.json 解析并下载 pkg.tar.gz）

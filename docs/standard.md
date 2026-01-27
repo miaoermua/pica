@@ -274,7 +274,7 @@ arch = all
 platform = openwrt
 uname = x86_64
 
-pica = 0.0.22
+pica = 0.0.23
 
 type = luci
 luci = lua1

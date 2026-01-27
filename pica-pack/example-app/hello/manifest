@@ -11,7 +11,7 @@ proprietary = false
 
 platform = all
 arch = all
-pica = 0.0.22
+pica = 0.0.23
 
 # Optional compatibility tags (recommended):
 # uname = arm64
