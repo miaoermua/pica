@@ -411,28 +411,28 @@ run_hook() {
   bash "$hook_path"
 }
 
-run_hook_install_tree() {
-  local hook_rel="$1"
+run_cmd_install_tree() {
+  local cmd_rel="$1"
   local label="$2"
 
-  if [[ -z "$hook_rel" ]]; then
+  if [[ -z "$cmd_rel" ]]; then
     return 0
   fi
 
-  if [[ "$hook_rel" == /* ]]; then
-    if [[ -f "$hook_rel" ]]; then
-      log_info "Running $label cmd: $hook_rel"
-      bash "$hook_rel"
+  if [[ "$cmd_rel" == /* ]]; then
+    if [[ -f "$cmd_rel" ]]; then
+      log_info "Running $label cmd: $cmd_rel"
+      bash "$cmd_rel"
       return 0
     fi
-    die "$label cmd not found: $hook_rel"
+    die "$label cmd not found: $cmd_rel"
   fi
 
-  local hook_path
-  hook_path="/usr/lib/pica/cmd/$hook_rel"
-  [[ -f "$hook_path" ]] || die "$label cmd not found: $hook_rel (expected at $hook_path)"
-  log_info "Running $label cmd: $hook_rel"
-  bash "$hook_path"
+  local cmd_path
+  cmd_path="/usr/lib/pica/cmd/$cmd_rel"
+  [[ -f "$cmd_path" ]] || die "$label cmd not found: $cmd_rel (expected at $cmd_path)"
+  log_info "Running $label cmd: $cmd_rel"
+  bash "$cmd_path"
 }
 
 sync_repos() {
@@ -855,7 +855,7 @@ install_pkgfile() {
     fi
   fi
 
-  # lifecycle hooks
+  # lifecycle cmd scripts
   if [[ "$is_upgrade" -eq 1 ]]; then
     run_hook "$tmpdir" "$cmd_update" update
   else
@@ -915,7 +915,7 @@ remove_pkg() {
 
   log_info "Removing $pkgname..."
 
-  run_hook_install_tree "$pkgname/$cmd_remove" remove
+  run_cmd_install_tree "$pkgname/$cmd_remove" remove
 
   # remove cmd files if listed, else do nothing (avoid deleting unknown files)
   # We support optional 'cmd' entries in manifest listing relative filenames.
