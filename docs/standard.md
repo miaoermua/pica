@@ -126,6 +126,10 @@ depend = <opkg package name>
 opkg = <opkg package name>
 cmd = <relative file>
 
+# special deps (repeatable)
+base_depend = <opkg package name>
+kmod_depend = <opkg package name>
+
 # optional type tags (repeatable)
 type = cli
 type = luci
@@ -137,6 +141,13 @@ luci = lua1
 - `depend`：安装阶段 `opkg install` 的依赖（不做依赖树管理）。
 - `opkg`：卸载阶段 `opkg remove` 的包名（仅卸载你显式列出的包）。
 - `cmd`：卸载阶段删除的 `/usr/bin/<cmd>` 白名单（避免误删）。
+- `base_depend`：基础依赖（必须已安装；`pica` 只检查，不自动安装）。
+- `kmod_depend`：kmod 依赖（必须已安装；`pica` 只检查，不自动安装）。
+
+说明：
+
+- `depend` 是“安装阶段由 pica 触发 opkg 安装”的依赖。
+- `base_depend/kmod_depend` 是“运行/内核环境前置条件”，默认要求系统里已存在；同步（`-S`）和安装（`-U` / `-Sp`）阶段会做检查并在缺失时报错/告警。
 
 ## arch（OpenWrt/opkg）
 

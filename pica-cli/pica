@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.0.15"
+PICA_VERSION="0.0.2"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
@@ -50,10 +50,49 @@ ver_ge() {
   return 0
 }
 
+pkgver_ge() {
+  # Compare pkgver like 1.2.3-1 (semver-release).
+  # Returns 0 if $1 >= $2, best-effort.
+  local a="$1" b="$2"
+  if [[ -z "$b" ]]; then
+    return 0
+  fi
+  if [[ -z "$a" ]]; then
+    return 1
+  fi
+
+  local av ar bv br
+  av="${a%%-*}"
+  ar="${a#*-}"
+  [[ "$ar" == "$a" ]] && ar="0"
+  bv="${b%%-*}"
+  br="${b#*-}"
+  [[ "$br" == "$b" ]] && br="0"
+
+  if [[ "$av" =~ ^[0-9]+(\.[0-9]+)*$ && "$bv" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    if ver_ge "$av" "$bv"; then
+      if ver_ge "$bv" "$av"; then
+        [[ "$ar" =~ ^[0-9]+$ && "$br" =~ ^[0-9]+$ ]] || return 0
+        (( ar >= br ))
+        return $?
+      fi
+      return 0
+    fi
+    return 1
+  fi
+
+  # Fallback: lexicographic compare.
+  [[ "$a" == "$b" ]] && return 0
+  [[ "$a" > "$b" ]] && return 0 || return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage:
   pica -S                 Sync (download repo.json and update index)
+  pica -Si <appname>      Install by app name (auto: opkg if available, else pica)
+  pica -So <appname>      Install by app name (force opkg)
+  pica -Sp <appname>      Install by app name (force pica repo)
   pica -U <pkgfile>       Install/Update from .pkg.tar.gz
   pica -R <pkgname>       Remove package (no dependency handling)
   pica -Q                 List installed pica packages
@@ -91,12 +130,47 @@ need_any_cmd() {
   fi
 }
 
+prompt_yn() {
+  # Usage: prompt_yn "question" default_yes
+  # - default_yes: 1 => [Y/n], 0 => [y/N]
+  local question="$1"
+  local default_yes="${2:-1}"
+  local hint
+  if [[ "$default_yes" -eq 1 ]]; then
+    hint="[Y/n]"
+  else
+    hint="[y/N]"
+  fi
+
+  while true; do
+    printf "%s %s " "$question" "$hint" >&2
+    local ans
+    IFS= read -r ans || return 1
+    ans="${ans,,}"
+    case "$ans" in
+      "")
+        [[ "$default_yes" -eq 1 ]] && return 0 || return 1
+        ;;
+      y|yes)
+        return 0
+        ;;
+      n|no)
+        return 1
+        ;;
+      *)
+        echo "Please answer y/yes or n/no." >&2
+        ;;
+    esac
+  done
+}
+
 ensure_dirs() {
   mkdir -p "$PICA_ETC_DIR" "$PICA_STATE_DIR" "$PICA_CACHE_DIR" "$PICA_REPOS_CACHE_DIR"
   if [[ ! -f "$PICA_CONF_FILE" ]]; then
     cat >"$PICA_CONF_FILE" <<'JSON'
 {
-  "repos": []
+  "repos": [],
+  "i18n": "zh-cn"
 }
 JSON
   fi
@@ -118,6 +192,21 @@ JSON
 }
 JSON
   fi
+}
+
+conf_get_i18n() {
+  # Default i18n language for luci-i18n-*-<lang> packages.
+  # This does NOT affect pica output language.
+  if [[ -f "$PICA_CONF_FILE" ]]; then
+    jq -r '.i18n // "zh-cn"' "$PICA_CONF_FILE" 2>/dev/null || echo "zh-cn"
+  else
+    echo "zh-cn"
+  fi
+}
+
+db_get_installed_manifest() {
+  local pkgname="$1"
+  jq -c --arg pkgname "$pkgname" '.installed[$pkgname].manifest // empty' "$PICA_DB_FILE" 2>/dev/null || true
 }
 
 detect_platform() {
@@ -198,6 +287,27 @@ fetch_url() {
     return $?
   fi
   die "no fetch tool found (need uclient-fetch, wget, or curl)"
+}
+
+opkg_has_package() {
+  local name="$1"
+  local out
+  out="$(opkg info "$name" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+  if grep -qi 'unknown package' <<<"$out"; then
+    return 1
+  fi
+  return 0
+}
+
+opkg_is_installed() {
+  local name="$1"
+  opkg status "$name" 2>/dev/null | grep -qi '^Status: .*installed'
+}
+
+opkg_installed_version() {
+  local name="$1"
+  opkg status "$name" 2>/dev/null | awk -F': ' 'tolower($1)=="version" {print $2; exit}'
 }
 
 db_set_installed() {
@@ -328,6 +438,188 @@ sync_repos() {
 
     log_info "$name updated"
   done
+
+  # Optional checks (OpenWrt only): verify declared base/kmod deps are available in opkg feeds.
+  if command -v opkg >/dev/null 2>&1; then
+    opkg update >/dev/null 2>&1 || true
+    local missing_any=0
+    while IFS= read -r dep; do
+      [[ -z "$dep" ]] && continue
+      if ! opkg_has_package "$dep"; then
+        log_warn "opkg feed missing dependency: $dep"
+        missing_any=1
+      fi
+    done < <(
+      jq -r '
+        .repos
+        | to_entries
+        | .[]
+        | .value.data.packages[]?
+        | (.manifest.base_depend? // empty | if type=="array" then .[] else . end),
+          (.manifest.kmod_depend? // empty | if type=="array" then .[] else . end)
+      ' "$PICA_INDEX_FILE" 2>/dev/null || true
+    )
+    if [[ "$missing_any" -ne 0 ]]; then
+      log_warn "Some base/kmod dependencies are missing in opkg feeds"
+    fi
+  fi
+}
+
+find_pica_package_in_index() {
+  local pkgname="$1"
+  ensure_dirs
+
+  [[ -f "$PICA_INDEX_FILE" ]] || die "missing index: run 'pica -S' first"
+
+  local host_platform
+  host_platform="$(detect_platform)"
+
+  # Output: pkgver\trepo\turl\tfilename\tpica
+  jq -r --arg pkgname "$pkgname" '
+    .repos
+    | to_entries
+    | map({repo: .key, url: .value.url, repo_platform: (.value.platform // ""), pkgs: (.value.data.packages // [])})
+    | .[]
+    | .pkgs[]
+    | select(.pkgname == $pkgname)
+    | select((.platform // "all") == "all" or (.platform // "") == "'"$host_platform"'" or (.platform // "") == (.repo_platform // ""))
+    | "\(.pkgver // \"\")\t\(.repo)\t\(.url)\t\(.filename // \"\")\t\(.pica // \"\")"
+  ' "$PICA_INDEX_FILE"
+}
+
+install_pica_from_repo() {
+  local pkgname="$1"
+  ensure_dirs
+  need_cmd tar
+
+  local candidates best
+  candidates="$(find_pica_package_in_index "$pkgname" || true)"
+  [[ -n "$candidates" ]] || die "package not found in pica repos: $pkgname"
+
+  # Choose best pkgver without relying on GNU sort -V (busybox compatibility).
+  local line
+  local best_ver=""
+  best=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local v
+    v="${line%%$'\t'*}"
+    if pkgver_ge "$v" "$best_ver"; then
+      best_ver="$v"
+      best="$line"
+    fi
+  done <<<"$candidates"
+  [[ -n "$best" ]] || die "package not found in pica repos: $pkgname"
+  local pkgver repo url filename min_pica
+  pkgver="${best%%$'\t'*}"
+  repo="$(cut -f2 <<<"$best")"
+  url="$(cut -f3 <<<"$best")"
+  filename="$(cut -f4 <<<"$best")"
+  min_pica="$(cut -f5 <<<"$best")"
+
+  [[ -n "$filename" ]] || die "$repo: repo entry missing filename for $pkgname"
+
+  if [[ -n "$min_pica" ]]; then
+    if ! ver_ge "$PICA_VERSION" "$min_pica"; then
+      die "pica too old: pkg requires >= $min_pica, cli is $PICA_VERSION"
+    fi
+  fi
+
+  mkdir -p "$PICA_CACHE_DIR/pkgs"
+
+  local pkg_url cached
+  pkg_url="${url%/}/packages/$filename"
+  cached="$PICA_CACHE_DIR/pkgs/$filename"
+
+  log_info "Downloading $pkgname ($pkgver) from $repo..."
+  fetch_url "$pkg_url" >"$cached.tmp" || die "download failed: $pkg_url"
+  mv "$cached.tmp" "$cached"
+  install_pkgfile "$cached"
+}
+
+install_app_via_opkg() {
+  local app="$1"
+  ensure_dirs
+  need_cmd opkg
+
+  opkg update >/dev/null 2>&1 || true
+
+  local lang
+  lang="${PICA_LANG:-$(conf_get_i18n)}"
+
+  local -a candidates
+  candidates=("$app" "luci-app-$app" "luci-i18n-${app}-${lang}")
+
+  local -a to_install
+  local pkg
+  for pkg in "${candidates[@]}"; do
+    if opkg_has_package "$pkg"; then
+      to_install+=("$pkg")
+    fi
+  done
+
+  if [[ ${#to_install[@]} -eq 0 ]]; then
+    die "opkg: package not found: $app"
+  fi
+
+  log_info "Installing (opkg): ${to_install[*]}"
+  local p
+  for p in "${to_install[@]}"; do
+    opkg install "$p" || die "opkg install failed: $p"
+  done
+
+  local base_ver
+  base_ver="$(opkg_installed_version "$app" || true)"
+  if [[ -z "$base_ver" ]]; then
+    base_ver="$(opkg_installed_version "${to_install[0]}" || true)"
+  fi
+
+  local manifest_json
+  manifest_json="$(
+    jq -n \
+      --arg pkgname "$app" \
+      --arg pkgver "${base_ver:-}" \
+      --arg platform "$(detect_platform)" \
+      --arg arch "all" \
+      --arg source "opkg" \
+      --argjson opkgs "$(printf '%s\n' "${to_install[@]}" | jq -R . | jq -s .)" \
+      '{pkgname:$pkgname, pkgver:$pkgver, platform:$platform, arch:$arch, source:$source, opkg:$opkgs}'
+  )"
+
+  db_set_installed "$app" "$manifest_json" "opkg"
+  log_info "Transaction completed"
+}
+
+install_app_auto() {
+  local app="$1"
+  ensure_dirs
+  need_cmd opkg
+
+  # Update path: do not prompt. Keep the original install source.
+  local installed_manifest source
+  installed_manifest="$(db_get_installed_manifest "$app")"
+  if [[ -n "$installed_manifest" ]]; then
+    source="$(manifest_get_first "$installed_manifest" source)"
+    case "$source" in
+      opkg)
+        install_app_via_opkg "$app"
+        return 0
+        ;;
+      pica)
+        install_pica_from_repo "$app"
+        return 0
+        ;;
+    esac
+  fi
+
+  opkg update >/dev/null 2>&1 || true
+  if opkg_has_package "$app"; then
+    if prompt_yn "Found '$app' in opkg feeds. Install via opkg?" 1; then
+      install_app_via_opkg "$app"
+      return 0
+    fi
+  fi
+  install_pica_from_repo "$app"
 }
 
 install_pkgfile() {
@@ -428,6 +720,24 @@ install_pkgfile() {
   if [[ -n "$pkg_luci" ]]; then
     log_info "  luci: $pkg_luci"
   fi
+
+  # Mark this as a pica-installed package for auto update selection.
+  manifest_json="$(jq --arg source "pica" '.source //= $source' <<<"$manifest_json")"
+
+  # base/kmod depends are special: must already be installed.
+  # They are checked but not auto-installed (different from depend=).
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if ! opkg_is_installed "$dep"; then
+      die "missing base dependency (install via opkg first): $dep"
+    fi
+  done < <(manifest_get_array "$manifest_json" base_depend || true)
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if ! opkg_is_installed "$dep"; then
+      die "missing kmod dependency (install via opkg first): $dep"
+    fi
+  done < <(manifest_get_array "$manifest_json" kmod_depend || true)
 
   # 1) install opkg deps (best-effort, no dependency tracking)
   while IFS= read -r dep; do
@@ -588,7 +898,6 @@ query_license() {
 
 main() {
   need_cmd jq
-  need_cmd tar
   need_any_cmd uclient-fetch wget curl
 
   if [[ $# -eq 0 ]]; then
@@ -603,8 +912,24 @@ main() {
     -S)
       sync_repos
       ;;
+    -Si)
+      need_cmd opkg
+      [[ $# -ge 2 ]] || die "-Si requires <appname>"
+      install_app_auto "$2"
+      ;;
+    -So)
+      need_cmd opkg
+      [[ $# -ge 2 ]] || die "-So requires <appname>"
+      install_app_via_opkg "$2"
+      ;;
+    -Sp)
+      need_cmd opkg
+      [[ $# -ge 2 ]] || die "-Sp requires <appname>"
+      install_pica_from_repo "$2"
+      ;;
     -U)
       need_cmd opkg
+      need_cmd tar
       [[ $# -ge 2 ]] || die "-U requires <pkgfile>"
       install_pkgfile "$2"
       ;;

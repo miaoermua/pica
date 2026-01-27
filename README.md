@@ -12,6 +12,29 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - 完成标准定义
 - 全流程滚动更新
 
+## CLI（当前支持）
+
+- `pica -S`：同步 pica 仓库索引（repo.json -> index.json）
+- `pica -Si <appname>`：按应用名安装（默认：如果 opkg 源有则询问，否则走 pica 源）
+- `pica -So <appname>`：强制走 opkg 安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
+- `pica -Sp <appname>`：强制走 pica 镜像源安装（从 repo.json 解析并下载 pkg.tar.gz）
+
+## 配置文件
+
+默认配置文件：`/etc/pica/pica.json`（首次运行会自动创建）。
+
+最小示例：
+
+```json
+{
+  "repos": [],
+  "i18n": "zh-cn"
+}
+```
+
+- `repos[]`：pica 仓库列表（`pica -S` / `pica -Sp` 使用）
+- `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，不影响 pica 自身输出语言）
+
 ## License
 
 GPL-3.0-only
