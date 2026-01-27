@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION_DEFAULT="0.0.26"
+PICA_VERSION_DEFAULT="0.0.3"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 msg() {
@@ -37,7 +37,7 @@ Manifest format (Arch-like key/value lines):
   pkgver = 1.0.0-1
   platform = all
   arch = all
-  pica = 0.0.26
+  pica = 0.0.3
   (optional) pkgdesc/url/packager/size
   (repeatable) opkg/binary/cmd/depend
 EOF
@@ -158,8 +158,10 @@ main_build() {
         echo "arch = $build_arch"
       } >>"$tmpdir/manifest"
 
-      mkdir -p "$tmpdir/cmd"
-      cp -a "$staging_dir/cmd/." "$tmpdir/cmd/"
+      if [[ -d "$staging_dir/cmd" ]]; then
+        mkdir -p "$tmpdir/cmd"
+        cp -a "$staging_dir/cmd/." "$tmpdir/cmd/"
+      fi
 
       if [[ -d "$binary_dir" ]]; then
         if [[ "$has_matrix" -eq 1 ]]; then
@@ -182,6 +184,8 @@ main_build() {
       # (We create a temporary archive, measure bytes, then rebuild once.)
       local pkg_tmp
       pkg_tmp="$tmpdir/$pkgfile"
+
+      # cmd/ is the only lifecycle/script payload directory.
 
       if [[ -d "$tmpdir/binary" ]]; then
         if [[ -f "$tmpdir/LICENSE" ]]; then

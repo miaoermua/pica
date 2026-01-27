@@ -129,7 +129,11 @@ proprietary = false
 ```
 depend = <opkg package name>
 opkg = <opkg package name>
-cmd = <relative file>
+
+# lifecycle cmd scripts (optional)
+cmd_install = <relative file>
+cmd_update = <relative file>
+cmd_remove = <relative file>
 
 # special deps (repeatable)
 base_depend = <opkg package name>
@@ -151,7 +155,9 @@ luci = lua1
 
 - `depend`：安装阶段 `opkg install` 的依赖（不做依赖树管理）。
 - `opkg`：卸载阶段 `opkg remove` 的包名（仅卸载你显式列出的包）。
-- `cmd`：卸载阶段删除的 `/usr/bin/<cmd>` 白名单（避免误删）。
+- `cmd_install`：安装生命周期脚本（在 `binary/` ipk 安装完成后执行；0 为成功）。
+- `cmd_update`：更新生命周期脚本（当检测到是升级路径时执行；0 为成功）。
+- `cmd_remove`：卸载生命周期脚本（在 `opkg remove` 前执行；0 为成功）。
 - `base_depend`：基础依赖（必须已安装；`pica` 只检查，不自动安装）。
 - `kmod_depend`：kmod 依赖（必须已安装；`pica` 只检查，不自动安装）。
 
@@ -272,7 +278,7 @@ arch = all
 platform = openwrt
 uname = x86_64
 
-pica = 0.0.26
+pica = 0.0.3
 
 type = luci
 luci = lua1

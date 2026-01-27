@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-if [ $# -lt 1 ]; then
+if [[ $# -lt 1 ]]; then
   echo "usage: pica-remove <pkgname>" >&2
   exit 2
 fi
 pica -R "$1"
 exit $?
+

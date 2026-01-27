@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.0.26"
+PICA_VERSION="0.0.3"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
@@ -384,6 +384,57 @@ manifest_get_array() {
   ' <<<"$manifest_json"
 }
 
+manifest_get_scalar() {
+  local manifest_json="$1"
+  local key="$2"
+  jq -r --arg k "$key" '
+    .[$k] as $v |
+    if $v == null then ""
+    elif ($v|type)=="array" then ""
+    else ($v|tostring)
+    end
+  ' <<<"$manifest_json"
+}
+
+run_hook() {
+  local tmpdir="$1"
+  local hook_rel="$2"
+  local label="$3"
+
+  [[ -n "$hook_rel" ]] || return 0
+
+  local hook_path
+  hook_path="$tmpdir/$hook_rel"
+  [[ -f "$hook_path" ]] || die "$label hook not found: $hook_rel"
+
+  log_info "Running $label hook: $hook_rel"
+  bash "$hook_path"
+}
+
+run_hook_install_tree() {
+  local hook_rel="$1"
+  local label="$2"
+
+  if [[ -z "$hook_rel" ]]; then
+    return 0
+  fi
+
+  if [[ "$hook_rel" == /* ]]; then
+    if [[ -f "$hook_rel" ]]; then
+      log_info "Running $label cmd: $hook_rel"
+      bash "$hook_rel"
+      return 0
+    fi
+    die "$label cmd not found: $hook_rel"
+  fi
+
+  local hook_path
+  hook_path="/usr/lib/pica/cmd/$hook_rel"
+  [[ -f "$hook_path" ]] || die "$label cmd not found: $hook_rel (expected at $hook_path)"
+  log_info "Running $label cmd: $hook_rel"
+  bash "$hook_path"
+}
+
 sync_repos() {
   ensure_dirs
   log_info "Synchronizing package databases..."
@@ -654,9 +705,20 @@ install_pkgfile() {
   pkg_luci="$(manifest_get_first "$manifest_json" luci)"
   local pkg_type
   pkg_type="$(manifest_get_first "$manifest_json" type)"
+
+  local cmd_install cmd_update cmd_remove
+  cmd_install="$(manifest_get_scalar "$manifest_json" cmd_install)"
+  cmd_update="$(manifest_get_scalar "$manifest_json" cmd_update)"
+  cmd_remove="$(manifest_get_scalar "$manifest_json" cmd_remove)"
   [[ -n "$pkgname" ]] || die "manifest missing pkgname"
   [[ -n "$pkg_platform" ]] || die "manifest missing platform"
   [[ -n "$pkg_arch" ]] || die "manifest missing arch"
+
+  local is_upgrade
+  is_upgrade=0
+  if jq -e --arg pkgname "$pkgname" '.installed[$pkgname] != null' "$PICA_DB_FILE" >/dev/null 2>&1; then
+    is_upgrade=1
+  fi
 
   # pica field is an optional minimum required pica-cli version.
   if [[ -n "$pica" ]]; then
@@ -793,16 +855,44 @@ install_pkgfile() {
     fi
   fi
 
-  # 3) install cmd/ payload to /usr/bin
-  mkdir -p /usr/bin
-  if command -v cp >/dev/null 2>&1; then
-    cp -a "$tmpdir/cmd/." /usr/bin/
+  # lifecycle hooks
+  if [[ "$is_upgrade" -eq 1 ]]; then
+    run_hook "$tmpdir" "$cmd_update" update
   else
-    # very minimal fallback
-    tar -C "$tmpdir/cmd" -cf - . | tar -C /usr/bin -xf -
+    run_hook "$tmpdir" "$cmd_install" install
   fi
 
-  # 4) optional cmd/.env -> /etc/pica/env.d/<pkgname>.env
+  # 3) install lifecycle cmd scripts (optional)
+  # Cmd scripts must be available during remove/update even without the original pkgfile.
+  mkdir -p "/usr/lib/pica/cmd/$pkgname"
+  local hook_rel
+  for hook_rel in "$cmd_install" "$cmd_update" "$cmd_remove"; do
+    [[ -z "$hook_rel" ]] && continue
+    if [[ "$hook_rel" == /* ]]; then
+      continue
+    fi
+    if [[ -f "$tmpdir/$hook_rel" ]]; then
+      mkdir -p "/usr/lib/pica/cmd/$pkgname/$(dirname "$hook_rel")"
+      cp -f "$tmpdir/$hook_rel" "/usr/lib/pica/cmd/$pkgname/$hook_rel"
+    else
+      die "cmd script not found in package: $hook_rel"
+    fi
+  done
+
+  # 4) install cmd/ payload to /usr/bin (optional)
+  # Only when manifest declares at least one `cmd = ...` entry.
+  if jq -e '.cmd? != null' <<<"$manifest_json" >/dev/null 2>&1; then
+    if [[ -d "$tmpdir/cmd" ]]; then
+      mkdir -p /usr/bin
+      if command -v cp >/dev/null 2>&1; then
+        cp -a "$tmpdir/cmd/." /usr/bin/
+      else
+        tar -C "$tmpdir/cmd" -cf - . | tar -C /usr/bin -xf -
+      fi
+    fi
+  fi
+
+  # 5) optional cmd/.env -> /etc/pica/env.d/<pkgname>.env
   if [[ -f "$tmpdir/cmd/.env" ]]; then
     mkdir -p /etc/pica/env.d
     cp -f "$tmpdir/cmd/.env" "/etc/pica/env.d/${pkgname}.env"
@@ -820,7 +910,12 @@ remove_pkg() {
   manifest_json="$(jq -c --arg pkgname "$pkgname" '.installed[$pkgname].manifest // empty' "$PICA_DB_FILE")"
   [[ -n "$manifest_json" ]] || die "not installed: $pkgname"
 
+  local cmd_remove
+  cmd_remove="$(manifest_get_scalar "$manifest_json" cmd_remove)"
+
   log_info "Removing $pkgname..."
+
+  run_hook_install_tree "$pkgname/$cmd_remove" remove
 
   # remove cmd files if listed, else do nothing (avoid deleting unknown files)
   # We support optional 'cmd' entries in manifest listing relative filenames.

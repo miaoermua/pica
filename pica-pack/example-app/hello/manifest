@@ -8,7 +8,7 @@ proprietary = false
 
 platform = all
 arch = all
-pica = 0.0.26
+pica = 0.0.3
 
 # Optional compatibility tags (recommended):
 # uname = arm64
@@ -32,3 +32,7 @@ depend = busybox
 cmd = pica-sync
 cmd = pica-update
 cmd = pica-remove
+
+cmd_install = cmd/install
+cmd_update = cmd/update
+cmd_remove = cmd/remove
