@@ -1,8 +1,7 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 if [ $# -lt 1 ]; then
   echo "usage: pica-update <pkgfile>" >&2
   exit 2
 fi
 pica -U "$1"
 exit $?
-

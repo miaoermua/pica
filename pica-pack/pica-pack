@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION_DEFAULT="0.0.25"
+PICA_VERSION_DEFAULT="0.0.26"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 msg() {
@@ -37,7 +37,7 @@ Manifest format (Arch-like key/value lines):
   pkgver = 1.0.0-1
   platform = all
   arch = all
-  pica = 0.0.25
+  pica = 0.0.26
   (optional) pkgdesc/url/packager/size
   (repeatable) opkg/binary/cmd/depend
 EOF
