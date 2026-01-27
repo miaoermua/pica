@@ -27,7 +27,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.23`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.25`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -192,7 +192,7 @@ luci-i18n-myapp-zh-cn
 
 ```
 ==> Making package: hello 0.1.0-1 (openwrt-any)
-  -> Pica version: 0.0.23
+  -> Pica version: 0.0.25
   -> Creating archive...
 ==> Finished: /tmp/pica-test/hello-0.1.0-1-openwrt-any.pkg.tar.gz
 ```
@@ -337,7 +337,7 @@ repo-root/
       "pkgname": "hello",
       "pkgver": "0.1.0-1",
       "platform": "openwrt-any",
-      "pica": "0.0.23",
+      "pica": "0.0.25",
       "filename": "hello-0.1.0-1-openwrt-any.pkg.tar.gz",
       "md5": "<md5>",
       "size": 465

@@ -1,17 +1,14 @@
 pkgname = hello
 pkgver = 0.1.0-1
-pkgdesc = Example package
+pkgdesc = Example lifecycle package
 url = https://example.invalid
 packager = pica-pack
-builddate = 0
-size = 0
-
 license = GPL-3.0-only
 proprietary = false
 
 platform = all
 arch = all
-pica = 0.0.23
+pica = 0.0.25
 
 # Optional compatibility tags (recommended):
 # uname = arm64
@@ -32,7 +29,6 @@ depend = busybox
 
 # Optional: if you want pica -R to delete installed /usr/bin files safely,
 # list them explicitly (relative paths under /usr/bin):
-cmd = hello
 cmd = pica-sync
-cmd = pica-update-self
-cmd = pica-remove-self
+cmd = pica-update
+cmd = pica-remove

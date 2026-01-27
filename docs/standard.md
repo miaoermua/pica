@@ -267,14 +267,12 @@ pkgrel = 1
 pkgdesc = Example LuCI application
 url = https://example.com
 packager = example
-builddate = 1700000000
-size = 123456
 
 arch = all
 platform = openwrt
 uname = x86_64
 
-pica = 0.0.23
+pica = 0.0.25
 
 type = luci
 luci = lua1
