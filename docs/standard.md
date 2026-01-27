@@ -138,6 +138,12 @@ type = luci
 luci = lua1
 ```
 
+约定：
+
+- `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。
+- `type = luci` 表示“该包包含/依赖 LuCI Web UI”。如果声明了 `type = luci`，必须同时声明 `luci = lua1|js2`。
+- `type = cli` 表示“该包提供纯命令行程序/脚本”。目前 `type = cli` 主要用于元数据标注，pica-cli 不会因为缺少 LuCI 而拒绝安装；需要 LuCI 的包请务必使用 `type = luci` 明确标注。
+
 - `depend`：安装阶段 `opkg install` 的依赖（不做依赖树管理）。
 - `opkg`：卸载阶段 `opkg remove` 的包名（仅卸载你显式列出的包）。
 - `cmd`：卸载阶段删除的 `/usr/bin/<cmd>` 白名单（避免误删）。
