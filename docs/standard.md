@@ -90,8 +90,14 @@ pkgname = <name>
 pkgver = <version-release>
 platform = all
 arch = all
-pica = 0.0.1
+pica = <min pica-cli version>
 ```
+
+关于 `pica` 字段：
+
+- 表示“最低兼容 pica-cli 版本”（minimum required），不是“必须完全一致的版本”。
+- 不写 `pica`：默认不做版本门槛校验（为了兼容旧包）。
+- 写了 `pica` 且本机 `pica-cli` 版本低于该值：安装/更新会失败并提示无法兼容。
 
 可选字段（强兼容校验，优先判断）：
 
@@ -107,6 +113,10 @@ url = ...
 packager = ...
 builddate = <unix timestamp>
 size = <bytes>
+
+# license metadata
+license = GPL-3.0-only
+proprietary = false
 ```
 
 ### 与 OpenWrt 安装相关的扩展字段（可重复，可选）
@@ -116,7 +126,11 @@ depend = <opkg package name>
 opkg = <opkg package name>
 cmd = <relative file>
 
-# optional luci variant
+# optional type tags (repeatable)
+type = cli
+type = luci
+
+# when type includes luci
 luci = lua1
 ```
 
@@ -169,23 +183,54 @@ cmd/.env
 - 安装时保存到 `/etc/pica/env.d/<pkgname>.env`
 - 卸载时同步删除该 env 文件
 
-## LuCI 版本/实现（可选）
+## type/luci：LuCI 版本/实现（可选）
 
 OpenWrt 上的 Web UI 可能存在不同实现（例如历史上的 Lua/LuCI1 与 luci2 JS）。
 
-当你的包包含 LuCI 插件或强依赖某种 LuCI 实现时，可以在 manifest 中声明：
+当你的包包含 LuCI 插件或强依赖某种 LuCI 实现时，建议：
+
+- 增加 `type = luci`
+- 声明 `luci` 的实现版本
 
 ```
+type = luci
 luci = lua1
 ```
 
 或：
 
 ```
+type = luci
 luci = js2
 ```
 
 约定：
 
-- 未声明 `luci`：不做 LuCI 兼容检查
-- 声明 `luci`：`pica -U` 会尝试检测本机 LuCI 实现并进行匹配；无法检测或不匹配则安装失败
+- 未包含 `type = luci`：不做 LuCI 兼容检查（`luci = ...` 即使存在也不会触发检查）
+- 包含 `type = luci`：必须同时声明 `luci = lua1|js2`
+- `pica -U` 会尝试检测本机 LuCI 实现并匹配；无法检测或不匹配则安装失败
+
+## 许可证（license / proprietary）
+
+manifest 中允许定义许可证信息：
+
+```
+license = GPL-3.0-only
+proprietary = false
+```
+
+约定：
+
+- `license`：建议用 SPDX 标识（例如 `GPL-3.0-only`、`MIT`、`Apache-2.0`）
+- `proprietary`：`true|false`，用于标记是否为专有软件
+- 当前版本只做“定义与展示”，不做任何许可证强制校验
+
+## LICENSE 文件（包内可选）
+
+打包时允许在 staging 根目录放一个 `LICENSE` 文件，`pica-pack` 会把它原样打进压缩包根目录：
+
+```
+LICENSE
+```
+
+当前版本不自动安装/展开该文件，仅作为后续 `pica` 命令显示许可证内容的基础。

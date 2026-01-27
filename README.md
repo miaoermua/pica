@@ -11,6 +11,10 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - 完成简单封装
 - 完成标准定义
 - 全流程滚动更新
+
+## License
+
+GPL-3.0-only
 - 用户仓库
 
 ## 特性
@@ -20,3 +24,5 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - 高度自由，用户友好
 - 分布式，支持用户仓库
 - 小型化，基于 openwrt 深度打造
+
+对于用户来说，你只需要使用 pica 完成包的管理，定期进行 pica 的升级，当然升级目前不支持，或者我们需要通过另外的手段实现，目前不能通过 pica 升级 pica。

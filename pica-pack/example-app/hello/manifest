@@ -6,14 +6,21 @@ packager = pica-pack
 builddate = 0
 size = 0
 
+license = GPL-3.0-only
+proprietary = false
+
 platform = all
 arch = all
-pica = 0.0.1
+pica = 0.0.15
 
 # Optional compatibility tags (recommended):
 # uname = arm64
 
-# Optional LuCI variant requirement:
+# Optional type tags (repeatable):
+# type = cli
+# type = luci
+#
+# If type includes luci, declare the implementation variant:
 # luci = lua1
 # luci = js2
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION_DEFAULT="0.0.1"
+PICA_VERSION_DEFAULT="0.0.15"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 msg() {
@@ -21,6 +21,7 @@ staging_dir must contain:
   - manifest
   - cmd/
   - binary/ is optional
+  - LICENSE is optional
 
 If binary/ exists, the recommended layout is:
   binary/<platform>/<arch>/*.ipk
@@ -36,7 +37,7 @@ Manifest format (Arch-like key/value lines):
   pkgver = 1.0.0-1
   platform = all
   arch = all
-  pica = 0.0.1
+  pica = 0.0.15
   (optional) pkgdesc/url/packager/builddate/size
   (repeatable) opkg/binary/cmd/depend
 EOF
@@ -102,7 +103,12 @@ main_build() {
 
   [[ -n "$pkgname" ]] || die "manifest missing pkgname"
   [[ -n "$pkgver" ]] || die "manifest missing pkgver"
-  [[ -n "$pica" ]] || die "manifest missing pica (expected ${PICA_VERSION_DEFAULT})"
+  # pica field is optional. If provided, treat it as minimum required pica-cli.
+  if [[ -n "$pica" ]]; then
+    msg2 "Pica requires >= $pica"
+  else
+    msg2 "Pica requires: (not specified)"
+  fi
 
   if [[ -z "$outdir" ]]; then
     outdir="$SCRIPT_DIR/bin/$pkgname"
@@ -136,7 +142,11 @@ main_build() {
       msg "Making package: $pkgname $pkgver"
       msg2 "Platform: $build_platform"
       msg2 "Arch: $build_arch"
-      msg2 "Pica version: $pica"
+      if [[ -n "$pica" ]]; then
+        msg2 "Pica requires >= $pica"
+      else
+        msg2 "Pica requires: (not specified)"
+      fi
       msg2 "Creating archive..."
 
       cp "$staging_dir/manifest" "$tmpdir/manifest"
@@ -161,11 +171,23 @@ main_build() {
         fi
       fi
 
-      if [[ -d "$tmpdir/binary" ]]; then
+    if [[ -f "$staging_dir/LICENSE" ]]; then
+      cp "$staging_dir/LICENSE" "$tmpdir/LICENSE"
+    fi
+
+    if [[ -d "$tmpdir/binary" ]]; then
+      if [[ -f "$tmpdir/LICENSE" ]]; then
+        tar -C "$tmpdir" -czf "$outdir/$pkgfile" manifest cmd binary LICENSE
+      else
         tar -C "$tmpdir" -czf "$outdir/$pkgfile" manifest cmd binary
+      fi
+    else
+      if [[ -f "$tmpdir/LICENSE" ]]; then
+        tar -C "$tmpdir" -czf "$outdir/$pkgfile" manifest cmd LICENSE
       else
         tar -C "$tmpdir" -czf "$outdir/$pkgfile" manifest cmd
       fi
+    fi
 
       msg "Finished: $outdir/$pkgfile"
       echo "$outdir/$pkgfile"

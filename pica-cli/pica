@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.0.13"
+PICA_VERSION="0.0.15"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
@@ -20,6 +20,36 @@ log_warn() {
   echo "warning: $*" >&2
 }
 
+ver_ge() {
+  # Returns 0 if $1 >= $2 (numeric dot-separated).
+  # Examples: ver_ge 0.0.15 0.0.1 -> true
+  local a="$1" b="$2"
+  local IFS='.'
+  local -a av bv
+  read -r -a av <<<"$a"
+  read -r -a bv <<<"$b"
+
+  local i max
+  max=${#av[@]}
+  if [[ ${#bv[@]} -gt $max ]]; then
+    max=${#bv[@]}
+  fi
+  for ((i=0; i<max; i++)); do
+    local ai bi
+    ai=${av[i]:-0}
+    bi=${bv[i]:-0}
+    [[ "$ai" =~ ^[0-9]+$ ]] || die "invalid version: $a"
+    [[ "$bi" =~ ^[0-9]+$ ]] || die "invalid version: $b"
+    if ((ai > bi)); then
+      return 0
+    fi
+    if ((ai < bi)); then
+      return 1
+    fi
+  done
+  return 0
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -27,6 +57,8 @@ Usage:
   pica -U <pkgfile>       Install/Update from .pkg.tar.gz
   pica -R <pkgname>       Remove package (no dependency handling)
   pica -Q                 List installed pica packages
+  pica -Qi <pkgname>      Show installed package info
+  pica -Ql <pkgname>      Show installed package license
   pica --version
 
 Notes:
@@ -139,6 +171,12 @@ detect_luci_variant() {
   fi
   # Alternative package names exist; keep it conservative.
   echo unknown
+}
+
+manifest_has_type() {
+  local manifest_json="$1"
+  local t="$2"
+  manifest_get_array "$manifest_json" type 2>/dev/null | awk -v t="$t" '$0==t{found=1} END{exit found?0:1}'
 }
 
 fetch_url() {
@@ -320,11 +358,18 @@ install_pkgfile() {
   pkg_uname="$(manifest_get_first "$manifest_json" uname)"
   local pkg_luci
   pkg_luci="$(manifest_get_first "$manifest_json" luci)"
+  local pkg_type
+  pkg_type="$(manifest_get_first "$manifest_json" type)"
   [[ -n "$pkgname" ]] || die "manifest missing pkgname"
-  [[ -n "$pica" ]] || die "manifest missing pica"
   [[ -n "$pkg_platform" ]] || die "manifest missing platform"
   [[ -n "$pkg_arch" ]] || die "manifest missing arch"
-  [[ "$pica" == "$PICA_VERSION" ]] || die "incompatible pica version: pkg=$pica cli=$PICA_VERSION"
+
+  # pica field is an optional minimum required pica-cli version.
+  if [[ -n "$pica" ]]; then
+    if ! ver_ge "$PICA_VERSION" "$pica"; then
+      die "pica too old: pkg requires >= $pica, cli is $PICA_VERSION"
+    fi
+  fi
 
   # platform is informational (used for store/repo display), do not gate installs.
   local host_platform
@@ -350,14 +395,24 @@ install_pkgfile() {
     fi
   fi
 
-  if [[ -n "$pkg_luci" ]]; then
-    local host_luci
-    host_luci="$(detect_luci_variant)"
-    if [[ "$host_luci" == "unknown" ]]; then
-      die "luci variant required ($pkg_luci) but cannot detect host"
-    fi
-    if [[ "$host_luci" != "$pkg_luci" ]]; then
-      die "unsupported luci variant: pkg=$pkg_luci host=$host_luci"
+  # LuCI compatibility is only checked for packages declaring type=luci.
+  # (type is repeatable; any matching 'luci' enables the check.)
+  if manifest_has_type "$manifest_json" luci; then
+    if [[ -n "$pkg_luci" ]]; then
+      local host_luci
+      host_luci="$(detect_luci_variant)"
+      if [[ "$host_luci" == "unknown" ]]; then
+        die "luci variant required ($pkg_luci) but cannot detect host"
+      fi
+      case "$pkg_luci" in
+        lua1|js2) : ;;
+        *) die "invalid luci value: $pkg_luci" ;;
+      esac
+      if [[ "$host_luci" != "$pkg_luci" ]]; then
+        die "unsupported luci variant: pkg=$pkg_luci host=$host_luci"
+      fi
+    else
+      die "type=luci requires luci=<lua1|js2>"
     fi
   fi
 
@@ -366,6 +421,9 @@ install_pkgfile() {
   log_info "  arch: $pkg_arch"
   if [[ -n "$pkg_uname" ]]; then
     log_info "  uname: $pkg_uname (host: $host_uname_raw)"
+  fi
+  if [[ -n "$pkg_type" ]]; then
+    log_info "  type: $pkg_type"
   fi
   if [[ -n "$pkg_luci" ]]; then
     log_info "  luci: $pkg_luci"
@@ -487,6 +545,47 @@ query_installed() {
   ' "$PICA_DB_FILE"
 }
 
+query_info() {
+  local pkgname="$1"
+  ensure_dirs
+
+  local entry
+  entry="$(jq -c --arg pkgname "$pkgname" '.installed[$pkgname] // empty' "$PICA_DB_FILE")"
+  [[ -n "$entry" ]] || die "not installed: $pkgname"
+
+  local manifest
+  manifest="$(jq -c '.manifest' <<<"$entry")"
+
+  echo "Name            : $pkgname"
+  echo "Version         : $(manifest_get_first "$manifest" pkgver)"
+  echo "Platform        : $(manifest_get_first "$manifest" platform)"
+  echo "Arch            : $(manifest_get_first "$manifest" arch)"
+  echo "Uname           : $(manifest_get_first "$manifest" uname)"
+  echo "Type            : $(manifest_get_first "$manifest" type)"
+  echo "License         : $(manifest_get_first "$manifest" license)"
+  echo "Proprietary     : $(manifest_get_first "$manifest" proprietary)"
+}
+
+query_license() {
+  local pkgname="$1"
+  ensure_dirs
+
+  local manifest
+  manifest="$(jq -c --arg pkgname "$pkgname" '.installed[$pkgname].manifest // empty' "$PICA_DB_FILE")"
+  [[ -n "$manifest" ]] || die "not installed: $pkgname"
+
+  local license proprietary
+  license="$(manifest_get_first "$manifest" license)"
+  proprietary="$(manifest_get_first "$manifest" proprietary)"
+
+  if [[ -n "$license" ]]; then
+    echo "$license"
+  fi
+  if [[ -n "$proprietary" ]]; then
+    echo "proprietary=$proprietary"
+  fi
+}
+
 main() {
   need_cmd jq
   need_cmd tar
@@ -516,6 +615,14 @@ main() {
       ;;
     -Q)
       query_installed
+      ;;
+    -Qi)
+      [[ $# -ge 2 ]] || die "-Qi requires <pkgname>"
+      query_info "$2"
+      ;;
+    -Ql)
+      [[ $# -ge 2 ]] || die "-Ql requires <pkgname>"
+      query_license "$2"
       ;;
     -h|--help|help)
       usage

@@ -27,8 +27,8 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.1`
-- 每个 pica 包的 `manifest` 必须声明：`pica = 0.0.1`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.15`
+- `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
 ## pica 包格式（.pkg.tar.gz）
@@ -106,7 +106,7 @@ pica-pack/bin/<pkgname>/
 pkgname = <name>
 pkgver = <version-release>
 platform = all
-pica = 0.0.1
+pica = <min pica-cli version>
 arch = all
 ```
 
@@ -126,6 +126,14 @@ cmd = <relative-file-under-/usr/bin>
 # optional compatibility tag
 # luci = lua1
 # luci = js2
+
+# optional type tags (repeatable)
+# type = cli
+# type = luci
+
+# license metadata
+# license = GPL-3.0-only
+# proprietary = false
 ```
 
 ### arch（OpenWrt/opkg）
@@ -184,7 +192,7 @@ luci-i18n-myapp-zh-cn
 
 ```
 ==> Making package: hello 0.1.0-1 (openwrt-any)
-  -> Pica version: 0.0.1
+  -> Pica version: 0.0.15
   -> Creating archive...
 ==> Finished: /tmp/pica-test/hello-0.1.0-1-openwrt-any.pkg.tar.gz
 ```
@@ -323,7 +331,7 @@ repo-root/
       "pkgname": "hello",
       "pkgver": "0.1.0-1",
       "platform": "openwrt-any",
-      "pica": "0.0.1",
+      "pica": "0.0.15",
       "filename": "hello-0.1.0-1-openwrt-any.pkg.tar.gz",
       "sha256": "<sha256>",
       "size": 465
