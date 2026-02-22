@@ -72,6 +72,79 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 ```
 
+## repo.json 强约束（schema + filename）
+
+`pica -S` 同步阶段会对 `repo.json` 做严格校验：
+
+- `schema` 必须为 `1`
+- `packages` 必须为数组
+- 每个 package 项必须包含非空字符串字段：
+  - `pkgname`
+  - `pkgver`
+  - `pkgrel`
+  - `platform`
+  - `arch`
+  - `filename`
+- `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），且必须以 `.pkg.tar.gz` 结尾
+- `filename` 必须与其他字段一致：
+  - `platform != all`：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz`
+  - `platform = all`：`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz`
+- 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，用于覆盖默认下载路径
+
+任一约束不满足，`pica -S` 会拒绝该 repo。
+
+## URL 安装
+
+`pica -U` 支持本地文件和 URL：
+
+```
+pica -U ./hello-0.1.0-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.0-1-all.pkg.tar.gz
+```
+
+允许的 URL 协议：
+
+- `http://`
+- `https://`
+- `file://`
+
+## JSON 输出（显式开启）
+
+`pica` 默认输出面向人工的文本日志，不改变现有使用习惯。
+
+可选参数：
+
+- `--json`：启用 JSON 输出（成功/失败）
+- `--json-errors`：仅失败时输出 JSON
+
+## 非交互与来源策略
+
+可选参数：
+
+- `--non-interactive`：禁用交互提示，适配后端调用
+- `--feed-policy <mode>`：来源策略
+  - `ask`（默认）
+  - `feed-first`
+  - `packaged-first`
+  - `feed-only`
+  - `packaged-only`
+
+## app 安装顺序
+
+`app` 阶段固定分组顺序：
+
+1. 主程序（core）
+2. `luci-app-*`
+3. `luci-i18n-*`
+
+若某组为空则直接跳过（例如纯 CLI 包没有 luci/i18n）。
+
+说明：
+
+- 这些参数为显式开启；不传时行为保持不变。
+- 当某些命令本身已经输出文本结果（例如 `-Q/-Qi/-Ql`），成功 JSON 会被自动抑制，避免混淆机器解析。
+- `--json/--json-errors` 依赖 `jq`（缺失时会直接报错退出）。
+
 ## 兼容维度：uname + arch（platform 仅展示）
 
 为了让安装/更新行为尽可能稳定，pica 的“实际兼容性判断”优先使用：
@@ -102,7 +175,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.0.4）
+### 最新推荐字段模板（0.0.5）
 
 ```ini
 # Required
@@ -117,7 +190,7 @@ pkgver = 0.1.0
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.0.4
+pica = 0.0.5
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -353,7 +426,7 @@ arch = all
 platform = openwrt
 uname = x86_64
 
-pica = 0.0.4
+pica = 0.0.5
 
 type = luci
 luci = lua1

@@ -27,7 +27,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.4`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.5`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -221,7 +221,7 @@ luci-i18n-myapp-zh-cn
 
 ```
 ==> Making package: hello 0.1.0-1 (openwrt-any)
-  -> Pica version: 0.0.4
+  -> Pica version: 0.0.5
   -> Creating archive...
 ==> Finished: /tmp/pica-test/hello-0.1.0-1-openwrt-any.pkg.tar.gz
 ```
@@ -254,6 +254,12 @@ luci-i18n-myapp-zh-cn
   - 安装数据库：`/var/lib/pica/db.json`
   - 仓库索引：`/var/lib/pica/index.json`
   - repo 缓存：`/var/lib/pica/cache/repos/<name>.json`
+  - 并发锁文件：`/var/lib/pica/db.lck`
+
+并发约束：
+
+- `pica` 运行时会持有全局锁，避免多个安装/同步事务并发写状态文件。
+- 若系统可用 `flock`，优先使用文件锁；否则回退到目录锁（`db.lck.d`）。
 
 开发/测试时可用环境变量覆盖路径（避免写入系统目录）：
 
@@ -262,6 +268,29 @@ PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 ```
 
 ### 命令
+
+可选机器可读输出参数（显式开启）：
+
+- `--json`：命令成功/失败都尝试输出 JSON（当命令已输出文本结果时，为避免混流，成功 JSON 会自动抑制）
+- `--json-errors`：仅在失败时输出 JSON 错误对象
+
+可选非交互参数（后端/自动化推荐）：
+
+- `--non-interactive`：禁用交互提示
+- `--feed-policy <mode>`：安装来源策略
+  - `ask`（默认）
+  - `feed-first`
+  - `packaged-first`
+  - `feed-only`
+  - `packaged-only`
+
+应用安装顺序（app 阶段固定）：
+
+- `core`（主程序，非 `luci-app-*` 且非 `luci-i18n-*`）
+- `luci-app-*`
+- `luci-i18n-*`
+
+说明：纯 CLI 应用只有 `core` 组时，后两组会自动跳过。
 
 #### 同步（-S）
 
@@ -377,7 +406,7 @@ repo-root/
       "version": "rolling",
       "branch": "stable",
       "platform": "openwrt-any",
-      "pica": "0.0.4",
+      "pica": "0.0.5",
       "filename": "hello-0.1.0-1-openwrt-any.pkg.tar.gz",
       "md5": "<md5>",
       "size": 465
@@ -385,5 +414,16 @@ repo-root/
   ]
 }
 ```
+
+当前 `pica -S` 对 `repo.json` 启用严格校验（强约束）：
+
+- `schema` 必须是 `1`
+- `packages` 必须是数组
+- 每个包条目必须包含非空字符串字段：`pkgname/pkgver/pkgrel/platform/arch/filename`
+- `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），并且必须以 `.pkg.tar.gz` 结尾
+- `filename` 必须与字段一致：
+  - `platform != all`：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz`
+  - `platform = all`：`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz`
+- 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`；安装时优先使用该 URL 下载
 
 当前 `pica -S` 只负责下载并缓存 `repo.json` 与写入索引；后续如果要做 `-Ss/-Si/从仓库安装`，会基于该索引扩展。
