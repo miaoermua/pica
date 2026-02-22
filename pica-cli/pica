@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.0.35"
+PICA_VERSION="0.0.4"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
@@ -11,6 +11,7 @@ PICA_DB_FILE="${PICA_DB_FILE:-${PICA_STATE_DIR}/db.json}"
 PICA_INDEX_FILE="${PICA_INDEX_FILE:-${PICA_STATE_DIR}/index.json}"
 PICA_CACHE_DIR="${PICA_CACHE_DIR:-${PICA_STATE_DIR}/cache}"
 PICA_REPOS_CACHE_DIR="${PICA_REPOS_CACHE_DIR:-${PICA_CACHE_DIR}/repos}"
+PICA_REPORT_FILE="${PICA_REPORT_FILE:-${PICA_STATE_DIR}/install-report.json}"
 
 log_info() {
   echo ":: $*"
@@ -86,15 +87,271 @@ pkgver_ge() {
   [[ "$a" > "$b" ]] && return 0 || return 1
 }
 
+pkgver_cmp_key() {
+  local pkgver="$1"
+  local pkgrel="$2"
+
+  if [[ -n "$pkgrel" ]]; then
+    echo "${pkgver}-${pkgrel}"
+    return 0
+  fi
+  echo "$pkgver"
+}
+
+manifest_pkgver_cmp_key() {
+  local manifest_json="$1"
+  local pkgver pkgrel
+  pkgver="$(manifest_get_first "$manifest_json" pkgver)"
+  pkgrel="$(manifest_get_first "$manifest_json" pkgrel)"
+  pkgver_cmp_key "$pkgver" "$pkgrel"
+}
+
+manifest_pkgver_display() {
+  local manifest_json="$1"
+  local pkgver pkgrel
+  pkgver="$(manifest_get_first "$manifest_json" pkgver)"
+  pkgrel="$(manifest_get_first "$manifest_json" pkgrel)"
+  if [[ -n "$pkgrel" ]]; then
+    echo "${pkgver}-${pkgrel}"
+    return 0
+  fi
+  echo "$pkgver"
+}
+
+selector_is_structured() {
+  local selector="$1"
+  [[ "$selector" == *"@"* || "$selector" == *":"* || "$selector" == *"("* || "$selector" == *"）"* || "$selector" == *"（"* ]]
+}
+
+parse_app_selector() {
+  # Supported selectors:
+  #   app
+  #   app@author
+  #   app@author:version
+  #   app@author:version(branch)
+  # Full-width variants are normalized:
+  #   app@作者：版本（分支）
+  local selector="$1"
+
+  local norm="$selector"
+  norm="${norm//：/:}"
+  norm="${norm//（/(}"
+  norm="${norm//）/)}"
+
+  local appname="$norm"
+  local author=""
+  local version=""
+  local branch=""
+
+  if [[ "$norm" =~ ^([^@]+)@([^:]+):(.*)$ ]]; then
+    appname="${BASH_REMATCH[1]}"
+    author="${BASH_REMATCH[2]}"
+    local tail
+    tail="${BASH_REMATCH[3]}"
+    if [[ "$tail" =~ ^([^()]+)\(([^()]+)\)$ ]]; then
+      version="${BASH_REMATCH[1]}"
+      branch="${BASH_REMATCH[2]}"
+    else
+      version="$tail"
+    fi
+  elif [[ "$norm" =~ ^([^@]+)@([^()]+)\(([^()]+)\)$ ]]; then
+    appname="${BASH_REMATCH[1]}"
+    author="${BASH_REMATCH[2]}"
+    branch="${BASH_REMATCH[3]}"
+  elif [[ "$norm" =~ ^([^@]+)@([^:]+)$ ]]; then
+    appname="${BASH_REMATCH[1]}"
+    author="${BASH_REMATCH[2]}"
+  elif [[ "$norm" =~ ^([^:]+):(.*)$ ]]; then
+    appname="${BASH_REMATCH[1]}"
+    local tail
+    tail="${BASH_REMATCH[2]}"
+    if [[ "$tail" =~ ^([^()]+)\(([^()]+)\)$ ]]; then
+      version="${BASH_REMATCH[1]}"
+      branch="${BASH_REMATCH[2]}"
+    else
+      version="$tail"
+    fi
+  fi
+
+  jq -n \
+    --arg raw "$selector" \
+    --arg norm "$norm" \
+    --arg appname "$appname" \
+    --arg author "$author" \
+    --arg version "$version" \
+    --arg branch "$branch" \
+    '{raw:$raw, norm:$norm, appname:$appname, author:$author, version:$version, branch:$branch}'
+}
+
+opkg_snapshot_installed() {
+  local out_file="$1"
+  opkg list-installed 2>/dev/null | awk -F' - ' '{print $1}' | sed '/^$/d' >"$out_file"
+}
+
+pkg_list_diff_added() {
+  local before_file="$1"
+  local after_file="$2"
+  comm -13 <(sort -u "$before_file") <(sort -u "$after_file")
+}
+
+ipk_dir_has_pkg() {
+  local dir="$1"
+  local pkg="$2"
+
+  [[ -d "$dir" ]] || return 1
+  shopt -s nullglob
+  local ipk
+  for ipk in "$dir"/*.ipk; do
+    local base
+    base="$(basename "$ipk")"
+    if [[ "$base" == "${pkg}_"* || "$base" == "${pkg}-"* ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+precheck_dep_source() {
+  local dep="$1"
+  local ipk_dir="$2"
+
+  if opkg_is_installed "$dep"; then
+    echo installed
+    return 0
+  fi
+  if opkg_has_package "$dep"; then
+    echo feed
+    return 0
+  fi
+  if ipk_dir_has_pkg "$ipk_dir" "$dep"; then
+    echo packaged
+    return 0
+  fi
+  echo missing
+}
+
+build_precheck_report() {
+  local manifest_json="$1"
+  local depend_dir="$2"
+  local binary_dir="$3"
+  local app_list_input="$4"
+
+  local tmp
+  tmp="$(mktemp -d)"
+
+  local kmod_file base_file app_file
+  kmod_file="$tmp/kmod.list"
+  base_file="$tmp/base.list"
+  app_file="$tmp/app.list"
+
+  manifest_get_array "$manifest_json" kmod >"$kmod_file" || true
+  manifest_get_array "$manifest_json" base >"$base_file" || true
+  printf '%s\n' "$app_list_input" | sed '/^$/d' >"$app_file"
+
+  local result
+  result="$(jq -n \
+    --slurpfile kmod <(
+      awk 'NF{print}' "$kmod_file" | while IFS= read -r dep; do
+        status="$(precheck_dep_source "$dep" "")"
+        jq -n --arg name "$dep" --arg status "$status" '{name:$name,status:$status}'
+      done | jq -s .
+    ) \
+    --slurpfile base <(
+      awk 'NF{print}' "$base_file" | while IFS= read -r dep; do
+        status="$(precheck_dep_source "$dep" "$depend_dir")"
+        jq -n --arg name "$dep" --arg status "$status" '{name:$name,status:$status}'
+      done | jq -s .
+    ) \
+    --slurpfile app <(
+      awk 'NF{print}' "$app_file" | while IFS= read -r dep; do
+        status="$(precheck_dep_source "$dep" "$binary_dir")"
+        jq -n --arg name "$dep" --arg status "$status" '{name:$name,status:$status}'
+      done | jq -s .
+    ) \
+    '{kmod:($kmod[0] // []), base:($base[0] // []), app:($app[0] // [])}')"
+
+  rm -rf "$tmp"
+  echo "$result"
+}
+
+precheck_assert_no_missing() {
+  local precheck_json="$1"
+  local missing
+  missing="$(jq -r '
+    [
+      (.kmod[]? | select(.status=="missing") | "kmod:" + .name),
+      (.base[]? | select(.status=="missing") | "base:" + .name),
+      (.app[]? | select(.status=="missing") | "app:" + .name)
+    ]
+    | .[]
+  ' <<<"$precheck_json")"
+
+  if [[ -n "$missing" ]]; then
+    die "dependency precheck failed, missing: $(tr '\n' ' ' <<<"$missing" | sed -e 's/[[:space:]]\+/ /g' -e 's/[[:space:]]$//')"
+  fi
+}
+
+report_set_install_result() {
+  local pkgname="$1"
+  local selector="$2"
+  local manifest_json="$3"
+  local precheck_json="$4"
+  local tx_added_json="$5"
+  local app_added_json="$6"
+
+  local now
+  now="$(date +%s)"
+
+  if [[ ! -f "$PICA_REPORT_FILE" ]]; then
+    cat >"$PICA_REPORT_FILE" <<'JSON'
+{
+  "schema": 1,
+  "reports": {}
+}
+JSON
+  fi
+
+  jq --arg pkgname "$pkgname" \
+     --arg selector "$selector" \
+     --arg now "$now" \
+     --argjson manifest "$manifest_json" \
+     --argjson precheck "$precheck_json" \
+     --argjson tx_added "$tx_added_json" \
+     --argjson app_added "$app_added_json" '
+    .reports[$pkgname] = {
+      updated_at: ($now|tonumber),
+      selector: $selector,
+      package: {
+        pkgname: ($manifest.pkgname // ""),
+        appname: ($manifest.appname // $manifest.pkgname // ""),
+        author: ($manifest.author // ""),
+        version: ($manifest.version // ""),
+        branch: ($manifest.branch // ""),
+        protocol: ($manifest.protocol // ""),
+        pkgver: ($manifest.pkgver // ""),
+        pkgrel: ($manifest.pkgrel // "")
+      },
+      precheck: $precheck,
+      dependency_diff: {
+        transaction_added: $tx_added,
+        app_stage_added: $app_added
+      }
+    }
+  ' "$PICA_REPORT_FILE" >"$PICA_REPORT_FILE.tmp"
+  mv "$PICA_REPORT_FILE.tmp" "$PICA_REPORT_FILE"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
   pica -S                 Sync (download repo.json and update index)
   pica -Su                Upgrade all installed pica packages
   pica -Syu               Sync, then upgrade all installed pica packages
-  pica -Si <appname>      Install by app name (auto: opkg if available, else pica)
-  pica -So <appname>      Install by app name (force opkg)
-  pica -Sp <appname>      Install by app name (force pica repo)
+  pica -Si <selector>     Install by selector (auto: opkg if available, else pica)
+  pica -So <selector>     Install by selector (force opkg)
+  pica -Sp <selector>     Install by selector (force pica repo)
   pica -U <pkgfile>       Install/Update from .pkg.tar.gz
   pica -R <pkgname>       Remove package (no dependency handling)
   pica -Q                 List installed pica packages
@@ -106,6 +363,7 @@ Notes:
   - Requires: opkg, jq, tar
   - Config: /etc/pica/pica.json
   - State:  /var/lib/pica/db.json, /var/lib/pica/index.json
+  - Selector example: app@author:version(branch)
 EOF
 }
 
@@ -209,6 +467,38 @@ conf_get_i18n() {
 db_get_installed_manifest() {
   local pkgname="$1"
   jq -c --arg pkgname "$pkgname" '.installed[$pkgname].manifest // empty' "$PICA_DB_FILE" 2>/dev/null || true
+}
+
+db_find_installed_pkgname_by_selector() {
+  local selector="$1"
+  local parsed appname author version branch
+  parsed="$(parse_app_selector "$selector")"
+  appname="$(jq -r '.appname' <<<"$parsed")"
+  author="$(jq -r '.author' <<<"$parsed")"
+  version="$(jq -r '.version' <<<"$parsed")"
+  branch="$(jq -r '.branch' <<<"$parsed")"
+
+  jq -r --arg appname "$appname" --arg author "$author" --arg version "$version" --arg branch "$branch" '
+    .installed
+    | to_entries
+    | map(
+        select(
+          (.key == $appname) or
+          ((.value.manifest.appname // "") == $appname) or
+          ((.value.manifest.pkgname // "") == $appname)
+        )
+        | select($author == "" or (.value.manifest.author // "") == $author)
+        | select(
+            $version == "" or
+            (.value.manifest.version // "") == $version or
+            (.value.manifest.branch // "") == $version or
+            (.value.manifest.pkgver // "") == $version or
+            ((.value.manifest.pkgver // "") + "-" + ((.value.manifest.pkgrel // "") | if length > 0 then . else "0" end)) == $version
+          )
+        | select($branch == "" or (.value.manifest.branch // "") == $branch)
+      )
+    | .[0].key // ""
+  ' "$PICA_DB_FILE" 2>/dev/null || true
 }
 
 detect_platform() {
@@ -396,6 +686,35 @@ manifest_get_scalar() {
   ' <<<"$manifest_json"
 }
 
+manifest_to_selector() {
+  local manifest_json="$1"
+  local fallback_pkgname="${2:-}"
+  local appname author version branch
+
+  appname="$(manifest_get_first "$manifest_json" appname)"
+  if [[ -z "$appname" ]]; then
+    appname="$(manifest_get_first "$manifest_json" pkgname)"
+  fi
+  if [[ -z "$appname" ]]; then
+    appname="$fallback_pkgname"
+  fi
+  author="$(manifest_get_first "$manifest_json" author)"
+  version="$(manifest_get_first "$manifest_json" version)"
+  branch="$(manifest_get_first "$manifest_json" branch)"
+
+  local out="$appname"
+  if [[ -n "$author" ]]; then
+    out+="@$author"
+  fi
+  if [[ -n "$version" ]]; then
+    out+=":$version"
+  fi
+  if [[ -n "$branch" ]]; then
+    out+="($branch)"
+  fi
+  echo "$out"
+}
+
 run_hook() {
   local tmpdir="$1"
   local hook_rel="$2"
@@ -520,7 +839,7 @@ sync_repos() {
 }
 
 find_pica_package_in_index() {
-  local pkgname="$1"
+  local selector="$1"
   ensure_dirs
 
   [[ -f "$PICA_INDEX_FILE" ]] || die "missing index: run 'pica -S' first"
@@ -528,29 +847,56 @@ find_pica_package_in_index() {
   local host_platform
   host_platform="$(detect_platform)"
 
-  # Output: pkgver\trepo\turl\tfilename\tpica
-  jq -r --arg pkgname "$pkgname" '
+  local parsed appname author version branch
+  parsed="$(parse_app_selector "$selector")"
+  appname="$(jq -r '.appname' <<<"$parsed")"
+  author="$(jq -r '.author' <<<"$parsed")"
+  version="$(jq -r '.version' <<<"$parsed")"
+  branch="$(jq -r '.branch' <<<"$parsed")"
+
+  # Output:
+  # cmpver\tpkgver\tpkgrel\trepo\turl\tfilename\tpica\tpkgname
+  jq -r --arg appname "$appname" --arg author "$author" --arg version "$version" --arg branch "$branch" '
     .repos
     | to_entries
     | map({repo: .key, url: .value.url, repo_platform: (.value.platform // ""), pkgs: (.value.data.packages // [])})
     | .[]
     | .pkgs[]
-    | select(.pkgname == $pkgname)
+    | select((.appname // .pkgname // "") == $appname)
+    | select($author == "" or (.author // "") == $author)
+    | select(
+        $version == "" or
+        (.version // "") == $version or
+        (.branch // "") == $version or
+        (.pkgver // "") == $version or
+        ((.pkgver // "") + "-" + ((.pkgrel // "") | if length > 0 then . else "0" end)) == $version
+      )
+    | select($branch == "" or (.branch // "") == $branch)
     | select((.platform // "all") == "all" or (.platform // "") == "'"$host_platform"'" or (.platform // "") == (.repo_platform // ""))
-    | "\(.pkgver // \"\")\t\(.repo)\t\(.url)\t\(.filename // \"\")\t\(.pica // \"\")"
+    | [
+        ((.pkgver // "") + "-" + ((.pkgrel // "") | if length>0 then . else "0" end)),
+        (.pkgver // ""),
+        (.pkgrel // ""),
+        .repo,
+        .url,
+        (.filename // ""),
+        (.pica // ""),
+        (.pkgname // "")
+      ]
+      | @tsv
   ' "$PICA_INDEX_FILE"
 }
 
 install_pica_from_repo() {
-  local pkgname="$1"
+  local selector="$1"
   ensure_dirs
   need_cmd tar
 
   local candidates best
-  candidates="$(find_pica_package_in_index "$pkgname" || true)"
-  [[ -n "$candidates" ]] || die "package not found in pica repos: $pkgname"
+  candidates="$(find_pica_package_in_index "$selector" || true)"
+  [[ -n "$candidates" ]] || die "package not found in pica repos: $selector"
 
-  # Choose best pkgver without relying on GNU sort -V (busybox compatibility).
+  # Choose best pkgver+pkgrel without relying on GNU sort -V (busybox compatibility).
   local line
   local best_ver=""
   best=""
@@ -563,13 +909,16 @@ install_pica_from_repo() {
       best="$line"
     fi
   done <<<"$candidates"
-  [[ -n "$best" ]] || die "package not found in pica repos: $pkgname"
-  local pkgver repo url filename min_pica
-  pkgver="${best%%$'\t'*}"
-  repo="$(cut -f2 <<<"$best")"
-  url="$(cut -f3 <<<"$best")"
-  filename="$(cut -f4 <<<"$best")"
-  min_pica="$(cut -f5 <<<"$best")"
+  [[ -n "$best" ]] || die "package not found in pica repos: $selector"
+  local cmpver pkgver pkgrel repo url filename min_pica pkgname
+  cmpver="$(cut -f1 <<<"$best")"
+  pkgver="$(cut -f2 <<<"$best")"
+  pkgrel="$(cut -f3 <<<"$best")"
+  repo="$(cut -f4 <<<"$best")"
+  url="$(cut -f5 <<<"$best")"
+  filename="$(cut -f6 <<<"$best")"
+  min_pica="$(cut -f7 <<<"$best")"
+  pkgname="$(cut -f8 <<<"$best")"
 
   [[ -n "$filename" ]] || die "$repo: repo entry missing filename for $pkgname"
 
@@ -585,14 +934,21 @@ install_pica_from_repo() {
   pkg_url="${url%/}/packages/$filename"
   cached="$PICA_CACHE_DIR/pkgs/$filename"
 
-  log_info "Downloading $pkgname ($pkgver) from $repo..."
+  log_info "Downloading $pkgname ($cmpver) from $repo..."
   fetch_url "$pkg_url" >"$cached.tmp" || die "download failed: $pkg_url"
   mv "$cached.tmp" "$cached"
-  install_pkgfile "$cached"
+  install_pkgfile "$cached" "$selector"
 }
 
 install_app_via_opkg() {
-  local app="$1"
+  local selector="$1"
+  local parsed app
+  parsed="$(parse_app_selector "$selector")"
+  app="$(jq -r '.appname' <<<"$parsed")"
+  local selector_author selector_version selector_branch
+  selector_author="$(jq -r '.author' <<<"$parsed")"
+  selector_version="$(jq -r '.version' <<<"$parsed")"
+  selector_branch="$(jq -r '.branch' <<<"$parsed")"
   ensure_dirs
   need_cmd opkg
 
@@ -632,12 +988,16 @@ install_app_via_opkg() {
   manifest_json="$(
     jq -n \
       --arg pkgname "$app" \
+      --arg appname "$app" \
+      --arg author "$selector_author" \
+      --arg version "$selector_version" \
+      --arg branch "$selector_branch" \
       --arg pkgver "${base_ver:-}" \
       --arg platform "$(detect_platform)" \
       --arg arch "all" \
       --arg source "opkg" \
       --argjson opkgs "$(printf '%s\n' "${to_install[@]}" | jq -R . | jq -s .)" \
-      '{pkgname:$pkgname, pkgver:$pkgver, platform:$platform, arch:$arch, source:$source, opkg:$opkgs}'
+      '{pkgname:$pkgname, appname:$appname, author:$author, version:$version, branch:$branch, pkgver:$pkgver, platform:$platform, arch:$arch, source:$source, opkg:$opkgs}'
   )"
 
   db_set_installed "$app" "$manifest_json" "opkg"
@@ -645,13 +1005,20 @@ install_app_via_opkg() {
 }
 
 install_app_auto() {
-  local app="$1"
+  local selector="$1"
+  local parsed app
+  parsed="$(parse_app_selector "$selector")"
+  app="$(jq -r '.appname' <<<"$parsed")"
   ensure_dirs
   need_cmd opkg
 
   # Update path: do not prompt. Keep the original install source.
-  local installed_manifest source
-  installed_manifest="$(db_get_installed_manifest "$app")"
+  local installed_pkgname installed_manifest source
+  installed_pkgname="$(db_find_installed_pkgname_by_selector "$selector")"
+  installed_manifest=""
+  if [[ -n "$installed_pkgname" ]]; then
+    installed_manifest="$(db_get_installed_manifest "$installed_pkgname")"
+  fi
   if [[ -n "$installed_manifest" ]]; then
     source="$(manifest_get_first "$installed_manifest" source)"
     case "$source" in
@@ -660,24 +1027,25 @@ install_app_auto() {
         return 0
         ;;
       pica)
-        install_pica_from_repo "$app"
+        install_pica_from_repo "$selector"
         return 0
         ;;
     esac
   fi
 
   opkg update >/dev/null 2>&1 || true
-  if opkg_has_package "$app"; then
+  if ! selector_is_structured "$selector" && opkg_has_package "$app"; then
     if prompt_yn "Found '$app' in opkg feeds. Install via opkg?" 1; then
       install_app_via_opkg "$app"
       return 0
     fi
   fi
-  install_pica_from_repo "$app"
+  install_pica_from_repo "$selector"
 }
 
 install_pkgfile() {
   local pkgfile="$1"
+  local selector="${2:-}"
   [[ -f "$pkgfile" ]] || die "pkgfile not found: $pkgfile"
 
   ensure_dirs
@@ -697,6 +1065,8 @@ install_pkgfile() {
   manifest_json="$(manifest_to_json "$tmpdir/manifest")"
   pkgname="$(manifest_get_first "$manifest_json" pkgname)"
   pica="$(manifest_get_first "$manifest_json" pica)"
+  local pkgver_display
+  pkgver_display="$(manifest_pkgver_display "$manifest_json")"
   local pkg_platform
   pkg_platform="$(manifest_get_first "$manifest_json" platform)"
   local pkg_arch
@@ -713,8 +1083,32 @@ install_pkgfile() {
   cmd_update="$(manifest_get_scalar "$manifest_json" cmd_update)"
   cmd_remove="$(manifest_get_scalar "$manifest_json" cmd_remove)"
   [[ -n "$pkgname" ]] || die "manifest missing pkgname"
+  [[ -n "$(manifest_get_first "$manifest_json" pkgver)" ]] || die "manifest missing pkgver"
   [[ -n "$pkg_platform" ]] || die "manifest missing platform"
   [[ -n "$pkg_arch" ]] || die "manifest missing arch"
+
+  local canonical_selector
+  canonical_selector="$pkgname"
+  local m_appname m_author m_version m_branch
+  m_appname="$(manifest_get_first "$manifest_json" appname)"
+  m_author="$(manifest_get_first "$manifest_json" author)"
+  m_version="$(manifest_get_first "$manifest_json" version)"
+  m_branch="$(manifest_get_first "$manifest_json" branch)"
+  if [[ -n "$m_appname" ]]; then
+    canonical_selector="$m_appname"
+    if [[ -n "$m_author" ]]; then
+      canonical_selector+="@$m_author"
+    fi
+    if [[ -n "$m_version" ]]; then
+      canonical_selector+=":$m_version"
+    fi
+    if [[ -n "$m_branch" ]]; then
+      canonical_selector+="($m_branch)"
+    fi
+  fi
+  if [[ -z "$selector" ]]; then
+    selector="$canonical_selector"
+  fi
 
   local is_upgrade
   is_upgrade=0
@@ -775,6 +1169,7 @@ install_pkgfile() {
   fi
 
   log_info "Installing $pkgname..."
+  log_info "  version: $pkgver_display"
   log_info "  platform: $pkg_platform (host: $host_platform)"
   log_info "  arch: $pkg_arch"
   if [[ -n "$pkg_uname" ]]; then
@@ -789,6 +1184,15 @@ install_pkgfile() {
 
   # Mark this as a pica-installed package for auto update selection.
   manifest_json="$(jq --arg source "pica" '.source //= $source' <<<"$manifest_json")"
+
+  # Normalize optional selector metadata defaults.
+  manifest_json="$(jq --arg fallback "$pkgname" '
+    .appname //= ($fallback)
+    | .author //= ""
+    | .version //= ""
+    | .branch //= ""
+    | .protocol //= ""
+  ' <<<"$manifest_json")"
 
   resolve_lang() {
     local lang=""
@@ -805,19 +1209,7 @@ install_pkgfile() {
     echo "${template//\{lang\}/$lang}"
   }
 
-  # kmod: hard requirement. Must be installable.
-  local kmod_list
-  kmod_list="$(manifest_get_array "$manifest_json" kmod || true)"
-  if [[ -n "$kmod_list" ]]; then
-    opkg update >/dev/null 2>&1 || true
-    local dep
-    while IFS= read -r dep; do
-      [[ -z "$dep" ]] && continue
-      if ! opkg_is_installed "$dep"; then
-        opkg install "$dep" || die "kmod dependency not installable: $dep"
-      fi
-    done <<<"$kmod_list"
-  fi
+  opkg update >/dev/null 2>&1 || true
 
   install_ipk_dir() {
     local label="$1"
@@ -900,14 +1292,6 @@ install_pkgfile() {
     die "$label not available in feeds and no packaged ipks provided"
   }
 
-  # base: must be available via feeds or packaged depend/.
-  local base_list
-  base_list="$(manifest_get_array "$manifest_json" base || true)"
-  local has_depend_dir=0
-  [[ -d "$tmpdir/depend" ]] && has_depend_dir=1
-  install_via_feeds_or_ipk "base" "$base_list" "$tmpdir/depend" "$has_depend_dir"
-
-  # app: must be available via feeds or packaged binary/.
   local app_list
   app_list="$(manifest_get_array "$manifest_json" app || true)"
   local lang
@@ -918,7 +1302,44 @@ install_pkgfile() {
     app_list+=$'\n'
     app_list+="$(expand_lang_template "$i18n_template" "$lang")"
   fi
+
+  local precheck_json
+  precheck_json="$(build_precheck_report "$manifest_json" "$tmpdir/depend" "$tmpdir/binary" "$app_list")"
+  precheck_assert_no_missing "$precheck_json"
+
+  local snap_before_tx snap_before_app snap_after_app snap_after_tx
+  snap_before_tx="$(mktemp)"
+  snap_before_app="$(mktemp)"
+  snap_after_app="$(mktemp)"
+  snap_after_tx="$(mktemp)"
+  trap 'rm -rf "$tmpdir" "$snap_before_tx" "$snap_before_app" "$snap_after_app" "$snap_after_tx"' EXIT
+  opkg_snapshot_installed "$snap_before_tx"
+
+  # kmod: hard requirement. Must be installable.
+  local kmod_list
+  kmod_list="$(manifest_get_array "$manifest_json" kmod || true)"
+  if [[ -n "$kmod_list" ]]; then
+    local dep
+    while IFS= read -r dep; do
+      [[ -z "$dep" ]] && continue
+      if ! opkg_is_installed "$dep"; then
+        opkg install "$dep" || die "kmod dependency not installable: $dep"
+      fi
+    done <<<"$kmod_list"
+  fi
+
+  # base: must be available via feeds or packaged depend/.
+  local base_list
+  base_list="$(manifest_get_array "$manifest_json" base || true)"
+  local has_depend_dir=0
+  [[ -d "$tmpdir/depend" ]] && has_depend_dir=1
+  install_via_feeds_or_ipk "base" "$base_list" "$tmpdir/depend" "$has_depend_dir"
+
+  opkg_snapshot_installed "$snap_before_app"
+
+  # app: must be available via feeds or packaged binary/.
   install_via_feeds_or_ipk "app" "$app_list" "$tmpdir/binary" 1
+  opkg_snapshot_installed "$snap_after_app"
 
   # lifecycle cmd scripts
   if [[ "$is_upgrade" -eq 1 ]]; then
@@ -962,6 +1383,13 @@ install_pkgfile() {
     mkdir -p /etc/pica/env.d
     cp -f "$tmpdir/cmd/.env" "/etc/pica/env.d/${pkgname}.env"
   fi
+
+  opkg_snapshot_installed "$snap_after_tx"
+  local tx_added_json app_added_json
+  tx_added_json="$(pkg_list_diff_added "$snap_before_tx" "$snap_after_tx" | jq -R . | jq -s .)"
+  app_added_json="$(pkg_list_diff_added "$snap_before_app" "$snap_after_app" | jq -R . | jq -s .)"
+
+  report_set_install_result "$pkgname" "$selector" "$manifest_json" "$precheck_json" "$tx_added_json" "$app_added_json"
 
   db_set_installed "$pkgname" "$manifest_json" "$(readlink -f "$pkgfile" 2>/dev/null || echo "$pkgfile")"
   log_info "Transaction completed"
@@ -1013,7 +1441,7 @@ query_installed() {
     | to_entries
     | sort_by(.key)
     | .[]
-    | "\(.key)\t\(.value.manifest.pkgver // \"\")\t\(.value.manifest.platform // \"\")"
+    | "\(.key)\t\(.value.manifest.pkgver // \"\")\(if (.value.manifest.pkgrel // \"\")|length>0 then \"-\" + (.value.manifest.pkgrel // \"\") else \"\" end)\t\(.value.manifest.platform // \"\")"
   ' "$PICA_DB_FILE"
 }
 
@@ -1029,7 +1457,14 @@ query_info() {
   manifest="$(jq -c '.manifest' <<<"$entry")"
 
   echo "Name            : $pkgname"
-  echo "Version         : $(manifest_get_first "$manifest" pkgver)"
+  echo "Version         : $(manifest_pkgver_display "$manifest")"
+  echo "Pkgver          : $(manifest_get_first "$manifest" pkgver)"
+  echo "Pkgrel          : $(manifest_get_first "$manifest" pkgrel)"
+  echo "AppName         : $(manifest_get_first "$manifest" appname)"
+  echo "Author          : $(manifest_get_first "$manifest" author)"
+  echo "Version Tag     : $(manifest_get_first "$manifest" version)"
+  echo "Branch          : $(manifest_get_first "$manifest" branch)"
+  echo "Protocol        : $(manifest_get_first "$manifest" protocol)"
   echo "Platform        : $(manifest_get_first "$manifest" platform)"
   echo "Arch            : $(manifest_get_first "$manifest" arch)"
   echo "Uname           : $(manifest_get_first "$manifest" uname)"
@@ -1069,7 +1504,19 @@ upgrade_all() {
     | sort_by(.key)
     | .[]
     | select((.value.manifest.source // "") == "pica")
-    | "\(.key)\t\(.value.manifest.pkgver // \"\")"
+    | [
+        .key,
+        (.value.manifest.appname // .value.manifest.pkgname // .key),
+        (.value.manifest.author // ""),
+        (.value.manifest.version // ""),
+        (.value.manifest.branch // ""),
+        (
+          (.value.manifest.pkgver // "")
+          +
+          (if (.value.manifest.pkgrel // "") | length > 0 then "-" + (.value.manifest.pkgrel // "") else "" end)
+        )
+      ]
+      | @tsv
   ' "$PICA_DB_FILE")"
 
   if [[ -z "$list" ]]; then
@@ -1078,11 +1525,26 @@ upgrade_all() {
   fi
 
   local updated_any=0
-  local line pkgname installed_ver
+  local line pkgname appname author version branch installed_ver selector
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    pkgname="${line%%$'\t'*}"
-    installed_ver="${line#*$'\t'}"
+    pkgname="$(cut -f1 <<<"$line")"
+    appname="$(cut -f2 <<<"$line")"
+    author="$(cut -f3 <<<"$line")"
+    version="$(cut -f4 <<<"$line")"
+    branch="$(cut -f5 <<<"$line")"
+    installed_ver="$(cut -f6 <<<"$line")"
+
+    selector="$appname"
+    if [[ -n "$author" ]]; then
+      selector+="@$author"
+    fi
+    if [[ -n "$version" ]]; then
+      selector+=":$version"
+    fi
+    if [[ -n "$branch" ]]; then
+      selector+="($branch)"
+    fi
 
     local candidate best best_ver
     best_ver=""
@@ -1095,7 +1557,7 @@ upgrade_all() {
         best_ver="$v"
         best="$candidate"
       fi
-    done < <(find_pica_package_in_index "$pkgname" || true)
+    done < <(find_pica_package_in_index "$selector" || true)
 
     if [[ -z "$best" ]]; then
       log_warn "Skip $pkgname: not found in index"
@@ -1108,7 +1570,7 @@ upgrade_all() {
     fi
 
     log_info "Upgrading $pkgname: $installed_ver -> $best_ver"
-    install_pica_from_repo "$pkgname"
+    install_pica_from_repo "$selector"
     updated_any=1
   done <<<"$list"
 
@@ -1149,7 +1611,7 @@ main() {
       ;;
     -So)
       need_cmd opkg
-      [[ $# -ge 2 ]] || die "-So requires <appname>"
+      [[ $# -ge 2 ]] || die "-So requires <selector>"
       install_app_via_opkg "$2"
       ;;
     -Sp)

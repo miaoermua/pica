@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION_DEFAULT="0.0.35"
+PICA_VERSION_DEFAULT="0.0.4"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 msg() {
@@ -34,14 +34,15 @@ When such layout is present, pica-pack will build one package per
 <platform>/<arch> combination.
 
 Package filename:
-  <pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+  <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 
 Manifest format (Arch-like key/value lines):
   pkgname = demo
-  pkgver = 1.0.0-1
+  pkgver = 1.0.0
+  pkgrel = 1
   platform = all
   arch = all
-  pica = 0.0.35
+  pica = 0.0.4
   (optional) pkgdesc/url/packager/size
   (repeatable) opkg/binary/cmd/depend
 EOF
@@ -117,18 +118,30 @@ main_build() {
   [[ -d "$staging_dir/cmd" ]] || die "missing cmd/ in $staging_dir"
 
   local manifest_file="$staging_dir/manifest"
-  local pkgname pkgver platform arch pica
+  local pkgname pkgver pkgrel platform arch pica
   pkgname="$(manifest_get_first "$manifest_file" pkgname)"
   pkgver="$(manifest_get_first "$manifest_file" pkgver)"
+  pkgrel="$(manifest_get_first "$manifest_file" pkgrel)"
   platform="$(manifest_get_first "$manifest_file" platform)"
   arch="$(manifest_get_first "$manifest_file" arch)"
   pica="$(manifest_get_first "$manifest_file" pica)"
+
+  if [[ -z "$pkgrel" ]]; then
+    # Backward compatibility with legacy pkgver=1.2.3-1.
+    if [[ "$pkgver" == *"-"* ]]; then
+      pkgrel="${pkgver#*-}"
+      pkgver="${pkgver%%-*}"
+    else
+      pkgrel="1"
+    fi
+  fi
 
   platform="${platform:-all}"
   arch="${arch:-all}"
 
   [[ -n "$pkgname" ]] || die "manifest missing pkgname"
   [[ -n "$pkgver" ]] || die "manifest missing pkgver"
+  [[ -n "$pkgrel" ]] || die "manifest missing pkgrel"
   # pica field is optional. If provided, treat it as minimum required pica-cli.
   if [[ -n "$pica" ]]; then
     msg2 "Pica requires >= $pica"
@@ -161,9 +174,9 @@ main_build() {
 
     local pkgfile
     if [[ "$build_platform" == "all" ]]; then
-      pkgfile="${pkgname}-${pkgver}-${build_arch}.pkg.tar.gz"
+      pkgfile="${pkgname}-${pkgver}-${pkgrel}-${build_arch}.pkg.tar.gz"
     else
-      pkgfile="${pkgname}-${pkgver}-${build_platform}-${build_arch}.pkg.tar.gz"
+      pkgfile="${pkgname}-${pkgver}-${pkgrel}-${build_platform}-${build_arch}.pkg.tar.gz"
     fi
 
     (
@@ -171,7 +184,7 @@ main_build() {
       tmpdir="$(mktemp -d)"
       trap 'rm -rf "${tmpdir:-}"' EXIT
 
-      msg "Making package: $pkgname $pkgver"
+      msg "Making package: $pkgname ${pkgver}-${pkgrel}"
       msg2 "Platform: $build_platform"
       msg2 "Arch: $build_arch"
       if [[ -n "$pica" ]]; then
@@ -196,11 +209,17 @@ main_build() {
       mv "$tmpdir/manifest" "$tmpdir/manifest.tmp"
       manifest_delete_key "$tmpdir/manifest.tmp" arch >"$tmpdir/manifest"
       mv "$tmpdir/manifest" "$tmpdir/manifest.tmp"
+      manifest_delete_key "$tmpdir/manifest.tmp" pkgver >"$tmpdir/manifest"
+      mv "$tmpdir/manifest" "$tmpdir/manifest.tmp"
+      manifest_delete_key "$tmpdir/manifest.tmp" pkgrel >"$tmpdir/manifest"
+      mv "$tmpdir/manifest" "$tmpdir/manifest.tmp"
       manifest_delete_key "$tmpdir/manifest.tmp" uname >"$tmpdir/manifest"
       rm -f "$tmpdir/manifest.tmp"
       rm -f "$tmpdir/manifest.src"
 
       manifest_append_kv "$tmpdir/manifest" builddate "$(date +%s)"
+      manifest_append_kv "$tmpdir/manifest" pkgver "$pkgver"
+      manifest_append_kv "$tmpdir/manifest" pkgrel "$pkgrel"
       manifest_append_kv "$tmpdir/manifest" platform "$build_platform"
       manifest_append_kv "$tmpdir/manifest" arch "$build_arch"
 

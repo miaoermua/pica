@@ -27,7 +27,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.35`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.0.4`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -36,13 +36,13 @@
 ### 文件名
 
 ```
-<pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 ```
 
 当 `platform = all` 时，为避免 `all-all`，文件名简化为：
 
 ```
-<pkgname>-<pkgver>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 ```
 
 说明：
@@ -54,7 +54,8 @@
 - `arch`：OpenWrt/opkg 定义的架构字段（推荐统一用 `all`）
 - 文件名仍以 `platform` 为主（更贴近 OpenWrt target 发布）。
 - `arch` 写入 `manifest`，用于安装时校验与展示。
-- `pkgver` 推荐形如 `1.2.3-1`（语义版本 + release）。
+- `pkgver` 推荐形如 `1.2.3`（语义版本）
+- `pkgrel` 用于 pica 打包修订号（滚动更新）
 
 ### 包内结构
 
@@ -82,14 +83,14 @@ binary/<platform>/<arch>/*.ipk
 
 ```
 pica-pack/bin/<pkgname>/
-  <pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+  <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 ```
 
 当 `platform = all` 时：
 
 ```
 pica-pack/bin/<pkgname>/
-  <pkgname>-<pkgver>-<arch>.pkg.tar.gz
+  <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 ```
 
 ## manifest（Arch-like 文本）
@@ -104,7 +105,8 @@ pica-pack/bin/<pkgname>/
 
 ```
 pkgname = <name>
-pkgver = <version-release>
+pkgver = <version>
+pkgrel = <pica-release>
 platform = all
 pica = <min pica-cli version>
 arch = all
@@ -116,12 +118,33 @@ arch = all
 uname = <uname -m>
 ```
 
+应用选择器（`-Si/-Sp`）：
+
+```
+app
+app@author
+app@author:version
+app@author:version(branch)
+```
+
+说明：
+
+- `version` 当前可当“分支标签”或“指定版本标识”来筛选。
+- 当前仓库仍是滚动更新，不保留历史可安装包；该字段为未来历史版本能力预留。
+
 ### OpenWrt 扩展字段
 
 ```
 app = <opkg-package>
 base = <opkg-package>
 kmod = <opkg-package>
+
+# logical app identity (optional)
+appname = <logical app name>
+author = <publisher>
+version = <branch-or-version-tag>
+branch = <distribution branch>
+protocol = <luci|cli|...>
 
 # optional
 app_i18n = luci-i18n-foo-{lang}
@@ -198,7 +221,7 @@ luci-i18n-myapp-zh-cn
 
 ```
 ==> Making package: hello 0.1.0-1 (openwrt-any)
-  -> Pica version: 0.0.35
+  -> Pica version: 0.0.4
   -> Creating archive...
 ==> Finished: /tmp/pica-test/hello-0.1.0-1-openwrt-any.pkg.tar.gz
 ```
@@ -284,6 +307,10 @@ pica -Syu
 - 最后处理 `app`：软件源有则可选择走软件源；软件源没有则必须使用包内 `binary/*.ipk`，否则失败。
 - 安装命令：将 `cmd/` 复制到 `/usr/bin/`
 - 写入本地安装数据库：`/var/lib/pica/db.json`
+- 写入安装审计报告：`/var/lib/pica/install-report.json`
+  - 安装前依赖可用性检查（kmod/base/app）
+  - 整个事务新增依赖列表
+  - app 阶段新增依赖列表
 
 #### 卸载（-R）
 
@@ -316,7 +343,7 @@ hello	0.1.0-1	openwrt-any
 repo-root/
   repo.json
   packages/
-<pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 ```
 
 ### /etc/pica/pica.json（建议）
@@ -343,9 +370,14 @@ repo-root/
   "packages": [
     {
       "pkgname": "hello",
-      "pkgver": "0.1.0-1",
+      "pkgver": "0.1.0",
+      "pkgrel": "1",
+      "appname": "hello",
+      "author": "demo",
+      "version": "rolling",
+      "branch": "stable",
       "platform": "openwrt-any",
-      "pica": "0.0.35",
+      "pica": "0.0.4",
       "filename": "hello-0.1.0-1-openwrt-any.pkg.tar.gz",
       "md5": "<md5>",
       "size": 465

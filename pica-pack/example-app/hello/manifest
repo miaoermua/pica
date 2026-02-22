@@ -1,5 +1,12 @@
 pkgname = hello
-pkgver = 0.1.0-1
+appname = hello
+author = demo
+version = rolling
+branch = stable
+protocol = luci
+
+pkgver = 0.1.0
+pkgrel = 1
 pkgdesc = Example lifecycle package
 url = https://example.invalid
 packager = pica-pack
@@ -8,7 +15,7 @@ proprietary = false
 
 platform = all
 arch = all
-pica = 0.0.35
+pica = 0.0.4
 
 # Optional compatibility tags (recommended):
 # uname = arm64

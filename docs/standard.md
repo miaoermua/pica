@@ -15,13 +15,13 @@
 ### 文件名
 
 ```
-<pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 ```
 
 当 `platform = all` 时，为避免出现 `all-all`，文件名可简化为：
 
 ```
-<pkgname>-<pkgver>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 ```
 
 说明：
@@ -63,13 +63,13 @@ depend/<platform>/<arch>/*.ipk
 默认情况下（不传 `--outdir`），`pica-pack` 会输出到 `pica-pack/bin/<pkgname>/`：
 
 ```
-pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<platform>-<arch>.pkg.tar.gz
+pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
 ```
 
 当 `platform = all` 时：
 
 ```
-pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<arch>.pkg.tar.gz
+pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 ```
 
 ## 兼容维度：uname + arch（platform 仅展示）
@@ -95,21 +95,29 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<arch>.pkg.tar.gz
 
 ```
 pkgname = <name>
-pkgver = <version-release>
+pkgver = <version>
+pkgrel = <pica-release>
 platform = all
 arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.0.35）
+### 最新推荐字段模板（0.0.4）
 
 ```ini
 # Required
 pkgname = hello
-pkgver = 0.1.0-1
+appname = hello
+author = demo
+version = rolling
+branch = stable
+protocol = luci
+
+pkgver = 0.1.0
+pkgrel = 1
 platform = all
 arch = all
-pica = 0.0.35
+pica = 0.0.4
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -308,10 +316,32 @@ LICENSE
 
 当前版本不自动安装/展开该文件，仅作为后续 `pica` 命令显示许可证内容的基础。
 
+## app 选择器
+
+`pica -Si/-Sp` 支持以下选择器（全角符号也支持）：
+
+```
+app
+app@author
+app@author:version
+app@author:version(branch)
+```
+
+约定：
+
+- `version` 在当前滚动更新模式下主要作为“标签/过滤条件”，可用于分支名或指定版本号语义。
+- 当前不提供历史版本安装，仓库仅保留最新包；`version` 字段为未来历史版本能力预留。
+
 ## manifest 示例（LuCI1）
 
 ```
 pkgname = luci-app-example
+appname = example
+author = demo
+version = rolling
+branch = openwrt-23
+protocol = luci
+
 pkgver = 1.0.0
 pkgrel = 1
 
@@ -323,7 +353,7 @@ arch = all
 platform = openwrt
 uname = x86_64
 
-  pica = 0.0.35
+pica = 0.0.4
 
 type = luci
 luci = lua1
