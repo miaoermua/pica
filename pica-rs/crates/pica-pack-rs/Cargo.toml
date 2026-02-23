@@ -1,0 +1,12 @@
+[package]
+name = "pica-pack-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pica-pack-rs"
+path = "src/main.rs"
+
+[dependencies]
+pica-core = { path = "../pica-core" }
+serde_json = "1"

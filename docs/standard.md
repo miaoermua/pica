@@ -175,7 +175,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.0.5）
+### 最新推荐字段模板（0.1.0）
 
 ```ini
 # Required
@@ -190,7 +190,7 @@ pkgver = 0.1.0
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.0.5
+pica = 0.1.0
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -426,7 +426,7 @@ arch = all
 platform = openwrt
 uname = x86_64
 
-pica = 0.0.5
+pica = 0.1.0
 
 type = luci
 luci = lua1
