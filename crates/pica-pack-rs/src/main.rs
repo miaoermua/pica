@@ -313,10 +313,71 @@ fn build_one(req: BuildRequest<'_>) -> PicaResult<()> {
     let final_pkg = req.output_dir.join(&pkgfile);
     run_tar_create(&tmpdir, &final_pkg, &tar_items)?;
 
+    let sha256 = file_sha256_hex(&final_pkg)?;
+    let sums_file = req.output_dir.join("SHA256SUMS");
+    write_sha256sum_entry(&sums_file, &pkgfile, &sha256)?;
+
     msg(format!("Finished: {}", final_pkg.display()));
     println!("{}", final_pkg.display());
 
     fs::remove_dir_all(&tmpdir)?;
+    Ok(())
+}
+
+fn file_sha256_hex(path: &Path) -> PicaResult<String> {
+    if let Ok(output) = Command::new("sha256sum").arg(path).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(sum) = text.split_whitespace().next() {
+                if !sum.is_empty() {
+                    return Ok(sum.to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("openssl")
+        .arg("dgst")
+        .arg("-sha256")
+        .arg(path)
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some((_, sum)) = text.rsplit_once("= ") {
+                let trimmed = sum.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    Err(PicaError::msg(
+        "cannot compute sha256: need command 'sha256sum' or 'openssl'",
+    ))
+}
+
+fn write_sha256sum_entry(path: &Path, filename: &str, sha256: &str) -> PicaResult<()> {
+    let mut lines: Vec<String> = if path.is_file() {
+        fs::read_to_string(path)?
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    lines.retain(|line| {
+        let trimmed = line.trim_end();
+        !trimmed.ends_with(&format!("  {filename}"))
+    });
+    lines.push(format!("{sha256}  {filename}"));
+    lines.sort();
+
+    let mut content = lines.join("\n");
+    content.push('\n');
+    fs::write(path, content)?;
     Ok(())
 }
 

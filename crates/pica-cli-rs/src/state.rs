@@ -74,6 +74,7 @@ pub fn db_set_installed(
     pkgname: &str,
     manifest: Value,
     pkgfile: &str,
+    files: &[String],
 ) -> CliResult<()> {
     let mut db = read_json_file(db_file)?;
     ensure_json_object_field(&mut db, "installed")?;
@@ -88,6 +89,7 @@ pub fn db_set_installed(
         json!({
             "manifest": manifest,
             "pkgfile": pkgfile,
+            "files": files,
             "installed_at": now_unix_secs(),
         }),
     );

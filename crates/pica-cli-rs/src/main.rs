@@ -22,7 +22,7 @@ use pica_core::PICA_VERSION;
 use std::env;
 use std::process::{self};
 use crate::lock::LockGuard;
-use crate::commands::query::{query_info, query_installed, query_license};
+use crate::commands::query::{query_files, query_info, query_installed};
 use crate::commands::remove::remove_pkg;
 use crate::commands::sync::sync_repos;
 use crate::commands::upgrade::upgrade_all;
@@ -32,7 +32,7 @@ use crate::commands::install::{
 
 fn usage() {
     println!(
-        "Usage:\n  pica-rs -S                 Sync (download repo.json and update index)\n  pica-rs -Su                Upgrade all installed pica packages\n  pica-rs -Syu               Sync, then upgrade all installed pica packages\n  pica-rs -Si <selector>     Install by selector (auto: opkg if available, else pica)\n  pica-rs -So <selector>     Install by selector (force opkg)\n  pica-rs -Sp <selector>     Install by selector (force pica repo)\n  pica-rs -U <pkgfile|url>   Install/Update from local file or URL\n  pica-rs -R <pkgname>       Remove package (no dependency handling)\n  pica-rs -Q                 List installed pica packages\n  pica-rs -Qi <pkgname>      Show installed package info\n  pica-rs -Ql <pkgname>      Show installed package license\n  pica-rs --json ...         Emit JSON on success and error (explicit only)\n  pica-rs --json-errors ...  Emit JSON only on error\n  pica-rs --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica-rs --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica-rs --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app:version(branch)"
+        "Usage:\n  pica-rs -S                 Sync (download repo.json and update index)\n  pica-rs -Su                Upgrade all installed pica packages\n  pica-rs -Syu               Sync, then upgrade all installed pica packages\n  pica-rs -Si <selector>     Install by selector (auto: opkg if available, else pica)\n  pica-rs -So <selector>     Install by selector (force opkg)\n  pica-rs -Sp <selector>     Install by selector (force pica repo)\n  pica-rs -U <pkgfile|url>   Install/Update from local file or URL\n  pica-rs -R <pkgname>       Remove package (no dependency handling)\n  pica-rs -Q                 List installed pica packages\n  pica-rs -Qi <pkgname>      Show installed package info\n  pica-rs -Ql <pkgname>      List installed package files\n  pica-rs --json ...         Emit JSON on success and error (explicit only)\n  pica-rs --json-errors ...  Emit JSON only on error\n  pica-rs --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica-rs --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica-rs -V\n  pica-rs --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app:version(branch)"
     );
 }
 
@@ -69,9 +69,9 @@ fn main() {
         app.emit_success(command, "usage");
         return;
     }
-    if command == "--version" {
+    if matches!(command, "-V" | "--version") {
         println!("{PICA_VERSION}");
-        app.emit_success("--version", PICA_VERSION);
+        app.emit_success(command, PICA_VERSION);
         return;
     }
 
@@ -140,7 +140,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
         "-Ql" => {
             app.set_phase("query");
             let pkgname = require_arg(args, 1, "-Ql requires <pkgname>")?;
-            query_license(app, pkgname)?;
+            query_files(app, pkgname)?;
             Ok(("-Ql", pkgname.to_string()))
         }
         "-So" => {

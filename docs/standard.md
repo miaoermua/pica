@@ -98,8 +98,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.24-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.24-1-all.pkg.tar.gz
+pica -U ./hello-0.1.27-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.27-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -175,7 +175,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.24）
+### 最新推荐字段模板（0.1.27）
 
 ```ini
 # Required
@@ -188,11 +188,11 @@ branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.24
+pkgver = 0.1.27
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.1.24
+pica = 0.1.27
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -259,6 +259,11 @@ proprietary = false
 
 - `builddate`：可选；Unix 时间戳（秒）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动补全。
 - `size`：可选；字节数（bytes）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动计算并补全。
+
+校验文件（由 `pica-pack build` 自动生成，不写入 manifest）：
+
+- `SHA256SUMS`：输出目录下的校验清单，格式为 `<sha256>  <filename>`
+- 每次构建会为产物 `.pkg.tar.gz` 写入/更新对应条目
 
 ### 与 OpenWrt 安装相关的扩展字段（可重复，可选）
 
@@ -452,7 +457,7 @@ arch = all
 platform = openwrt-any
 uname = x86_64
 
-pica = 0.1.24
+pica = 0.1.27
 source = pica
 
 type = luci

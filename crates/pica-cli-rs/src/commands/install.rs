@@ -144,7 +144,7 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
         "opkg": to_install,
     });
 
-    db_set_installed(&app.paths.db_file, &appname, manifest, "opkg")?;
+    db_set_installed(&app.paths.db_file, &appname, manifest, "opkg", &to_install)?;
     app.log_info("Transaction completed");
     Ok(())
 }
@@ -304,6 +304,8 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     let canonical_selector = manifest.canonical_selector(&pkgname);
     let selector = selector.unwrap_or(canonical_selector);
 
+    let mut installed_files = Vec::new();
+
     let is_upgrade = db_has_installed(&app.paths.db_file, &pkgname)?;
 
     if !pica_required.is_empty() && !ver_ge(PICA_VERSION, &pica_required) {
@@ -462,6 +464,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
             fs::copy(&source, &target).map_err(|err| {
                 CliError::new(E_IO, format!("copy hook failed: {err}"))
             })?;
+            installed_files.push(target.display().to_string());
         } else {
             return Err(CliError::new(
                 E_PACKAGE_INVALID,
@@ -474,6 +477,18 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     if cmd_dir.is_dir() {
         ensure_dir(Path::new("/usr/bin"))?;
         copy_dir_recursive(&cmd_dir, Path::new("/usr/bin"))?;
+        if let Ok(entries) = fs::read_dir(&cmd_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+                        if name != ".env" {
+                            installed_files.push(Path::new("/usr/bin").join(name).display().to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let env_file = tmpdir.join("cmd/.env");
@@ -483,6 +498,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         fs::copy(env_file, target).map_err(|err| {
             CliError::new(E_IO, format!("copy env file failed: {err}"))
         })?;
+        installed_files.push(Path::new("/etc/pica/env.d").join(format!("{pkgname}.env")).display().to_string());
     }
 
     report_set_install_result(
@@ -524,6 +540,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         &pkgname,
         manifest_stored,
         &canonicalize_display(pkgfile),
+        &installed_files,
     )?;
 
     app.log_info("Transaction completed");

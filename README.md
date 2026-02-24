@@ -41,7 +41,7 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - `pica -R <pkgname>`：卸载（不处理依赖关系）
 - `pica -Q`：列出已安装的 pica 包
 - `pica -Qi <pkgname>`：显示已安装包信息
-- `pica -Ql <pkgname>`：显示已安装包 License
+- `pica -Ql <pkgname>`：列出该包安装到系统的文件路径
 - `pica --fetch-timeout <seconds>`：下载超时（默认 30 秒）
 - `pica --fetch-retry <count>`：下载重试次数（默认 2，表示总尝试次数=1+count）
 - `pica --fetch-retry-delay <seconds>`：重试间隔（默认 1 秒）
@@ -70,7 +70,7 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 
 - 触发方式：
   - 手动触发（`workflow_dispatch`）
-  - 推送 `v*` tag（例如 `v0.1.24`）
+  - 推送 `v*` tag（例如 `v0.1.27`）
   - Pull Request（仅在 Rust/CI 相关文件变更时）
 - 目标平台（musl，适配 OpenWrt 常见架构）：
   - `x86_64-unknown-linux-musl`

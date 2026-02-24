@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.1.24"
+PICA_VERSION="0.1.27"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"

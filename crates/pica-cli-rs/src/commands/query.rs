@@ -57,14 +57,8 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
             &manifest_get_first(manifest, "pkgrel")
         )
     );
-    println!(
-        "Pkgver          : {}",
-        manifest_get_first(manifest, "pkgver")
-    );
-    println!(
-        "Pkgrel          : {}",
-        manifest_get_first(manifest, "pkgrel")
-    );
+    println!("Pkgver          : {}", manifest_get_first(manifest, "pkgver"));
+    println!("Pkgrel          : {}", manifest_get_first(manifest, "pkgrel"));
     println!(
         "AppName         : {}",
         manifest_get_first(manifest, "appname")
@@ -82,53 +76,33 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
         "LuCI URL        : {}",
         manifest_get_first(manifest, "luci_url")
     );
-    println!(
-        "Version Tag     : {}",
-        manifest_get_first(manifest, "version")
-    );
-    println!(
-        "Branch          : {}",
-        manifest_get_first(manifest, "branch")
-    );
-    println!(
-        "Protocol        : {}",
-        manifest_get_first(manifest, "protocol")
-    );
-    println!(
-        "LuCI Desc       : {}",
-        manifest_get_first(manifest, "luci_desc")
-    );
-    println!(
-        "Platform        : {}",
-        manifest_get_first(manifest, "platform")
-    );
+    println!("Version Tag     : {}", manifest_get_first(manifest, "version"));
+    println!("Branch          : {}", manifest_get_first(manifest, "branch"));
+    println!("LuCI Desc       : {}", manifest_get_first(manifest, "luci_desc"));
+    println!("Platform        : {}", manifest_get_first(manifest, "platform"));
     println!("Arch            : {}", manifest_get_first(manifest, "arch"));
-    println!(
-        "Uname           : {}",
-        manifest_get_first(manifest, "uname")
-    );
+    println!("Uname           : {}", manifest_get_first(manifest, "uname"));
     println!("Type            : {}", manifest_get_first(manifest, "type"));
-    println!(
-        "License         : {}",
-        manifest_get_first(manifest, "license")
-    );
-    println!(
-        "Proprietary     : {}",
-        manifest_get_first(manifest, "proprietary")
-    );
+    println!("Source          : {}", manifest_get_first(manifest, "source"));
+    println!("PkgMgr          : {}", manifest_get_first(manifest, "pkgmgr"));
+    println!("Packager        : {}", manifest_get_first(manifest, "packager"));
+    println!("Build Date      : {}", manifest_get_first(manifest, "builddate"));
+    println!("Installed At    : {}", entry.get("installed_at").and_then(Value::as_u64).map(|value| value.to_string()).unwrap_or_default());
+    println!("Installed From  : {}", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
+    println!("License         : {}", manifest_get_first(manifest, "license"));
+    println!("Proprietary     : {}", manifest_get_first(manifest, "proprietary"));
 
     Ok(())
 }
 
-pub fn query_license(app: &mut App, pkgname: &str) -> CliResult<()> {
+pub fn query_files(app: &mut App, pkgname: &str) -> CliResult<()> {
     ensure_dirs(&app.paths)?;
     let db = read_json_file(&app.paths.db_file)?;
 
-    let Some(manifest) = db
+    let Some(entry) = db
         .get("installed")
         .and_then(Value::as_object)
         .and_then(|installed| installed.get(pkgname))
-        .and_then(|entry| entry.get("manifest"))
     else {
         return Err(CliError::new(
             E_ARG_INVALID,
@@ -136,14 +110,16 @@ pub fn query_license(app: &mut App, pkgname: &str) -> CliResult<()> {
         ));
     };
 
-    let license = manifest_get_first(manifest, "license");
-    let proprietary = manifest_get_first(manifest, "proprietary");
+    let files = entry
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
-    if !license.is_empty() {
-        println!("{license}");
-    }
-    if !proprietary.is_empty() {
-        println!("proprietary={proprietary}");
+    for item in files {
+        if let Some(path) = item.as_str() {
+            println!("{path}");
+        }
     }
 
     Ok(())
