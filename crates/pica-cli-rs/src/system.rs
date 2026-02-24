@@ -1,4 +1,7 @@
-use crate::{CliError, CliResult, DEFAULT_ERROR_CODE};
+use crate::{
+    CliError, CliResult, E_IO, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL, E_OPKG_REMOVE,
+    E_RUNTIME,
+};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -7,14 +10,14 @@ use std::process::Command;
 pub fn fetch_url(url: &str, is_supported_url: fn(&str) -> bool) -> CliResult<Vec<u8>> {
     if !is_supported_url(url) {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("unsupported URL: {url}"),
         ));
     }
 
     if let Some(path) = url.strip_prefix("file://") {
         return fs::read(path).map_err(|err| {
-            CliError::new(DEFAULT_ERROR_CODE, format!("read file url failed: {err}"))
+            CliError::new(E_IO, format!("read file url failed: {err}"))
         });
     }
 
@@ -29,7 +32,7 @@ pub fn fetch_url(url: &str, is_supported_url: fn(&str) -> bool) -> CliResult<Vec
     }
 
     Err(CliError::new(
-        "E_MISSING_COMMAND",
+        E_MISSING_COMMAND,
         "no fetch tool found (need uclient-fetch, wget, or curl)",
     ))
 }
@@ -39,7 +42,7 @@ pub fn need_cmd(name: &str) -> CliResult<()> {
         Ok(())
     } else {
         Err(CliError::new(
-            "E_MISSING_COMMAND",
+            E_MISSING_COMMAND,
             format!("missing required command: {name}"),
         ))
     }
@@ -104,7 +107,7 @@ pub fn opkg_install_pkg(label: &str, target: &str) -> CliResult<()> {
         .arg("install")
         .arg(target)
         .output()
-        .map_err(|err| CliError::new("E_OPKG_INSTALL", format!("opkg install failed: {err}")))?;
+        .map_err(|err| CliError::new(E_OPKG_INSTALL, format!("opkg install failed: {err}")))?;
 
     if output.status.success() {
         return Ok(());
@@ -113,13 +116,13 @@ pub fn opkg_install_pkg(label: &str, target: &str) -> CliResult<()> {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if detail.to_ascii_lowercase().contains("no space left on device") {
         return Err(CliError::new(
-            "E_NO_SPACE",
+            E_NO_SPACE,
             format!("{label} install failed: {target} (storage-full). detail=[{detail}]"),
         ));
     }
 
     Err(CliError::new(
-        "E_OPKG_INSTALL",
+        E_OPKG_INSTALL,
         format!("{label} install failed: {target} detail=[{detail}]"),
     ))
 }
@@ -129,14 +132,14 @@ pub fn opkg_remove_pkg(target: &str) -> CliResult<()> {
         .arg("remove")
         .arg(target)
         .output()
-        .map_err(|err| CliError::new("E_OPKG_REMOVE", format!("opkg remove failed: {err}")))?;
+        .map_err(|err| CliError::new(E_OPKG_REMOVE, format!("opkg remove failed: {err}")))?;
 
     if output.status.success() {
         Ok(())
     } else {
         let detail = stderr_or_stdout(&output.stdout, &output.stderr);
         Err(CliError::new(
-            "E_OPKG_REMOVE",
+            E_OPKG_REMOVE,
             format!("opkg remove failed: {target} detail=[{detail}]"),
         ))
     }
@@ -177,11 +180,11 @@ pub fn run_command_text(program: &str, args: &[&str]) -> CliResult<String> {
     let output = Command::new(program)
         .args(args)
         .output()
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, format!("{program} failed: {err}")))?;
+        .map_err(|err| CliError::new(E_IO, format!("{program} failed: {err}")))?;
 
     if !output.status.success() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("{program} exited with status {}", output.status),
         ));
     }
@@ -193,14 +196,14 @@ pub fn run_command_capture_output(program: &str, args: &[&str]) -> CliResult<Vec
     let output = Command::new(program)
         .args(args)
         .output()
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, format!("{program} failed: {err}")))?;
+        .map_err(|err| CliError::new(E_IO, format!("{program} failed: {err}")))?;
 
     if output.status.success() {
         Ok(output.stdout)
     } else {
         let detail = stderr_or_stdout(&output.stdout, &output.stderr);
         Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("{program} failed: {detail}"),
         ))
     }
@@ -213,14 +216,14 @@ pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
         .arg("-C")
         .arg(target_dir)
         .output()
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, format!("tar extract failed: {err}")))?;
+        .map_err(|err| CliError::new(E_IO, format!("tar extract failed: {err}")))?;
 
     if output.status.success() {
         Ok(())
     } else {
         let detail = stderr_or_stdout(&output.stdout, &output.stderr);
         Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("tar extract failed: {detail}"),
         ))
     }
@@ -230,14 +233,14 @@ fn run_fetch(command: &str, args: &[&str]) -> CliResult<Vec<u8>> {
     let output = Command::new(command)
         .args(args)
         .output()
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, format!("{command} failed: {err}")))?;
+        .map_err(|err| CliError::new(E_IO, format!("{command} failed: {err}")))?;
 
     if output.status.success() {
         Ok(output.stdout)
     } else {
         let detail = stderr_or_stdout(&output.stdout, &output.stderr);
         Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("{command} download failed: {detail}"),
         ))
     }

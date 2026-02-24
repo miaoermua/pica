@@ -1,6 +1,6 @@
 use crate::{
     ensure_dirs, manifest_get_array, manifest_get_scalar, App, CliError, CliResult,
-    DEFAULT_ERROR_CODE,
+    E_ARG_INVALID, E_CONFIG_INVALID,
 };
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::{opkg_remove_pkg, run_command_capture_output};
@@ -19,7 +19,7 @@ pub fn remove_pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
         .and_then(|installed| installed.get(pkgname))
         .and_then(|entry| entry.get("manifest"))
         .cloned()
-        .ok_or_else(|| CliError::new(DEFAULT_ERROR_CODE, format!("not installed: {pkgname}")))?;
+        .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))?;
 
     let cmd_remove = manifest_get_scalar(&manifest, "cmd_remove");
     let pkgmgr = {
@@ -86,7 +86,7 @@ fn run_cmd_install_tree(app: &mut App, cmd_rel: &str, label: &str) -> CliResult<
 
     if !cmd_path.is_file() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!(
                 "{label} cmd not found: {cmd_rel} (expected at {})",
                 cmd_path.display()

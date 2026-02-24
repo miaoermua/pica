@@ -1,11 +1,28 @@
+use pica_core::error::PicaError;
 use serde_json::{json, Value};
 use std::env;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ETC_DIR: &str = "/etc/pica";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/pica";
-pub const DEFAULT_ERROR_CODE: &str = "E_RUNTIME";
-
+pub const E_RUNTIME: &str = "E_RUNTIME";
+pub const E_ARG_INVALID: &str = "E_ARG_INVALID";
+pub const E_IO: &str = "E_IO";
+pub const E_JSON_INVALID: &str = "E_JSON_INVALID";
+pub const E_DB_INVALID: &str = "E_DB_INVALID";
+pub const E_INDEX_INVALID: &str = "E_INDEX_INVALID";
+pub const E_CONFIG_INVALID: &str = "E_CONFIG_INVALID";
+pub const E_POLICY_INVALID: &str = "E_POLICY_INVALID";
+pub const E_REPO_INVALID: &str = "E_REPO_INVALID";
+pub const E_MISSING_COMMAND: &str = "E_MISSING_COMMAND";
+pub const E_LOCK_BUSY: &str = "E_LOCK_BUSY";
+pub const E_OPKG_INSTALL: &str = "E_OPKG_INSTALL";
+pub const E_OPKG_REMOVE: &str = "E_OPKG_REMOVE";
+pub const E_NO_SPACE: &str = "E_NO_SPACE";
+pub const E_MANIFEST_INVALID: &str = "E_MANIFEST_INVALID";
+pub const E_PACKAGE_INVALID: &str = "E_PACKAGE_INVALID";
+pub const E_PLATFORM_UNSUPPORTED: &str = "E_PLATFORM_UNSUPPORTED";
+pub const E_VERSION_INCOMPATIBLE: &str = "E_VERSION_INCOMPATIBLE";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonMode {
     None,
@@ -99,6 +116,16 @@ impl CliError {
     }
 }
 
+impl From<PicaError> for CliError {
+    fn from(value: PicaError) -> Self {
+        match value {
+            PicaError::Message(message) => CliError::new(E_RUNTIME, message),
+            PicaError::Io(err) => CliError::new(E_IO, err.to_string()),
+            PicaError::Json(err) => CliError::new(E_JSON_INVALID, err.to_string()),
+        }
+    }
+}
+
 pub struct App {
     pub paths: Paths,
     pub options: Options,
@@ -167,7 +194,7 @@ impl App {
 pub fn require_arg<'a>(args: &'a [String], index: usize, message: &str) -> CliResult<&'a str> {
     args.get(index)
         .map(String::as_str)
-        .ok_or_else(|| CliError::new(DEFAULT_ERROR_CODE, message))
+        .ok_or_else(|| CliError::new(E_ARG_INVALID, message))
 }
 
 pub fn parse_options(args: Vec<String>) -> CliResult<(Options, Vec<String>)> {
@@ -194,13 +221,13 @@ pub fn parse_options(args: Vec<String>) -> CliResult<(Options, Vec<String>)> {
             "--feed-policy" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(CliError::new(
-                        "E_POLICY_INVALID",
+                        E_POLICY_INVALID,
                         "--feed-policy requires <mode>",
                     ));
                 };
                 feed_policy = FeedPolicy::parse(value).ok_or_else(|| {
                     CliError::new(
-                        "E_POLICY_INVALID",
+                        E_POLICY_INVALID,
                         format!("invalid --feed-policy: {value}"),
                     )
                 })?;
@@ -226,25 +253,25 @@ pub fn parse_options(args: Vec<String>) -> CliResult<(Options, Vec<String>)> {
 pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
     std::fs::create_dir_all(&paths.etc_dir).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("mkdir {} failed: {err}", paths.etc_dir.display()),
         )
     })?;
     std::fs::create_dir_all(&paths.state_dir).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("mkdir {} failed: {err}", paths.state_dir.display()),
         )
     })?;
     std::fs::create_dir_all(&paths.cache_dir).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("mkdir {} failed: {err}", paths.cache_dir.display()),
         )
     })?;
     std::fs::create_dir_all(&paths.repos_cache_dir).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("mkdir {} failed: {err}", paths.repos_cache_dir.display()),
         )
     })?;
@@ -292,23 +319,23 @@ fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_IO,
                 format!("mkdir {} failed: {err}", parent.display()),
             )
         })?;
     }
 
     let content = serde_json::to_string_pretty(value)
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, err.to_string()))?;
+        .map_err(|err| CliError::new(E_JSON_INVALID, err.to_string()))?;
     std::fs::write(&tmp_path, content).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("write {} failed: {err}", tmp_path.display()),
         )
     })?;
     std::fs::rename(&tmp_path, path).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("rename {} failed: {err}", path.display()),
         )
     })?;

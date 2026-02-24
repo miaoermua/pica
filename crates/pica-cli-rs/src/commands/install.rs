@@ -4,7 +4,8 @@ use crate::{
     make_temp_dir, manifest_get_first, normalize_uname, pkg_list_diff_added, pkgver_cmp_key,
     pkgver_ge, precheck_assert_no_missing, reorder_app_list, required_manifest_field,
     resolve_lang, run_hook, ver_ge, write_file_atomic, App, CliError, CliResult, Manifest, Selector,
-    DEFAULT_ERROR_CODE, PICA_VERSION,
+    E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
+    E_REPO_INVALID, E_VERSION_INCOMPATIBLE, PICA_VERSION,
 };
 use crate::state::{
     db_find_installed_pkgname_by_selector, db_has_installed, db_set_installed, read_json_file,
@@ -15,6 +16,7 @@ use crate::system::{
     opkg_is_installed, opkg_snapshot_installed, opkg_update_ignore, run_command_text,
     run_tar_extract,
 };
+use pica_core::io::now_unix_secs;
 use pica_core::repo::is_supported_url;
 use serde_json::{json, Value};
 use std::fs;
@@ -111,7 +113,7 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
 
     if to_install.is_empty() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("opkg: package not found: {appname}"),
         ));
     }
@@ -154,7 +156,7 @@ pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     let candidates = crate::find_pica_candidates_in_index(app, selector)?;
     if candidates.is_empty() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("package not found in pica repos: {selector}"),
         ));
     }
@@ -173,7 +175,7 @@ pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     if let Some(min_pica) = &best.min_pica {
         if !min_pica.is_empty() && !ver_ge(PICA_VERSION, min_pica) {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_VERSION_INCOMPATIBLE,
                 format!("pica too old: pkg requires >= {min_pica}, cli is {PICA_VERSION}"),
             ));
         }
@@ -181,7 +183,7 @@ pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
     if best.filename.contains('/') || !best.filename.ends_with(".pkg.tar.gz") {
         return Err(CliError::new(
-            "E_REPO_INVALID",
+            E_REPO_INVALID,
             format!("{}: invalid filename: {}", best.repo, best.filename),
         ));
     }
@@ -189,7 +191,7 @@ pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     let download_url = if let Some(url) = &best.download_url {
         if !is_supported_url(url) {
             return Err(CliError::new(
-                "E_REPO_INVALID",
+                E_REPO_INVALID,
                 format!(
                     "{}: invalid download_url for {}: {url}",
                     best.repo, best.pkgname
@@ -246,7 +248,7 @@ pub fn install_pkg_source(app: &mut App, source: &str, selector: Option<String>)
     }
 
     Err(CliError::new(
-        DEFAULT_ERROR_CODE,
+        E_CONFIG_INVALID,
         format!("pkg source not found or unsupported URL: {source}"),
     ))
 }
@@ -254,7 +256,7 @@ pub fn install_pkg_source(app: &mut App, source: &str, selector: Option<String>)
 pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
     if !pkgfile.is_file() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_PACKAGE_INVALID,
             format!("pkgfile not found: {}", pkgfile.display()),
         ));
     }
@@ -270,19 +272,19 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     let manifest_file = tmpdir.join("manifest");
     if !manifest_file.is_file() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_PACKAGE_INVALID,
             "package missing manifest",
         ));
     }
     if !tmpdir.join("cmd").is_dir() {
-        return Err(CliError::new(DEFAULT_ERROR_CODE, "package missing cmd/"));
+        return Err(CliError::new(E_PACKAGE_INVALID, "package missing cmd/"));
     }
     if !tmpdir.join("binary").is_dir() {
-        return Err(CliError::new(DEFAULT_ERROR_CODE, "package missing binary/"));
+        return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
     }
 
     let manifest = Manifest::from_file(&manifest_file)
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, format!("invalid manifest: {err}")))?;
+        .map_err(|err| CliError::new(E_MANIFEST_INVALID, format!("invalid manifest: {err}")))?;
 
     let pkgname = required_manifest_field(&manifest, "pkgname")?;
     let pica_required = manifest.get_first("pica");
@@ -306,7 +308,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
 
     if !pica_required.is_empty() && !ver_ge(PICA_VERSION, &pica_required) {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_VERSION_INCOMPATIBLE,
             format!("pica too old: pkg requires >= {pica_required}, cli is {PICA_VERSION}"),
         ));
     }
@@ -319,7 +321,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
 
     if !pkg_uname.is_empty() && pkg_uname_norm != host_uname {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_PLATFORM_UNSUPPORTED,
             format!("unsupported uname: pkg={pkg_uname} host={host_uname_raw}"),
         ));
     }
@@ -328,7 +330,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         let host_arches = detect_opkg_arches();
         if !host_arches.iter().any(|arch| arch == &pkg_arch) {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_PLATFORM_UNSUPPORTED,
                 format!(
                     "unsupported arch: pkg={pkg_arch} (opkg arches: {})",
                     host_arches.join(" ")
@@ -344,7 +346,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     };
     if pkgmgr != "opkg" && pkgmgr != "none" {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("invalid pkgmgr value: {pkgmgr} (supported: opkg, none)"),
         ));
     }
@@ -352,26 +354,26 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     if manifest.has_type("luci") {
         if pkg_luci.is_empty() {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_CONFIG_INVALID,
                 "type=luci requires luci=<lua1|js2>",
             ));
         }
         if pkg_luci != "lua1" && pkg_luci != "js2" {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_CONFIG_INVALID,
                 format!("invalid luci value: {pkg_luci}"),
             ));
         }
         let host_luci = detect_luci_variant();
         if host_luci == "unknown" {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_PLATFORM_UNSUPPORTED,
                 format!("luci variant required ({pkg_luci}) but cannot detect host"),
             ));
         }
         if host_luci != pkg_luci {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_PLATFORM_UNSUPPORTED,
                 format!("unsupported luci variant: pkg={pkg_luci} host={host_luci}"),
             ));
         }
@@ -458,11 +460,11 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
                 ensure_dir(parent)?;
             }
             fs::copy(&source, &target).map_err(|err| {
-                CliError::new(DEFAULT_ERROR_CODE, format!("copy hook failed: {err}"))
+                CliError::new(E_IO, format!("copy hook failed: {err}"))
             })?;
         } else {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_PACKAGE_INVALID,
                 format!("cmd script not found in package: {hook_rel}"),
             ));
         }
@@ -479,7 +481,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         ensure_dir(Path::new("/etc/pica/env.d"))?;
         let target = Path::new("/etc/pica/env.d").join(format!("{pkgname}.env"));
         fs::copy(env_file, target).map_err(|err| {
-            CliError::new(DEFAULT_ERROR_CODE, format!("copy env file failed: {err}"))
+            CliError::new(E_IO, format!("copy env file failed: {err}"))
         })?;
     }
 
@@ -549,9 +551,35 @@ pub fn sanitize_cache_filename(value: &str) -> String {
     out
 }
 
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_cache_filename, TempDirGuard};
+    use std::fs;
+
+    #[test]
+    fn sanitize_cache_filename_keeps_extension() {
+        let value = sanitize_cache_filename("hello package");
+        assert!(value.ends_with(".pkg.tar.gz"));
+        assert!(!value.contains(' '));
+    }
+
+    #[test]
+    fn temp_dir_guard_cleans_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "pica-install-guard-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        fs::write(path.join("marker"), "x").expect("write marker");
+
+        {
+            let _guard = TempDirGuard::new(path.clone());
+        }
+
+        assert!(!path.exists());
+    }
 }

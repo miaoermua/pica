@@ -1,5 +1,6 @@
 use crate::{
-    ensure_dirs, manifest_get_first, pkgver_cmp_key, App, CliError, CliResult, DEFAULT_ERROR_CODE,
+    ensure_dirs, manifest_get_first, pkgver_cmp_key, App, CliError, CliResult, E_ARG_INVALID,
+    E_DB_INVALID,
 };
 use crate::state::read_json_file;
 use serde_json::Value;
@@ -10,7 +11,7 @@ pub fn query_installed(app: &mut App) -> CliResult<()> {
     let installed = db
         .get("installed")
         .and_then(Value::as_object)
-        .ok_or_else(|| CliError::new("E_DB_INVALID", "db installed is not object"))?;
+        .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
 
     let mut names: Vec<String> = installed.keys().cloned().collect();
     names.sort();
@@ -41,7 +42,7 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
         .and_then(|installed| installed.get(pkgname))
     else {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_ARG_INVALID,
             format!("not installed: {pkgname}"),
         ));
     };
@@ -130,7 +131,7 @@ pub fn query_license(app: &mut App, pkgname: &str) -> CliResult<()> {
         .and_then(|entry| entry.get("manifest"))
     else {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_ARG_INVALID,
             format!("not installed: {pkgname}"),
         ));
     };

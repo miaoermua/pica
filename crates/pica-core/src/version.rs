@@ -33,7 +33,80 @@ pub fn pkgver_ge(a: &str, b: &str) -> bool {
             Some(Ordering::Less) | None => false,
         }
     } else {
-        a >= b
+        match compare_mixed_version(&a_ver, &b_ver) {
+            Ordering::Greater => true,
+            Ordering::Equal => compare_numeric_rel(&a_rel, &b_rel) != Ordering::Less,
+            Ordering::Less => false,
+        }
+    }
+}
+
+fn compare_mixed_version(a: &str, b: &str) -> Ordering {
+    let a_tokens = tokenize_version(a);
+    let b_tokens = tokenize_version(b);
+
+    let len = a_tokens.len().max(b_tokens.len());
+    for index in 0..len {
+        let left = a_tokens.get(index).copied().unwrap_or(Token::Num(0));
+        let right = b_tokens.get(index).copied().unwrap_or(Token::Num(0));
+        let ord = compare_token(left, right);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    Ordering::Equal
+}
+
+#[derive(Clone, Copy)]
+enum Token<'a> {
+    Num(u64),
+    Text(&'a str),
+}
+
+fn tokenize_version(input: &str) -> Vec<Token<'_>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let chars: Vec<char> = input.chars().collect();
+
+    while start < chars.len() {
+        if !chars[start].is_ascii_alphanumeric() {
+            start += 1;
+            continue;
+        }
+
+        let is_digit = chars[start].is_ascii_digit();
+        let mut end = start + 1;
+        while end < chars.len() {
+            let ch = chars[end];
+            if !ch.is_ascii_alphanumeric() || ch.is_ascii_digit() != is_digit {
+                break;
+            }
+            end += 1;
+        }
+
+        let segment = &input[chars[..start].iter().map(|ch| ch.len_utf8()).sum::<usize>()
+            ..chars[..end].iter().map(|ch| ch.len_utf8()).sum::<usize>()];
+
+        if is_digit {
+            let value = segment.parse::<u64>().unwrap_or(0);
+            out.push(Token::Num(value));
+        } else {
+            out.push(Token::Text(segment));
+        }
+
+        start = end;
+    }
+
+    out
+}
+
+fn compare_token(left: Token<'_>, right: Token<'_>) -> Ordering {
+    match (left, right) {
+        (Token::Num(a), Token::Num(b)) => a.cmp(&b),
+        (Token::Text(a), Token::Text(b)) => a.cmp(b),
+        (Token::Num(_), Token::Text(_)) => Ordering::Greater,
+        (Token::Text(_), Token::Num(_)) => Ordering::Less,
     }
 }
 
@@ -105,6 +178,13 @@ mod tests {
         assert!(pkgver_ge("1.2.4-1", "1.2.3-9"));
         assert!(!pkgver_ge("1.2.3-1", "1.2.3-2"));
         assert!(pkgver_ge("1.2.3", "1.2.3-0"));
+    }
+
+    #[test]
+    fn compare_mixed_pkgver_rel() {
+        assert!(!pkgver_ge("9.0-1", "10.0-1"));
+        assert!(pkgver_ge("1.0.0-rc10", "1.0.0-rc2"));
+        assert!(pkgver_ge("1.0.0", "1.0.0-rc1"));
     }
 
     #[test]

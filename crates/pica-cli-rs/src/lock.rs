@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::{CliError, CliResult};
+use crate::{CliError, CliResult, E_IO, E_LOCK_BUSY, E_RUNTIME};
 
 pub struct LockGuard {
     lock_dir: PathBuf,
@@ -23,13 +23,13 @@ impl LockGuard {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(CliError::new(
-                    "E_LOCK_BUSY",
+                    E_LOCK_BUSY,
                     format!("cannot lock pica database: {} exists", lock_dir.display()),
                 ));
             }
             Err(err) => {
                 return Err(CliError::new(
-                    "E_RUNTIME",
+                    E_RUNTIME,
                     format!("cannot lock pica database: {err}"),
                 ));
             }
@@ -51,7 +51,7 @@ impl Drop for LockGuard {
 fn ensure_dir(path: &Path) -> CliResult<()> {
     fs::create_dir_all(path).map_err(|err| {
         CliError::new(
-            "E_RUNTIME",
+            E_IO,
             format!("mkdir {} failed: {err}", path.display()),
         )
     })

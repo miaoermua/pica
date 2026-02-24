@@ -1,7 +1,8 @@
 use crate::state::read_json_file;
 use crate::system;
 use crate::{
-    ensure_dirs, App, CliError, CliResult, FeedPolicy, Manifest, Selector, DEFAULT_ERROR_CODE,
+    ensure_dirs, App, CliError, CliResult, FeedPolicy, Manifest, Selector, E_CONFIG_INVALID,
+    E_INDEX_INVALID, E_IO, E_POLICY_INVALID, E_RUNTIME,
 };
 use pica_core::io::{
     copy_dir_recursive as core_copy_dir_recursive, make_temp_dir as core_make_temp_dir,
@@ -28,7 +29,7 @@ pub(crate) fn find_pica_candidates_in_index(
     let repos = index
         .get("repos")
         .and_then(Value::as_object)
-        .ok_or_else(|| CliError::new(DEFAULT_ERROR_CODE, "missing index: run 'pica -S' first"))?;
+        .ok_or_else(|| CliError::new(E_INDEX_INVALID, "missing index: run 'pica -S' first"))?;
 
     for (repo_name, repo_entry) in repos {
         let repo_url = repo_entry
@@ -155,7 +156,7 @@ pub(crate) fn required_manifest_field(manifest: &Manifest, key: &str) -> CliResu
     let value = manifest.get_first(key);
     if value.is_empty() {
         Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("manifest missing {key}"),
         ))
     } else {
@@ -312,7 +313,7 @@ pub(crate) fn precheck_assert_no_missing(precheck: &Value) -> CliResult<()> {
         Ok(())
     } else {
         Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("dependency precheck failed, missing: {}", missing.join(" ")),
         ))
     }
@@ -434,7 +435,7 @@ pub(crate) fn install_via_feeds_or_ipk(
     let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir)?;
     if use_feeds == -1 {
         return Err(CliError::new(
-            "E_POLICY_INVALID",
+            E_POLICY_INVALID,
             format!("{label} requires feed packages under feed-only policy"),
         ));
     }
@@ -442,7 +443,7 @@ pub(crate) fn install_via_feeds_or_ipk(
     if use_feeds == 1 {
         if pkg_list.is_empty() {
             return Err(CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_CONFIG_INVALID,
                 format!("{label} packages not defined in manifest"),
             ));
         }
@@ -461,7 +462,7 @@ pub(crate) fn install_via_feeds_or_ipk(
     }
 
     Err(CliError::new(
-        DEFAULT_ERROR_CODE,
+        E_RUNTIME,
         format!("{label} not available in feeds and no packaged ipks provided"),
     ))
 }
@@ -474,7 +475,7 @@ pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
     let mut installed_any = false;
     let entries = fs::read_dir(dir).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("read {} failed: {err}", dir.display()),
         )
     })?;
@@ -490,7 +491,7 @@ pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
 
     if !installed_any {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("no ipk files found in {label} dir: {}", dir.display()),
         ));
     }
@@ -529,7 +530,7 @@ pub(crate) fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str
     let hook_path = tmpdir.join(hook_rel);
     if !hook_path.is_file() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("{label} hook not found: {hook_rel}"),
         ));
     }
@@ -583,13 +584,13 @@ pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
 
     fs::write(&tmp_path, content).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("write {} failed: {err}", tmp_path.display()),
         )
     })?;
     fs::rename(&tmp_path, path).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("rename {} failed: {err}", path.display()),
         )
     })?;
@@ -600,14 +601,14 @@ pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
 pub(crate) fn ensure_dir(path: &Path) -> CliResult<()> {
     fs::create_dir_all(path).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("mkdir {} failed: {err}", path.display()),
         )
     })
 }
 
 pub(crate) fn make_temp_dir(prefix: &str) -> CliResult<PathBuf> {
-    core_make_temp_dir(prefix).map_err(map_core_error)
+    core_make_temp_dir(prefix).map_err(CliError::from)
 }
 
 pub(crate) fn need_cmd(name: &str) -> CliResult<()> {
@@ -639,11 +640,7 @@ pub(crate) fn run_command_capture_output(program: &str, args: &[&str]) -> CliRes
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> CliResult<()> {
-    core_copy_dir_recursive(source, target).map_err(map_core_error)
-}
-
-fn map_core_error(err: pica_core::error::PicaError) -> CliError {
-    CliError::new(DEFAULT_ERROR_CODE, err.to_string())
+    core_copy_dir_recursive(source, target).map_err(CliError::from)
 }
 
 pub(crate) fn manifest_get_array(value: &Value, key: &str) -> Vec<String> {
@@ -726,5 +723,44 @@ mod tests {
         assert_eq!(manifest_get_scalar(&value, "single"), "baz");
         assert_eq!(manifest_get_scalar(&value, "app"), "");
         assert_eq!(manifest_get_scalar(&value, "missing"), "");
+    }
+
+    #[test]
+    fn should_use_feeds_policy_matrix_basics() {
+        let paths = crate::Paths::from_env();
+        let base = App::new(
+            paths,
+            crate::Options {
+                json_mode: crate::JsonMode::None,
+                non_interactive: true,
+                feed_policy: FeedPolicy::FeedOnly,
+            },
+        );
+
+        let decision = should_use_feeds(&base, "app", &["a".to_string()], true)
+            .expect("feed-only with feeds must pass");
+        assert_eq!(decision, 1);
+
+        let no_feed = should_use_feeds(&base, "app", &[], true)
+            .expect("feed-only without feeds returns sentinel");
+        assert_eq!(no_feed, -1);
+
+        let mut packaged_only = base;
+        packaged_only.options.feed_policy = FeedPolicy::PackagedOnly;
+        let packaged = should_use_feeds(&packaged_only, "app", &["a".to_string()], true)
+            .expect("packaged-only should choose ipk");
+        assert_eq!(packaged, 0);
+
+        let mut feed_first = packaged_only;
+        feed_first.options.feed_policy = FeedPolicy::FeedFirst;
+        let feed_first_choice = should_use_feeds(&feed_first, "app", &["a".to_string()], true)
+            .expect("feed-first with list should choose feed");
+        assert_eq!(feed_first_choice, 1);
+
+        let mut packaged_first = feed_first;
+        packaged_first.options.feed_policy = FeedPolicy::PackagedFirst;
+        let packaged_first_choice = should_use_feeds(&packaged_first, "app", &["a".to_string()], true)
+            .expect("packaged-first with ipk should choose ipk");
+        assert_eq!(packaged_first_choice, 0);
     }
 }

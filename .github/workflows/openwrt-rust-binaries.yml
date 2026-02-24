@@ -32,6 +32,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure Rust target installed
+        run: rustup target add "${{ matrix.target }}"
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -84,4 +89,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*.tar.gz
-

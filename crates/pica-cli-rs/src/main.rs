@@ -7,7 +7,10 @@ mod helpers;
 
 use crate::types::{
     ensure_dirs, parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode,
-    Options, Paths, DEFAULT_ERROR_CODE,
+    E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, E_INDEX_INVALID, E_IO, E_JSON_INVALID,
+    E_LOCK_BUSY, E_MANIFEST_INVALID, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL,
+    E_OPKG_REMOVE, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED, E_POLICY_INVALID, E_REPO_INVALID,
+    E_RUNTIME, E_VERSION_INCOMPATIBLE, Options, Paths,
 };
 use crate::state::read_json_file;
 use crate::helpers::*;
@@ -74,7 +77,7 @@ fn main() {
 
     if app.options.json_mode != JsonMode::None && !has_command("jq") {
         let err = CliError::new(
-            "E_MISSING_COMMAND",
+            E_MISSING_COMMAND,
             "--json/--json-errors requires command: jq",
         );
         app.emit_error(&err);
@@ -178,7 +181,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
             Ok(("-R", pkgname.to_string()))
         }
         other => Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_ARG_INVALID,
             format!("unknown arg: {other}"),
         )),
     }

@@ -1,7 +1,8 @@
 use crate::{
     ensure_dirs, manifest_get_first, pkgver_cmp_key, CliError, CliResult, Selector,
-    DEFAULT_ERROR_CODE,
+    E_DB_INVALID, E_IO, E_JSON_INVALID, E_RUNTIME,
 };
+use pica_core::io::now_unix_secs;
 use serde_json::{json, Map, Value};
 use std::ffi::OsString;
 use std::fs;
@@ -80,7 +81,7 @@ pub fn db_set_installed(
     let installed = db
         .get_mut("installed")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| CliError::new("E_DB_INVALID", "db installed is not object"))?;
+        .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
 
     installed.insert(
         pkgname.to_string(),
@@ -101,7 +102,7 @@ pub fn db_del_installed(db_file: &Path, pkgname: &str) -> CliResult<()> {
     let installed = db
         .get_mut("installed")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| CliError::new("E_DB_INVALID", "db installed is not object"))?;
+        .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
     installed.remove(pkgname);
 
     write_json_atomic_pretty(db_file, &db)
@@ -166,14 +167,14 @@ pub fn db_find_installed_pkgname_by_selector(
 pub fn read_json_file(path: &Path) -> CliResult<Value> {
     let content = fs::read_to_string(path).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("read {} failed: {err}", path.display()),
         )
     })?;
 
     serde_json::from_str(&content).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_JSON_INVALID,
             format!("parse {} failed: {err}", path.display()),
         )
     })
@@ -187,23 +188,23 @@ pub fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             CliError::new(
-                DEFAULT_ERROR_CODE,
+                E_IO,
                 format!("mkdir {} failed: {err}", parent.display()),
             )
         })?;
     }
 
     let content = serde_json::to_string_pretty(value)
-        .map_err(|err| CliError::new(DEFAULT_ERROR_CODE, err.to_string()))?;
+        .map_err(|err| CliError::new(E_JSON_INVALID, err.to_string()))?;
     fs::write(&tmp_path, content).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("write {} failed: {err}", tmp_path.display()),
         )
     })?;
     fs::rename(&tmp_path, path).map_err(|err| {
         CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_IO,
             format!("rename {} failed: {err}", path.display()),
         )
     })?;
@@ -213,7 +214,7 @@ pub fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
 
 pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
     let Some(obj) = value.as_object_mut() else {
-        return Err(CliError::new(DEFAULT_ERROR_CODE, "json root is not object"));
+        return Err(CliError::new(E_RUNTIME, "json root is not object"));
     };
 
     if !obj.contains_key(key) {
@@ -222,19 +223,12 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
 
     if !obj.get(key).is_some_and(Value::is_object) {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_RUNTIME,
             format!("json field '{key}' is not object"),
         ));
     }
 
     Ok(())
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -258,7 +252,7 @@ mod tests {
 
         let mut invalid = json!({"installed": []});
         let err = ensure_json_object_field(&mut invalid, "installed").expect_err("must fail");
-        assert_eq!(err.code, DEFAULT_ERROR_CODE);
+        assert_eq!(err.code, E_RUNTIME);
     }
 
     #[test]

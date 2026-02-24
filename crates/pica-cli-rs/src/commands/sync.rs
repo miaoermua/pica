@@ -1,8 +1,10 @@
 use crate::{
-    detect_platform, ensure_dirs, App, CliError, CliResult, DEFAULT_ERROR_CODE,
+    detect_platform, ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID,
+    E_REPO_INVALID,
 };
 use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
 use crate::system::{fetch_url, has_command, opkg_has_package, opkg_update_ignore};
+use pica_core::io::now_unix_secs;
 use pica_core::repo::parse_repo_json;
 use serde_json::{json, Value};
 
@@ -19,7 +21,7 @@ pub fn sync_repos(app: &mut App) -> CliResult<()> {
 
     if repos.is_empty() {
         return Err(CliError::new(
-            DEFAULT_ERROR_CODE,
+            E_CONFIG_INVALID,
             format!("no repos configured in {}", app.paths.conf_file.display()),
         ));
     }
@@ -53,13 +55,13 @@ pub fn sync_repos(app: &mut App) -> CliResult<()> {
 
         if name.is_empty() {
             return Err(CliError::new(
-                "E_CONFIG_INVALID",
+                E_CONFIG_INVALID,
                 format!("repo[{repo_index}] missing name"),
             ));
         }
         if url.is_empty() {
             return Err(CliError::new(
-                "E_CONFIG_INVALID",
+                E_CONFIG_INVALID,
                 format!("repo[{repo_index}] missing url"),
             ));
         }
@@ -69,19 +71,19 @@ pub fn sync_repos(app: &mut App) -> CliResult<()> {
         let repo_raw = fetch_url(&repo_json_url, crate::is_supported_url)?;
         let repo_text = String::from_utf8(repo_raw).map_err(|_| {
             CliError::new(
-                "E_REPO_INVALID",
+                E_REPO_INVALID,
                 format!("{name}: repo.json is not valid UTF-8"),
             )
         })?;
         let parsed_repo = parse_repo_json(&repo_text).map_err(|error| {
             CliError::new(
-                "E_REPO_INVALID",
+                E_REPO_INVALID,
                 format!("{name}: repo.json failed strict schema/filename validation: {error}"),
             )
         })?;
 
         let repo_value = serde_json::to_value(&parsed_repo)
-            .map_err(|error| CliError::new("E_REPO_INVALID", error.to_string()))?;
+            .map_err(|error| CliError::new(E_REPO_INVALID, error.to_string()))?;
 
         let repo_cache_file = app.paths.repos_cache_dir.join(format!("{name}.json"));
         write_json_atomic_pretty(&repo_cache_file, &repo_value)?;
@@ -103,7 +105,7 @@ pub fn sync_repos(app: &mut App) -> CliResult<()> {
         let repos_obj = index
             .get_mut("repos")
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| CliError::new("E_INDEX_INVALID", "index repos is not object"))?;
+            .ok_or_else(|| CliError::new(E_INDEX_INVALID, "index repos is not object"))?;
         repos_obj.insert(name.to_string(), repo_obj);
 
         app.log_info(format!("{name} updated"));
@@ -188,13 +190,6 @@ fn append_dep_list(output: &mut Vec<String>, value: Option<&Value>) {
         }
         _ => {}
     }
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

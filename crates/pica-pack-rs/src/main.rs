@@ -529,4 +529,29 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn rewrite_manifest_supports_legacy_pkgver_without_pkgrel() {
+        let root = unique_tmp_dir("legacy-pkgver");
+        let source = root.join("manifest.src");
+        let target = root.join("manifest.dst");
+
+        fs::write(
+            &source,
+            "pkgname = hello\npkgver = 0.1.0-7\nplatform = old\narch = old\n",
+        )
+        .expect("write source manifest");
+
+        rewrite_manifest_for_build(&source, &target, "0.1.0", "7", "all", "all")
+            .expect("rewrite manifest");
+
+        let out = fs::read_to_string(&target).expect("read target manifest");
+        assert!(out.contains("pkgver = 0.1.0"));
+        assert!(out.contains("pkgrel = 7"));
+        assert!(out.contains("platform = all"));
+        assert!(out.contains("arch = all"));
+        assert!(!out.contains("platform = old"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
