@@ -102,8 +102,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.32-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.32-1-all.pkg.tar.gz
+pica -U ./hello-0.1.35-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.35-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -179,7 +179,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.32）
+### 最新推荐字段模板（0.1.35）
 
 ```ini
 # Required
@@ -191,17 +191,17 @@ branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.32
+pkgver = 0.1.35
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.1.32
+pica = 0.1.35
 
 # Optional metadata
 pkgdesc = Example lifecycle package
 packager = pica-pack
 license = GPL-3.0-only
-proprietary = false
+visibility = open
 
 # Optional strong compatibility gate
 # uname = aarch64
@@ -255,7 +255,7 @@ size = <bytes>
 
 # license metadata
 license = GPL-3.0-only
-proprietary = false
+visibility = open
 ```
 
 约定：
@@ -395,19 +395,19 @@ luci = js2
 - 包含 `type = luci`：必须同时声明 `luci = lua1|js2`
 - `pica -U` 会尝试检测本机 LuCI 实现并匹配；无法检测或不匹配则安装失败
 
-## 许可证（license / proprietary）
+## 许可证（license / visibility）
 
 manifest 中允许定义许可证信息：
 
 ```
 license = GPL-3.0-only
-proprietary = false
+visibility = open
 ```
 
 约定：
 
 - `license`：建议用 SPDX 标识（例如 `GPL-3.0-only`、`MIT`、`Apache-2.0`）
-- `proprietary`：`true|false`，用于标记是否为专有软件
+- `visibility`：软件可见性标签，取值只能是 `open|mix|closed`
 - 当前版本只做“定义与展示”，不做任何许可证强制校验
 
 ## LICENSE 文件（包内可选）
@@ -453,13 +453,13 @@ pkgmgr = opkg
 pkgdesc = Example LuCI application
 packager = example
 license = GPL-3.0-only
-proprietary = false
+visibility = open
 
 arch = all
 platform = openwrt-any
 uname = x86_64
 
-pica = 0.1.32
+pica = 0.1.35
 source = pica
 
 type = luci

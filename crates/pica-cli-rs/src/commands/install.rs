@@ -317,6 +317,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     let pkg_uname = manifest.get_first("uname");
     let pkg_luci = manifest.get_first("luci");
     let pkgmgr = manifest.get_first("pkgmgr");
+    let visibility = manifest.get_first("visibility");
 
     let cmd_install = manifest.get_scalar("cmd_install");
     let cmd_update = manifest.get_scalar("cmd_update");
@@ -374,6 +375,13 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         ));
     }
 
+    if visibility != "open" && visibility != "mix" && visibility != "closed" {
+        return Err(CliError::new(
+            E_CONFIG_INVALID,
+            format!("invalid visibility value: {visibility} (supported: open, mix, closed)"),
+        ));
+    }
+
     if manifest.has_type("luci") {
         if pkg_luci.is_empty() {
             return Err(CliError::new(
@@ -407,6 +415,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     app.log_info(format!("  platform: {pkg_platform} (host: {host_platform})"));
     app.log_info(format!("  arch: {pkg_arch}"));
     app.log_info(format!("  pkgmgr: {pkgmgr}"));
+    app.log_info(format!("  visibility: {visibility}"));
     if !pkg_uname.is_empty() {
         app.log_info(format!("  uname: {pkg_uname} (host: {host_uname_raw})"));
     }
@@ -550,7 +559,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     if manifest_stored.get("pkgmgr").is_none() {
         manifest_stored["pkgmgr"] = json!("opkg");
     }
-    for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "pkgmgr"] {
+    for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "pkgmgr", "visibility"] {
         if manifest_stored.get(key).is_none() {
             manifest_stored[key] = json!("");
         }

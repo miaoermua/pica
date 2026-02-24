@@ -5,6 +5,32 @@ use crate::{
 use crate::state::read_json_file;
 use serde_json::Value;
 
+fn format_size_display(size_text: &str) -> String {
+    if size_text.is_empty() {
+        return String::new();
+    }
+
+    let Ok(size_bytes) = size_text.parse::<u64>() else {
+        return size_text.to_string();
+    };
+
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let human = if (size_bytes as f64) >= GIB {
+        format!("{:.2} GiB", (size_bytes as f64) / GIB)
+    } else if (size_bytes as f64) >= MIB {
+        format!("{:.2} MiB", (size_bytes as f64) / MIB)
+    } else if (size_bytes as f64) >= KIB {
+        format!("{:.2} KiB", (size_bytes as f64) / KIB)
+    } else {
+        format!("{} B", size_bytes)
+    };
+
+    format!("{} ({human})", size_bytes)
+}
+
 pub fn query_installed(app: &mut App) -> CliResult<()> {
     ensure_dirs(&app.paths)?;
     let db = read_json_file(&app.paths.db_file)?;
@@ -88,10 +114,14 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
     println!("PkgMgr          : {}", manifest_get_first(manifest, "pkgmgr"));
     println!("Packager        : {}", manifest_get_first(manifest, "packager"));
     println!("Build Date      : {}", manifest_get_first(manifest, "builddate"));
+    println!(
+        "Size            : {}",
+        format_size_display(&manifest_get_first(manifest, "size"))
+    );
     println!("Installed At    : {}", entry.get("installed_at").and_then(Value::as_u64).map(|value| value.to_string()).unwrap_or_default());
     println!("Installed From  : {}", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
     println!("License         : {}", manifest_get_first(manifest, "license"));
-    println!("Proprietary     : {}", manifest_get_first(manifest, "proprietary"));
+    println!("Visibility      : {}", manifest_get_first(manifest, "visibility"));
 
     Ok(())
 }
@@ -124,4 +154,22 @@ pub fn query_files(app: &mut App, pkgname: &str) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_size_display;
+
+    #[test]
+    fn format_size_display_handles_empty_and_invalid() {
+        assert_eq!(format_size_display(""), "");
+        assert_eq!(format_size_display("not-a-number"), "not-a-number");
+    }
+
+    #[test]
+    fn format_size_display_converts_units() {
+        assert_eq!(format_size_display("999"), "999 (999 B)");
+        assert_eq!(format_size_display("1024"), "1024 (1.00 KiB)");
+        assert_eq!(format_size_display("1048576"), "1048576 (1.00 MiB)");
+    }
 }
