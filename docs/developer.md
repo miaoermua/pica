@@ -31,7 +31,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.1.35`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.1.36`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -112,6 +112,7 @@ pkgname = <name>
 pkgver = <version>
 pkgrel = <pica-release>
 platform = all
+os = openwrt
 pica = <min pica-cli version>
 arch = all
 ```
@@ -144,6 +145,8 @@ kmod = <opkg-package>
 
 # logical app identity (optional)
 appname = <logical app name>
+os = <openwrt|linux|...>
+platform = <display label, e.g. arm64/amd64>
 url = <project homepage or repository URL>
 luci_url = <LuCI plugin homepage or repository URL>
 branch = <distribution branch>
@@ -226,10 +229,10 @@ luci-i18n-myapp-zh-cn
 输出日志风格参考 Arch `makepkg`：
 
 ```
-==> Making package: hello 0.1.35-1 (openwrt-any)
-  -> Pica version: 0.1.35
+==> Making package: hello 0.1.36-1 (openwrt-any)
+  -> Pica version: 0.1.36
   -> Creating archive...
-==> Finished: /tmp/pica-test/hello-0.1.35-1-openwrt-any.pkg.tar.gz
+==> Finished: /tmp/pica-test/hello-0.1.36-1-openwrt-any.pkg.tar.gz
 ```
 
 ### 示例
@@ -320,7 +323,7 @@ pica -S
 #### 安装/更新（-U）
 
 ```
-pica -U ./hello-0.1.35-1-openwrt-any.pkg.tar.gz
+pica -U ./hello-0.1.36-1-openwrt-any.pkg.tar.gz
 
 #### 全量升级（-Syu）
 
@@ -366,7 +369,7 @@ pica -R myapp
 
 ```
 pica -Q
-hello	0.1.35-1	openwrt-any
+hello	0.1.36-1	amd64
 ```
 
 ## 仓库协议（repo.json，最小实现）
@@ -404,16 +407,17 @@ repo-root/
   "packages": [
     {
       "pkgname": "hello",
-      "pkgver": "0.1.35",
+      "pkgver": "0.1.36",
       "pkgrel": "1",
       "appname": "hello",
       "url": "https://github.com/miaoermua/pica",
       "luci_url": "https://github.com/openwrt/luci/tree/master/applications/luci-app-hello",
       "pkgmgr": "opkg",
       "branch": "stable",
-      "platform": "openwrt-any",
-      "pica": "0.1.35",
-      "filename": "hello-0.1.35-1-openwrt-any.pkg.tar.gz",
+      "os": "openwrt",
+      "platform": "amd64",
+      "pica": "0.1.36",
+      "filename": "hello-0.1.36-1-amd64-all.pkg.tar.gz",
       "sha256": "<sha256>",
       "size": 465
     }
@@ -426,6 +430,7 @@ repo-root/
 - `schema` 必须是 `1`
 - `packages` 必须是数组
 - 每个包条目必须包含非空字符串字段：`pkgname/pkgver/pkgrel/platform/arch/filename/sha256`
+- `os` 推荐始终声明（建议 `openwrt`）
 - `sha256` 必须是 64 位十六进制字符串
 - `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），并且必须以 `.pkg.tar.gz` 结尾
 - `filename` 必须与字段一致：

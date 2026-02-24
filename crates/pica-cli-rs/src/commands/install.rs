@@ -3,7 +3,7 @@ use crate::{
     detect_luci_variant, detect_opkg_arches, detect_platform, ensure_dir, ensure_dirs, install_via_feeds_or_ipk,
     make_temp_dir, manifest_get_first, normalize_uname, pkg_list_diff_added, pkgver_cmp_key,
     pkgver_ge, precheck_assert_no_missing, reorder_app_list, required_manifest_field,
-    resolve_lang, run_hook, ver_ge, write_file_atomic, App, CliError, CliResult, Manifest, Selector,
+    resolve_lang, run_hook, ver_ge, write_file_atomic, detect_os, App, CliError, CliResult, Manifest, Selector,
     E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
     E_REPO_INVALID, E_VERSION_INCOMPATIBLE, E_INTEGRITY_INVALID, PICA_VERSION,
 };
@@ -139,6 +139,7 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
         "appname": appname,
         "branch": parsed.branch,
         "pkgver": base_ver,
+        "os": detect_os(),
         "platform": detect_platform(),
         "arch": "all",
         "source": "opkg",
@@ -313,6 +314,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     let pkgrel = manifest.get_first("pkgrel");
     let pkgver_display = pkgver_cmp_key(&pkgver, &pkgrel);
     let pkg_platform = required_manifest_field(&manifest, "platform")?;
+    let pkg_os = required_manifest_field(&manifest, "os")?;
     let pkg_arch = required_manifest_field(&manifest, "arch")?;
     let pkg_uname = manifest.get_first("uname");
     let pkg_luci = manifest.get_first("luci");
@@ -338,6 +340,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     }
 
     let host_platform = detect_platform();
+    let host_os = detect_os();
     let host_uname_raw =
         run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string());
     let host_uname = normalize_uname(&host_uname_raw);
@@ -347,6 +350,13 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
         return Err(CliError::new(
             E_PLATFORM_UNSUPPORTED,
             format!("unsupported uname: pkg={pkg_uname} host={host_uname_raw}"),
+        ));
+    }
+
+    if pkg_os != "all" && pkg_os != host_os {
+        return Err(CliError::new(
+            E_PLATFORM_UNSUPPORTED,
+            format!("unsupported os: pkg={pkg_os} host={host_os}"),
         ));
     }
 
@@ -412,6 +422,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
 
     app.log_info(format!("Installing {pkgname}..."));
     app.log_info(format!("  version: {pkgver_display}"));
+    app.log_info(format!("  os: {pkg_os} (host: {host_os})"));
     app.log_info(format!("  platform: {pkg_platform} (host: {host_platform})"));
     app.log_info(format!("  arch: {pkg_arch}"));
     app.log_info(format!("  pkgmgr: {pkgmgr}"));

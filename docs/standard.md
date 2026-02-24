@@ -102,8 +102,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.35-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.35-1-all.pkg.tar.gz
+pica -U ./hello-0.1.36-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.36-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -149,16 +149,18 @@ pica -U https://example.invalid/pkgs/hello-0.1.35-1-all.pkg.tar.gz
 - 当某些命令本身已经输出文本结果（例如 `-Q/-Qi/-Ql`），成功 JSON 会被自动抑制，避免混淆机器解析。
 - `--json/--json-errors` 依赖 `jq`（缺失时会直接报错退出）。
 
-## 兼容维度：uname + arch（platform 仅展示）
+## 兼容维度：os + arch + uname（platform 仅展示）
 
-为了让安装/更新行为尽可能稳定，pica 的“实际兼容性判断”优先使用：
+为了让安装/更新行为尽可能稳定，pica 的“实际兼容性判断”使用：
+
+- `os`：系统类型（例如 `openwrt`），强约束
 
 - `uname`：与 `uname -m` 严格匹配（跨系统最通用的基线）
 - `arch`：OpenWrt/opkg 定义的架构字段（可通过 `opkg print-architecture` 查看），推荐统一使用 `all`
 
 `platform` 仍然保留，但它只用于应用商店/仓库展示与筛选，不作为安装的硬性门槛。
 
-在需要展示时（日志、查询）应同时展示 `platform + arch + uname`（若 `uname` 未提供则可省略）。
+在需要展示时（日志、查询）应同时展示 `os + platform + arch + uname`（若 `uname` 未提供则可省略）。
 
 ## manifest（Arch-like 文本）
 
@@ -175,11 +177,12 @@ pkgname = <name>
 pkgver = <version>
 pkgrel = <pica-release>
 platform = all
+os = openwrt
 arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.35）
+### 最新推荐字段模板（0.1.36）
 
 ```ini
 # Required
@@ -191,11 +194,12 @@ branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.35
+pkgver = 0.1.36
 pkgrel = 1
-platform = all
+os = openwrt
+platform = arm64
 arch = all
-pica = 0.1.35
+pica = 0.1.36
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -337,6 +341,15 @@ luci = lua1
 - `arch = all`：永远允许
 - `arch != all`：必须出现在 `opkg print-architecture` 输出中，否则安装失败
 
+## os（系统类型）
+
+`os` 用于标识系统类型（例如 `openwrt`）。
+
+`pica-cli` 的检查逻辑：
+
+- `os = all`：永远允许
+- `os != all`：必须与当前系统类型一致，否则安装失败
+
 ## OpenWrt：一个 app 多个 opkg 包
 
 OpenWrt/LEDE 生态里，一个“应用”（你希望用一个 `pkgname` 表示）通常拆成多个 opkg 包：
@@ -456,10 +469,11 @@ license = GPL-3.0-only
 visibility = open
 
 arch = all
-platform = openwrt-any
+os = openwrt
+platform = amd64
 uname = x86_64
 
-pica = 0.1.35
+pica = 0.1.36
 source = pica
 
 type = luci

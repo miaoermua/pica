@@ -106,6 +106,7 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
     println!("Protocol        : {}", manifest_get_first(manifest, "protocol"));
     println!("Branch          : {}", manifest_get_first(manifest, "branch"));
     println!("LuCI Desc       : {}", manifest_get_first(manifest, "luci_desc"));
+    println!("OS              : {}", manifest_get_first(manifest, "os"));
     println!("Platform        : {}", manifest_get_first(manifest, "platform"));
     println!("Arch            : {}", manifest_get_first(manifest, "arch"));
     println!("Uname           : {}", manifest_get_first(manifest, "uname"));

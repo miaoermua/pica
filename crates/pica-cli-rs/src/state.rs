@@ -53,6 +53,7 @@ pub fn report_set_install_result(
             "appname": appname,
             "url": program_url,
             "luci_url": manifest_get_first(manifest, "luci_url"),
+            "os": manifest_get_first(manifest, "os"),
             "branch": manifest_get_first(manifest, "branch"),
             "protocol": manifest_get_first(manifest, "protocol"),
             "pkgver": manifest_get_first(manifest, "pkgver"),

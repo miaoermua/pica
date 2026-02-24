@@ -23,7 +23,7 @@ pub(crate) fn find_pica_candidates_in_index(
     let index = read_json_file(&app.paths.index_file)?;
     let parsed = Selector::parse(selector)
         .map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
-    let host_platform = detect_platform();
+    let host_os = detect_os();
 
     let mut out = Vec::new();
 
@@ -38,12 +38,6 @@ pub(crate) fn find_pica_candidates_in_index(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let repo_platform = repo_entry
-            .get("platform")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
         let Some(packages) = repo_entry
             .get("data")
             .and_then(|data| data.get("packages"))
@@ -83,11 +77,6 @@ pub(crate) fn find_pica_candidates_in_index(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let platform = pkg
-                .get("platform")
-                .and_then(Value::as_str)
-                .unwrap_or("all")
-                .to_string();
             let download_url = pkg
                 .get("download_url")
                 .and_then(Value::as_str)
@@ -109,10 +98,14 @@ pub(crate) fn find_pica_candidates_in_index(
                 continue;
             }
 
-            let platform_match = platform == "all"
-                || platform == host_platform
-                || (!repo_platform.is_empty() && platform == repo_platform);
-            if !platform_match {
+            let pkg_os = pkg
+                .get("os")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            let os_match = pkg_os.is_empty() || pkg_os == "all" || pkg_os == host_os;
+            if !os_match {
                 continue;
             }
 
@@ -543,31 +536,22 @@ pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
 }
 
 pub(crate) fn detect_platform() -> String {
+    let uname = run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string());
+    normalize_uname(&uname)
+}
+
+pub(crate) fn detect_os() -> String {
     if let Ok(openwrt_release) = fs::read_to_string("/etc/openwrt_release") {
-        for line in openwrt_release.lines() {
-            let trimmed = line.trim();
-            if let Some(value) = trimmed.strip_prefix("DISTRIB_TARGET=") {
-                return unquote_shell_value(value);
-            }
+        if openwrt_release.contains("DISTRIB_ID='OpenWrt'")
+            || openwrt_release.contains("DISTRIB_ID=\"OpenWrt\"")
+            || openwrt_release.contains("DISTRIB_ID=OpenWrt")
+        {
+            return "openwrt".to_string();
         }
     }
 
-    run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string())
+    "linux".to_string()
 }
-
-pub(crate) fn unquote_shell_value(value: &str) -> String {
-    let trimmed = value.trim();
-    if ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-        && trimmed.len() >= 2
-    {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-
 
 pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
     let mut tmp_name = OsString::from(path.as_os_str());
