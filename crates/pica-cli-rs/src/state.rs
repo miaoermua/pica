@@ -1,6 +1,6 @@
 use crate::{
-    ensure_dirs, manifest_get_first, pkgver_cmp_key, CliError, CliResult, Selector,
-    E_DB_INVALID, E_IO, E_JSON_INVALID, E_RUNTIME,
+    ensure_dirs, manifest_get_first, CliError, CliResult, Selector, E_DB_INVALID, E_IO,
+    E_JSON_INVALID, E_RUNTIME,
 };
 use pica_core::io::now_unix_secs;
 use serde_json::{json, Map, Value};
@@ -53,7 +53,6 @@ pub fn report_set_install_result(
             "appname": appname,
             "url": program_url,
             "luci_url": manifest_get_first(manifest, "luci_url"),
-            "version": manifest_get_first(manifest, "version"),
             "branch": manifest_get_first(manifest, "branch"),
             "protocol": manifest_get_first(manifest, "protocol"),
             "pkgver": manifest_get_first(manifest, "pkgver"),
@@ -137,22 +136,6 @@ pub fn db_find_installed_pkgname_by_selector(
             || manifest_get_first(manifest, "pkgname") == selector.appname;
         if !key_matches {
             continue;
-        }
-
-        if !selector.version.is_empty() {
-            let manifest_version = manifest_get_first(manifest, "version");
-            let manifest_branch = manifest_get_first(manifest, "branch");
-            let manifest_pkgver = manifest_get_first(manifest, "pkgver");
-            let manifest_pkgrel = manifest_get_first(manifest, "pkgrel");
-            let manifest_pkgver_rel = pkgver_cmp_key(&manifest_pkgver, &manifest_pkgrel);
-
-            let version_matches = manifest_version == selector.version
-                || manifest_branch == selector.version
-                || manifest_pkgver == selector.version
-                || manifest_pkgver_rel == selector.version;
-            if !version_matches {
-                continue;
-            }
         }
 
         if !selector.branch.is_empty() && manifest_get_first(manifest, "branch") != selector.branch
@@ -258,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn db_find_installed_pkgname_by_selector_matches_version_and_branch() {
+    fn db_find_installed_pkgname_by_selector_matches_branch() {
         let db_file = unique_tmp_path("selector");
         let db = json!({
             "schema": 1,
@@ -267,7 +250,6 @@ mod tests {
                     "manifest": {
                         "pkgname": "hello",
                         "appname": "hello-app",
-                        "version": "rolling",
                         "branch": "stable",
                         "pkgver": "1.2.3",
                         "pkgrel": "4"
@@ -277,19 +259,13 @@ mod tests {
         });
         write_json_atomic_pretty(&db_file, &db).expect("write db");
 
-        let selector = Selector::parse("hello-app:rolling(stable)");
+        let selector = Selector::parse("hello-app(stable)").expect("parse selector");
         let found = db_find_installed_pkgname_by_selector(&db_file, &selector)
             .expect("query selector")
             .expect("must match");
         assert_eq!(found, "hello");
 
-        let selector_by_pkgver = Selector::parse("hello-app:1.2.3-4");
-        let found_by_pkgver = db_find_installed_pkgname_by_selector(&db_file, &selector_by_pkgver)
-            .expect("query selector by pkgver")
-            .expect("must match pkgver");
-        assert_eq!(found_by_pkgver, "hello");
-
-        let selector_miss = Selector::parse("hello-app:rolling(dev)");
+        let selector_miss = Selector::parse("hello-app(dev)").expect("parse selector");
         let miss = db_find_installed_pkgname_by_selector(&db_file, &selector_miss)
             .expect("query miss");
         assert!(miss.is_none());

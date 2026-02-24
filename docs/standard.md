@@ -102,8 +102,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.29-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.29-1-all.pkg.tar.gz
+pica -U ./hello-0.1.32-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.32-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -179,7 +179,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.29）
+### 最新推荐字段模板（0.1.32）
 
 ```ini
 # Required
@@ -187,16 +187,15 @@ pkgname = hello
 appname = hello
 url = https://github.com/miaoermua/pica
 luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hello
-version = rolling
 branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.29
+pkgver = 0.1.32
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.1.29
+pica = 0.1.32
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -427,14 +426,14 @@ LICENSE
 
 ```
 app
-app:version
-app:version(branch)
+app(branch)
+app:branch
 ```
 
 约定：
 
-- `version` 在当前滚动更新模式下主要作为“标签/过滤条件”，可用于分支名或指定版本号语义。
-- 当前不提供历史版本安装，仓库仅保留最新包；`version` 字段为未来历史版本能力预留。
+- 当前选择器仅支持按 `branch` 过滤。
+- 当前不提供历史版本安装，仓库仅保留最新包。
 
 ## manifest 示例（LuCI1）
 
@@ -443,7 +442,6 @@ pkgname = luci-app-example
 appname = example
 url = https://github.com/example/example
 luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-example
-version = rolling
 branch = openwrt-23
 protocol = luci
 luci_desc = Example LuCI plugin for OpenWrt
@@ -461,7 +459,7 @@ arch = all
 platform = openwrt-any
 uname = x86_64
 
-pica = 0.1.29
+pica = 0.1.32
 source = pica
 
 type = luci

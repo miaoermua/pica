@@ -42,7 +42,8 @@ impl Drop for TempDirGuard {
 pub fn install_app_auto(app: &mut App, selector: &str) -> CliResult<()> {
     ensure_dirs(&app.paths)?;
 
-    let parsed = Selector::parse(selector);
+    let parsed = Selector::parse(selector)
+        .map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
     let installed_pkg = db_find_installed_pkgname_by_selector(&app.paths.db_file, &parsed)?;
     if let Some(pkgname) = installed_pkg {
         let db = read_json_file(&app.paths.db_file)?;
@@ -94,7 +95,8 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
     ensure_dirs(&app.paths)?;
     need_cmd("opkg")?;
 
-    let parsed = Selector::parse(selector);
+    let parsed = Selector::parse(selector)
+        .map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
     let appname = parsed.appname.clone();
 
     opkg_update_ignore();
@@ -135,7 +137,6 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
     let manifest = json!({
         "pkgname": appname,
         "appname": appname,
-        "version": parsed.version,
         "branch": parsed.branch,
         "pkgver": base_ver,
         "platform": detect_platform(),
@@ -549,7 +550,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     if manifest_stored.get("pkgmgr").is_none() {
         manifest_stored["pkgmgr"] = json!("opkg");
     }
-    for key in ["version", "branch", "protocol", "url", "luci_url", "luci_desc", "pkgmgr"] {
+    for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "pkgmgr"] {
         if manifest_stored.get(key).is_none() {
             manifest_stored[key] = json!("");
         }

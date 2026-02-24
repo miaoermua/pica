@@ -1,3 +1,4 @@
 # Local agent cache docs (do not upload)
 docs/local_agent_cache/*
 target/*
+examples/*

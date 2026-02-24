@@ -72,11 +72,12 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
         }
     };
     println!("Program URL     : {}", program_url);
+    println!("PkgDesc         : {}", manifest_get_first(manifest, "pkgdesc"));
     println!(
         "LuCI URL        : {}",
         manifest_get_first(manifest, "luci_url")
     );
-    println!("Version Tag     : {}", manifest_get_first(manifest, "version"));
+    println!("Protocol        : {}", manifest_get_first(manifest, "protocol"));
     println!("Branch          : {}", manifest_get_first(manifest, "branch"));
     println!("LuCI Desc       : {}", manifest_get_first(manifest, "luci_desc"));
     println!("Platform        : {}", manifest_get_first(manifest, "platform"));

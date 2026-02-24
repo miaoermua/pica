@@ -21,7 +21,8 @@ pub(crate) fn find_pica_candidates_in_index(
     ensure_dirs(&app.paths)?;
 
     let index = read_json_file(&app.paths.index_file)?;
-    let parsed = Selector::parse(selector);
+    let parsed = Selector::parse(selector)
+        .map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
     let host_platform = detect_platform();
 
     let mut out = Vec::new();
@@ -61,11 +62,6 @@ pub(crate) fn find_pica_candidates_in_index(
                 .get("appname")
                 .and_then(Value::as_str)
                 .unwrap_or(&pkgname)
-                .to_string();
-            let version_tag = pkg
-                .get("version")
-                .and_then(Value::as_str)
-                .unwrap_or("")
                 .to_string();
             let branch = pkg
                 .get("branch")
@@ -109,17 +105,6 @@ pub(crate) fn find_pica_candidates_in_index(
             if appname != parsed.appname {
                 continue;
             }
-            if !parsed.version.is_empty() {
-                let cmpver = pkgver_cmp_key(&pkgver, &pkgrel);
-                let version_match = version_tag == parsed.version
-                    || branch == parsed.version
-                    || pkgver == parsed.version
-                    || cmpver == parsed.version;
-                if !version_match {
-                    continue;
-                }
-            }
-
             if !parsed.branch.is_empty() && branch != parsed.branch {
                 continue;
             }
@@ -439,6 +424,10 @@ pub(crate) fn install_via_feeds_or_ipk(
     ipk_dir: &Path,
     have_ipk_dir: bool,
 ) -> CliResult<()> {
+    if pkg_list.is_empty() && !have_ipk_dir {
+        return Ok(());
+    }
+
     let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir)?;
     if use_feeds == -1 {
         return Err(CliError::new(
@@ -769,5 +758,20 @@ mod tests {
         let packaged_first_choice = should_use_feeds(&packaged_first, "app", &["a".to_string()], true)
             .expect("packaged-first with ipk should choose ipk");
         assert_eq!(packaged_first_choice, 0);
+    }
+
+    #[test]
+    fn install_via_feeds_or_ipk_skips_empty_optional_group() {
+        let app = App::new(
+            crate::Paths::from_env(),
+            crate::Options {
+                json_mode: crate::JsonMode::None,
+                non_interactive: true,
+                feed_policy: FeedPolicy::Ask,
+            },
+        );
+
+        let result = install_via_feeds_or_ipk(&app, "base", &[], Path::new("/nonexistent"), false);
+        assert!(result.is_ok());
     }
 }

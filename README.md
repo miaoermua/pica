@@ -6,7 +6,7 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 ![shell](https://ziadoua.github.io/m3-Markdown-Badges/badges/Shell/shell1.svg)
 ![licence](https://ziadoua.github.io/m3-Markdown-Badges/badges/LicenceGPLv3/licencegplv31.svg)
 
-该名字继承自 Wine 递归浪漫，简单紧凑而不落后，以及运用 Arch 系包管理器相似的滚动更新机制。
+该名字继承自 Wine 递归浪漫，简单紧凑而不落后，运用 Arch 系包管理器相似的滚动更新机制，在 OpenWrt 上体验强大统一且先进的软件包管理器。
 
 > 说明：Bash 版本已归档到 `legacy/`，后续以 Rust 核心实现为主。
 # todo
@@ -64,19 +64,11 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - `repos[]`：pica 仓库列表（`pica -S` / `pica -Sp` 使用）
 - `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，不影响 pica 自身输出语言）
 
-## GitHub Actions（OpenWrt Rust 二进制）
+## 感谢
 
-仓库已提供工作流：`.github/workflows/openwrt-rust-binaries.yml`。
+[@Canmi](https://github.com/canmi21)
 
-- 触发方式：
-  - 手动触发（`workflow_dispatch`）
-  - 推送 `v*` tag（例如 `v0.1.29`）
-  - Pull Request（仅在 Rust/CI 相关文件变更时）
-- 目标平台（musl，适配 OpenWrt 常见架构）：
-  - `x86_64-unknown-linux-musl`
-  - `aarch64-unknown-linux-musl`
-  - `armv7-unknown-linux-musleabihf`
-- 产物内容：每个目标输出一个 `tar.gz`，内含：
-  - `pica-rs`
-  - `pica-pack-rs`
-- 发布行为：当推送 `v*` tag 时，自动把构建产物上传到 GitHub Release。
+此项目的诞生借鉴了这些优秀的开源项目：
+
+- Paru
+- Pacman
