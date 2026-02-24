@@ -1,6 +1,6 @@
 [package]
 name = "pica-cli-rs"
-version = "0.1.16"
+version = "0.1.23"
 edition = "2021"
 
 [[bin]]

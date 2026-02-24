@@ -8,7 +8,7 @@ pkgmgr = opkg
 luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hello
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.16
+pkgver = 0.1.23
 pkgrel = 1
 pkgdesc = Example lifecycle package
 packager = pica-pack
@@ -17,7 +17,7 @@ proprietary = false
 
 platform = all
 arch = all
-pica = 0.1.16
+pica = 0.1.23
 
 # Optional compatibility tags (recommended):
 # uname = arm64

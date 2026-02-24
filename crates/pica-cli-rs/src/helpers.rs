@@ -1,193 +1,22 @@
-mod lock;
-mod commands;
-mod types;
-mod state;
-mod system;
-
-use crate::types::{
-    ensure_dirs, parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode,
-    Options, Paths, DEFAULT_ERROR_CODE,
-};
 use crate::state::read_json_file;
-use pica_core::manifest::{get_first as manifest_get_first, Manifest};
-use pica_core::repo::is_supported_url;
-use pica_core::selector::Selector;
-use pica_core::version::{pkgver_cmp_key, pkgver_ge, ver_ge};
-use pica_core::PICA_VERSION;
-use pica_core::io::{copy_dir_recursive as core_copy_dir_recursive, make_temp_dir as core_make_temp_dir};
+use crate::system;
+use crate::{
+    ensure_dirs, App, CliError, CliResult, FeedPolicy, Manifest, Selector, DEFAULT_ERROR_CODE,
+};
+use pica_core::io::{
+    copy_dir_recursive as core_copy_dir_recursive, make_temp_dir as core_make_temp_dir,
+};
+use pica_core::version::pkgver_cmp_key;
 use serde_json::{json, Value};
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
-use crate::lock::LockGuard;
-use crate::commands::query::{query_info, query_installed, query_license};
-use crate::commands::remove::remove_pkg;
-use crate::commands::sync::sync_repos;
-use crate::commands::upgrade::upgrade_all;
-use crate::commands::install::{
-    install_app_auto, install_app_via_opkg, install_pica_from_repo, install_pkg_source,
-};
+use std::process::Command;
 
-fn usage() {
-    println!(
-        "Usage:\n  pica-rs -S                 Sync (download repo.json and update index)\n  pica-rs -Su                Upgrade all installed pica packages\n  pica-rs -Syu               Sync, then upgrade all installed pica packages\n  pica-rs -Si <selector>     Install by selector (auto: opkg if available, else pica)\n  pica-rs -So <selector>     Install by selector (force opkg)\n  pica-rs -Sp <selector>     Install by selector (force pica repo)\n  pica-rs -U <pkgfile|url>   Install/Update from local file or URL\n  pica-rs -R <pkgname>       Remove package (no dependency handling)\n  pica-rs -Q                 List installed pica packages\n  pica-rs -Qi <pkgname>      Show installed package info\n  pica-rs -Ql <pkgname>      Show installed package license\n  pica-rs --json ...         Emit JSON on success and error (explicit only)\n  pica-rs --json-errors ...  Emit JSON only on error\n  pica-rs --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica-rs --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica-rs --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app:version(branch)"
-    );
-}
-
-
-fn main() {
-    let paths = Paths::from_env();
-
-    let (options, args) = match parse_options(env::args().skip(1).collect()) {
-        Ok(value) => value,
-        Err(err) => {
-            let app = App::new(
-                paths,
-                Options {
-                    json_mode: JsonMode::None,
-                    non_interactive: false,
-                    feed_policy: FeedPolicy::Ask,
-                },
-            );
-            app.emit_error(&err);
-            process::exit(1);
-        }
-    };
-
-    let mut app = App::new(paths, options);
-
-    if args.is_empty() {
-        usage();
-        process::exit(2);
-    }
-
-    let command = args[0].as_str();
-    if matches!(command, "-h" | "--help" | "help") {
-        usage();
-        app.emit_success(command, "usage");
-        return;
-    }
-    if command == "--version" {
-        println!("{PICA_VERSION}");
-        app.emit_success("--version", PICA_VERSION);
-        return;
-    }
-
-    if app.options.json_mode != JsonMode::None && !has_command("jq") {
-        let err = CliError::new(
-            "E_MISSING_COMMAND",
-            "--json/--json-errors requires command: jq",
-        );
-        app.emit_error(&err);
-        process::exit(1);
-    }
-
-    let lock_guard = match LockGuard::acquire(&app.paths.lock_file) {
-        Ok(guard) => guard,
-        Err(err) => {
-            app.emit_error(&CliError::new(err.code, err.message));
-            process::exit(1);
-        }
-    };
-
-    let result = run_command(&mut app, &args);
-    drop(lock_guard);
-
-    match result {
-        Ok((cmd, target)) => app.emit_success(cmd, &target),
-        Err(err) => {
-            app.emit_error(&err);
-            process::exit(1);
-        }
-    }
-}
-
-fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, String)> {
-    let command = args[0].as_str();
-    match command {
-        "-S" => {
-            app.set_phase("sync");
-            sync_repos(app)?;
-            Ok(("-S", "repos".to_string()))
-        }
-        "-Su" => {
-            app.set_phase("upgrade");
-            need_cmd("opkg")?;
-            upgrade_all(app)?;
-            Ok(("-Su", "all".to_string()))
-        }
-        "-Syu" => {
-            app.set_phase("sync");
-            need_cmd("opkg")?;
-            sync_repos(app)?;
-            app.set_phase("upgrade");
-            upgrade_all(app)?;
-            Ok(("-Syu", "all".to_string()))
-        }
-        "-Q" => {
-            app.set_phase("query");
-            query_installed(app)?;
-            Ok(("-Q", "installed".to_string()))
-        }
-        "-Qi" => {
-            app.set_phase("query");
-            let pkgname = require_arg(args, 1, "-Qi requires <pkgname>")?;
-            query_info(app, pkgname)?;
-            Ok(("-Qi", pkgname.to_string()))
-        }
-        "-Ql" => {
-            app.set_phase("query");
-            let pkgname = require_arg(args, 1, "-Ql requires <pkgname>")?;
-            query_license(app, pkgname)?;
-            Ok(("-Ql", pkgname.to_string()))
-        }
-        "-So" => {
-            app.set_phase("install");
-            need_cmd("opkg")?;
-            let selector = require_arg(args, 1, "-So requires <selector>")?;
-            install_app_via_opkg(app, selector)?;
-            Ok(("-So", selector.to_string()))
-        }
-        "-Si" => {
-            app.set_phase("install");
-            need_cmd("opkg")?;
-            let selector = require_arg(args, 1, "-Si requires <selector>")?;
-            install_app_auto(app, selector)?;
-            Ok(("-Si", selector.to_string()))
-        }
-        "-Sp" => {
-            app.set_phase("install");
-            need_cmd("opkg")?;
-            need_cmd("tar")?;
-            let selector = require_arg(args, 1, "-Sp requires <selector>")?;
-            install_pica_from_repo(app, selector)?;
-            Ok(("-Sp", selector.to_string()))
-        }
-        "-U" => {
-            app.set_phase("install");
-            need_cmd("opkg")?;
-            need_cmd("tar")?;
-            let source = require_arg(args, 1, "-U requires <pkgfile|url>")?;
-            install_pkg_source(app, source, None)?;
-            Ok(("-U", source.to_string()))
-        }
-        "-R" => {
-            app.set_phase("remove");
-            need_cmd("opkg")?;
-            let pkgname = require_arg(args, 1, "-R requires <pkgname>")?;
-            remove_pkg(app, pkgname)?;
-            Ok(("-R", pkgname.to_string()))
-        }
-        other => Err(CliError::new(
-            DEFAULT_ERROR_CODE,
-            format!("unknown arg: {other}"),
-        )),
-    }
-}
-
-fn find_pica_candidates_in_index(app: &App, selector: &str) -> CliResult<Vec<RepoCandidate>> {
+pub(crate) fn find_pica_candidates_in_index(
+    app: &App,
+    selector: &str,
+) -> CliResult<Vec<RepoCandidate>> {
     ensure_dirs(&app.paths)?;
 
     let index = read_json_file(&app.paths.index_file)?;
@@ -312,17 +141,17 @@ fn find_pica_candidates_in_index(app: &App, selector: &str) -> CliResult<Vec<Rep
 }
 
 #[derive(Debug, Clone)]
-struct RepoCandidate {
-    cmpver: String,
-    repo: String,
-    url: String,
-    filename: String,
-    download_url: Option<String>,
-    min_pica: Option<String>,
-    pkgname: String,
+pub(crate) struct RepoCandidate {
+    pub(crate) cmpver: String,
+    pub(crate) repo: String,
+    pub(crate) url: String,
+    pub(crate) filename: String,
+    pub(crate) download_url: Option<String>,
+    pub(crate) min_pica: Option<String>,
+    pub(crate) pkgname: String,
 }
 
-fn required_manifest_field(manifest: &Manifest, key: &str) -> CliResult<String> {
+pub(crate) fn required_manifest_field(manifest: &Manifest, key: &str) -> CliResult<String> {
     let value = manifest.get_first(key);
     if value.is_empty() {
         Err(CliError::new(
@@ -334,14 +163,13 @@ fn required_manifest_field(manifest: &Manifest, key: &str) -> CliResult<String> 
     }
 }
 
-fn canonicalize_display(path: &Path) -> String {
+pub(crate) fn canonicalize_display(path: &Path) -> String {
     fs::canonicalize(path)
-        .ok()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
-fn normalize_uname(value: &str) -> String {
+pub(crate) fn normalize_uname(value: &str) -> String {
     match value {
         "x86_64" => "amd64".to_string(),
         "aarch64" => "arm64".to_string(),
@@ -349,7 +177,7 @@ fn normalize_uname(value: &str) -> String {
     }
 }
 
-fn detect_opkg_arches() -> Vec<String> {
+pub(crate) fn detect_opkg_arches() -> Vec<String> {
     let Ok(output) = Command::new("opkg").arg("print-architecture").output() else {
         return Vec::new();
     };
@@ -366,7 +194,7 @@ fn detect_opkg_arches() -> Vec<String> {
     out
 }
 
-fn detect_luci_variant() -> String {
+pub(crate) fn detect_luci_variant() -> String {
     if opkg_is_installed("luci") {
         return "lua1".to_string();
     }
@@ -376,11 +204,11 @@ fn detect_luci_variant() -> String {
     "unknown".to_string()
 }
 
-fn opkg_is_installed(name: &str) -> bool {
+pub(crate) fn opkg_is_installed(name: &str) -> bool {
     system::opkg_is_installed(name)
 }
 
-fn pkg_list_diff_added(before: &[String], after: &[String]) -> Vec<String> {
+pub(crate) fn pkg_list_diff_added(before: &[String], after: &[String]) -> Vec<String> {
     let before_set: std::collections::HashSet<&str> = before.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for item in after {
@@ -391,7 +219,7 @@ fn pkg_list_diff_added(before: &[String], after: &[String]) -> Vec<String> {
     out
 }
 
-fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
+pub(crate) fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
@@ -414,7 +242,7 @@ fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
     false
 }
 
-fn precheck_dep_source(dep: &str, ipk_dir: &Path) -> String {
+pub(crate) fn precheck_dep_source(dep: &str, ipk_dir: &Path) -> String {
     if opkg_is_installed(dep) {
         return "installed".to_string();
     }
@@ -427,7 +255,7 @@ fn precheck_dep_source(dep: &str, ipk_dir: &Path) -> String {
     "missing".to_string()
 }
 
-fn build_precheck_report(
+pub(crate) fn build_precheck_report(
     manifest: &Manifest,
     depend_dir: &Path,
     binary_dir: &Path,
@@ -460,7 +288,7 @@ fn build_precheck_report(
     })
 }
 
-fn precheck_assert_no_missing(precheck: &Value) -> CliResult<()> {
+pub(crate) fn precheck_assert_no_missing(precheck: &Value) -> CliResult<()> {
     let mut missing = Vec::new();
 
     for (group, key) in [
@@ -490,7 +318,7 @@ fn precheck_assert_no_missing(precheck: &Value) -> CliResult<()> {
     }
 }
 
-fn resolve_lang(conf_file: &Path) -> String {
+pub(crate) fn resolve_lang(conf_file: &Path) -> String {
     let conf = read_json_file(conf_file).ok();
     conf.and_then(|value| {
         value
@@ -501,7 +329,7 @@ fn resolve_lang(conf_file: &Path) -> String {
     .unwrap_or_else(|| "zh-cn".to_string())
 }
 
-fn reorder_app_list(list: Vec<String>) -> Vec<String> {
+pub(crate) fn reorder_app_list(list: Vec<String>) -> Vec<String> {
     let mut core = Vec::new();
     let mut luci = Vec::new();
     let mut i18n = Vec::new();
@@ -524,7 +352,7 @@ fn reorder_app_list(list: Vec<String>) -> Vec<String> {
     core
 }
 
-fn should_use_feeds(
+pub(crate) fn should_use_feeds(
     app: &App,
     label: &str,
     pkg_list: &[String],
@@ -596,7 +424,7 @@ fn should_use_feeds(
     }
 }
 
-fn install_via_feeds_or_ipk(
+pub(crate) fn install_via_feeds_or_ipk(
     app: &App,
     label: &str,
     pkg_list: &[String],
@@ -638,7 +466,7 @@ fn install_via_feeds_or_ipk(
     ))
 }
 
-fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
+pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -670,7 +498,7 @@ fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn prompt_yn(question: &str, default_yes: bool) -> bool {
+pub(crate) fn prompt_yn(question: &str, default_yes: bool) -> bool {
     use std::io::{self, Read, Write};
 
     let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
@@ -697,7 +525,7 @@ fn prompt_yn(question: &str, default_yes: bool) -> bool {
     }
 }
 
-fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str) -> CliResult<()> {
+pub(crate) fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str) -> CliResult<()> {
     if hook_rel.is_empty() {
         return Ok(());
     }
@@ -715,13 +543,13 @@ fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str) -> CliRes
 }
 
 
-fn conf_get_i18n(conf_file: &Path) -> Option<String> {
+pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
     let conf = read_json_file(conf_file).ok()?;
     let value = conf.get("i18n").and_then(Value::as_str).unwrap_or("zh-cn");
     Some(value.to_string())
 }
 
-fn detect_platform() -> String {
+pub(crate) fn detect_platform() -> String {
     if let Ok(openwrt_release) = fs::read_to_string("/etc/openwrt_release") {
         for line in openwrt_release.lines() {
             let trimmed = line.trim();
@@ -734,7 +562,7 @@ fn detect_platform() -> String {
     run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn unquote_shell_value(value: &str) -> String {
+pub(crate) fn unquote_shell_value(value: &str) -> String {
     let trimmed = value.trim();
     if ((trimmed.starts_with('"') && trimmed.ends_with('"'))
         || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
@@ -748,7 +576,7 @@ fn unquote_shell_value(value: &str) -> String {
 
 
 
-fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
+pub(crate) fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
     let mut tmp_name = OsString::from(path.as_os_str());
     tmp_name.push(".tmp");
     let tmp_path = PathBuf::from(tmp_name);
@@ -773,7 +601,7 @@ fn write_file_atomic(path: &Path, content: &[u8]) -> CliResult<()> {
     Ok(())
 }
 
-fn ensure_dir(path: &Path) -> CliResult<()> {
+pub(crate) fn ensure_dir(path: &Path) -> CliResult<()> {
     fs::create_dir_all(path).map_err(|err| {
         CliError::new(
             DEFAULT_ERROR_CODE,
@@ -782,39 +610,39 @@ fn ensure_dir(path: &Path) -> CliResult<()> {
     })
 }
 
-fn make_temp_dir(prefix: &str) -> CliResult<PathBuf> {
+pub(crate) fn make_temp_dir(prefix: &str) -> CliResult<PathBuf> {
     core_make_temp_dir(prefix).map_err(map_core_error)
 }
 
-fn need_cmd(name: &str) -> CliResult<()> {
+pub(crate) fn need_cmd(name: &str) -> CliResult<()> {
     system::need_cmd(name)
 }
 
-fn has_command(name: &str) -> bool {
+pub(crate) fn has_command(name: &str) -> bool {
     system::has_command(name)
 }
 
-fn opkg_update_ignore() {
+pub(crate) fn opkg_update_ignore() {
     system::opkg_update_ignore()
 }
 
-fn opkg_has_package(name: &str) -> bool {
+pub(crate) fn opkg_has_package(name: &str) -> bool {
     system::opkg_has_package(name)
 }
 
-fn opkg_install_pkg(label: &str, target: &str) -> CliResult<()> {
+pub(crate) fn opkg_install_pkg(label: &str, target: &str) -> CliResult<()> {
     system::opkg_install_pkg(label, target)
 }
 
-fn run_command_text(program: &str, args: &[&str]) -> CliResult<String> {
+pub(crate) fn run_command_text(program: &str, args: &[&str]) -> CliResult<String> {
     system::run_command_text(program, args)
 }
 
-fn run_command_capture_output(program: &str, args: &[&str]) -> CliResult<Vec<u8>> {
+pub(crate) fn run_command_capture_output(program: &str, args: &[&str]) -> CliResult<Vec<u8>> {
     system::run_command_capture_output(program, args)
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> CliResult<()> {
+pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> CliResult<()> {
     core_copy_dir_recursive(source, target).map_err(map_core_error)
 }
 
@@ -822,7 +650,7 @@ fn map_core_error(err: pica_core::error::PicaError) -> CliError {
     CliError::new(DEFAULT_ERROR_CODE, err.to_string())
 }
 
-fn manifest_get_array(value: &Value, key: &str) -> Vec<String> {
+pub(crate) fn manifest_get_array(value: &Value, key: &str) -> Vec<String> {
     let Some(entry) = value.get(key) else {
         return Vec::new();
     };
@@ -838,7 +666,7 @@ fn manifest_get_array(value: &Value, key: &str) -> Vec<String> {
     }
 }
 
-fn manifest_get_scalar(value: &Value, key: &str) -> String {
+pub(crate) fn manifest_get_scalar(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)

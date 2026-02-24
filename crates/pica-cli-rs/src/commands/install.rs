@@ -20,6 +20,22 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
+struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 pub fn install_app_auto(app: &mut App, selector: &str) -> CliResult<()> {
     ensure_dirs(&app.paths)?;
 
@@ -248,6 +264,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     app.log_info("Loading package files...");
 
     let tmpdir = make_temp_dir("pica-install")?;
+    let _tmpdir_guard = TempDirGuard::new(tmpdir.clone());
     run_tar_extract(pkgfile, &tmpdir)?;
 
     let manifest_file = tmpdir.join("manifest");
@@ -509,7 +526,6 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
 
     app.log_info("Transaction completed");
 
-    let _ = fs::remove_dir_all(&tmpdir);
     Ok(())
 }
 

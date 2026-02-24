@@ -4,8 +4,8 @@ Rust workspace for pica migration.
 
 ## Binaries
 
-- `pica-rs` (CLI replacement for `pica-cli/pica`)
-- `pica-pack-rs` (packer replacement for `pica-pack/pica-pack`)
+- `pica-rs` (CLI replacement for `legacy/pica-cli/pica`)
+- `pica-pack-rs` (packer replacement for `legacy/pica-pack/pica-pack`)
 
 ## Goals
 
@@ -16,7 +16,7 @@ Rust workspace for pica migration.
 ## Workspace layout
 
 ```text
-pica-rs/
+./
   crates/
     pica-core/      # shared domain/runtime helpers
     pica-cli-rs/    # device-side CLI

@@ -3,10 +3,12 @@
 Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 
 ![rust](https://ziadoua.github.io/m3-Markdown-Badges/badges/Rust/rust1.svg)
+![licence](https://ziadoua.github.io/m3-Markdown-Badges/badges/LicenceGPLv3/licencegplv31.svg)
+![shell](https://ziadoua.github.io/m3-Markdown-Badges/badges/Shell/shell1.svg)
 
 该名字继承自 Wine 递归浪漫，简单紧凑而不落后，以及运用 Arch 系包管理器相似的滚动更新机制。
 
-目前支持双版（Rust & Bash），后续可能淘汰掉 Bash 版本以便维护。
+> 说明：Bash 版本已归档到 `legacy/`，后续以 Rust 核心实现为主。
 # todo
 
 - 完善 CLI 文档/安装方式
@@ -40,8 +42,11 @@ Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 - `pica -Q`：列出已安装的 pica 包
 - `pica -Qi <pkgname>`：显示已安装包信息
 - `pica -Ql <pkgname>`：显示已安装包 License
+- `pica --fetch-timeout <seconds>`：下载超时（默认 30 秒）
+- `pica --fetch-retry <count>`：下载重试次数（默认 2，表示总尝试次数=1+count）
+- `pica --fetch-retry-delay <seconds>`：重试间隔（默认 1 秒）
 
-说明：仓库里的 CLI 实现位于 `pica-cli/pica`（bash 版本）。更完整的包标准/字段约定见 `docs/standard.md`。
+说明：当前核心实现为 Rust（`crates/pica-cli-rs` / `crates/pica-pack-rs`），Bash 版本已归档到 `legacy/`（不再作为核心维护）。更完整的包标准/字段约定见 `docs/standard.md`。
 
 ## 配置文件
 

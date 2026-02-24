@@ -3,20 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-#[derive(Debug)]
-pub struct LockError {
-    pub code: &'static str,
-    pub message: String,
-}
-
-pub type LockResult<T> = Result<T, LockError>;
+use crate::{CliError, CliResult};
 
 pub struct LockGuard {
     lock_dir: PathBuf,
 }
 
 impl LockGuard {
-    pub fn acquire(lock_file: &Path) -> LockResult<Self> {
+    pub fn acquire(lock_file: &Path) -> CliResult<Self> {
         if let Some(parent) = lock_file.parent() {
             ensure_dir(parent)?;
         }
@@ -28,16 +22,16 @@ impl LockGuard {
         match fs::create_dir(&lock_dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(LockError {
-                    code: "E_LOCK_BUSY",
-                    message: format!("cannot lock pica database: {} exists", lock_dir.display()),
-                });
+                return Err(CliError::new(
+                    "E_LOCK_BUSY",
+                    format!("cannot lock pica database: {} exists", lock_dir.display()),
+                ));
             }
             Err(err) => {
-                return Err(LockError {
-                    code: "E_RUNTIME",
-                    message: format!("cannot lock pica database: {err}"),
-                });
+                return Err(CliError::new(
+                    "E_RUNTIME",
+                    format!("cannot lock pica database: {err}"),
+                ));
             }
         }
 
@@ -54,9 +48,11 @@ impl Drop for LockGuard {
     }
 }
 
-fn ensure_dir(path: &Path) -> LockResult<()> {
-    fs::create_dir_all(path).map_err(|err| LockError {
-        code: "E_RUNTIME",
-        message: format!("mkdir {} failed: {err}", path.display()),
+fn ensure_dir(path: &Path) -> CliResult<()> {
+    fs::create_dir_all(path).map_err(|err| {
+        CliError::new(
+            "E_RUNTIME",
+            format!("mkdir {} failed: {err}", path.display()),
+        )
     })
 }
