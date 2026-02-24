@@ -5,6 +5,7 @@ use crate::{
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::{opkg_remove_pkg, run_command_capture_output};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,10 +35,26 @@ pub fn remove_pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
         let _ = fs::remove_file(file);
     }
 
-    for opkg_name in manifest_get_array(&manifest, "opkg") {
-        if opkg_name.is_empty() {
-            continue;
+    let mut remove_set = BTreeSet::new();
+    for app_name in manifest_get_array(&manifest, "app") {
+        let trimmed = app_name.trim();
+        if !trimmed.is_empty() {
+            remove_set.insert(trimmed.to_string());
         }
+    }
+
+    let app_i18n_template = manifest_get_scalar(&manifest, "app_i18n");
+    if !app_i18n_template.is_empty() {
+        let lang = read_json_file(&app.paths.conf_file)
+            .ok()
+            .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
+            .unwrap_or_else(|| "zh-cn".to_string());
+        if lang == "zh-cn" {
+            remove_set.insert(app_i18n_template.replace("{lang}", &lang));
+        }
+    }
+
+    for opkg_name in remove_set {
         app.log_info(format!("removing opkg package: {opkg_name}"));
         opkg_remove_pkg(&opkg_name)?;
     }

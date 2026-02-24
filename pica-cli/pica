@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PICA_VERSION="0.1.9"
+PICA_VERSION="0.1.11"
 
 PICA_ETC_DIR="${PICA_ETC_DIR:-/etc/pica}"
 PICA_CONF_FILE="${PICA_CONF_FILE:-${PICA_ETC_DIR}/pica.json}"
@@ -1210,10 +1210,13 @@ install_app_via_opkg() {
   opkg update >/dev/null 2>&1 || true
 
   local lang
-  lang="${PICA_LANG:-$(conf_get_i18n)}"
+  lang="$(conf_get_i18n)"
 
   local -a candidates
-  candidates=("$app" "luci-app-$app" "luci-i18n-${app}-${lang}")
+  candidates=("$app" "luci-app-$app")
+  if [[ "$lang" == "zh-cn" ]]; then
+    candidates+=("luci-i18n-${app}-${lang}")
+  fi
 
   local -a to_install
   local pkg
@@ -1454,12 +1457,7 @@ install_pkgfile() {
   ' <<<"$manifest_json")"
 
   resolve_lang() {
-    local lang=""
-    lang="$(jq -r '.lang // empty' "$PICA_CONF_FILE" 2>/dev/null || true)"
-    if [[ -z "$lang" ]]; then
-      lang="zh-cn"
-    fi
-    echo "$lang"
+    conf_get_i18n
   }
 
   expand_lang_template() {
@@ -1580,7 +1578,7 @@ install_pkgfile() {
   lang="$(resolve_lang)"
   local i18n_template
   i18n_template="$(manifest_get_first "$manifest_json" app_i18n)"
-  if [[ -n "$i18n_template" ]]; then
+  if [[ -n "$i18n_template" && "$lang" == "zh-cn" ]]; then
     app_list+=$'\n'
     app_list+="$(expand_lang_template "$i18n_template" "$lang")"
   fi
@@ -1748,7 +1746,21 @@ remove_pkg() {
     rm -f "/usr/bin/$cmdpath" || true
   done < <(manifest_get_array "$manifest_json" cmd || true)
 
-  # remove opkg packages if listed explicitly (optional)
+  # remove opkg packages by app/app_i18n mapping
+  local remove_list=""
+  local app_name
+  while IFS= read -r app_name; do
+    [[ -z "$app_name" ]] && continue
+    remove_list+="$app_name"$'\n'
+  done < <(manifest_get_array "$manifest_json" app || true)
+
+  local app_i18n_template lang
+  app_i18n_template="$(manifest_get_first "$manifest_json" app_i18n)"
+  lang="$(conf_get_i18n)"
+  if [[ -n "$app_i18n_template" && "$lang" == "zh-cn" ]]; then
+    remove_list+="$(expand_lang_template "$app_i18n_template" "$lang")"$'\n'
+  fi
+
   while IFS= read -r opkg_name; do
     [[ -z "$opkg_name" ]] && continue
     log_info "removing opkg package: $opkg_name"
@@ -1756,7 +1768,7 @@ remove_pkg() {
       set_error_code E_OPKG_REMOVE
       die "opkg remove failed: $opkg_name detail=[$out]"
     fi
-  done < <(manifest_get_array "$manifest_json" opkg || true)
+  done < <(printf '%s' "$remove_list" | sed '/^$/d' | sort -u)
 
   if [[ -f "/etc/pica/env.d/${pkgname}.env" ]]; then
     log_info "removing env: /etc/pica/env.d/${pkgname}.env"

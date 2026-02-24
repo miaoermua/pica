@@ -503,7 +503,7 @@ fn resolve_lang(conf_file: &Path) -> String {
     let conf = read_json_file(conf_file).ok();
     conf.and_then(|value| {
         value
-            .get("lang")
+            .get("i18n")
             .and_then(Value::as_str)
             .map(ToString::to_string)
     })

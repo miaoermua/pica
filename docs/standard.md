@@ -98,8 +98,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.9-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.9-1-all.pkg.tar.gz
+pica -U ./hello-0.1.11-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.1.11-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -175,7 +175,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.9）
+### 最新推荐字段模板（0.1.11）
 
 ```ini
 # Required
@@ -186,11 +186,11 @@ version = rolling
 branch = stable
 protocol = luci
 
-pkgver = 0.1.9
+pkgver = 0.1.11
 pkgrel = 1
 platform = all
 arch = all
-pica = 0.1.9
+pica = 0.1.11
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -206,6 +206,9 @@ proprietary = false
 # type = cli
 # type = luci
 # luci = lua1
+#
+# Optional source metadata
+source = pica
 
 # Install plan
 app = hello
@@ -257,8 +260,6 @@ proprietary = false
 ### 与 OpenWrt 安装相关的扩展字段（可重复，可选）
 
 ```
-opkg = <opkg package name>
-
 # Install plan (repeatable)
 app = <opkg package name>
 base = <opkg package name>
@@ -284,13 +285,15 @@ luci = lua1
 约定：
 
 - `app/base/kmod` 定义“安装清单”，pica 安装时必须遍历这些字段来决定需要安装的 opkg 包。
-- `app_i18n` 允许包含 `{lang}` 占位符，pica 根据配置语言选择实际 i18n 包名。
-- `opkg` 用于卸载白名单（仅卸载你显式列出的包）。
+- `app_i18n` 允许包含 `{lang}` 占位符，pica 根据配置 `i18n` 选择实际 i18n 包名（当前仅 `zh-cn` 时参与安装/卸载）。
+- 卸载默认按 `app` + `app_i18n`（当 `i18n=zh-cn`）映射执行，不再依赖 `opkg` 字段。
 - `cmd_install/cmd_update/cmd_remove` 是生命周期脚本（包内路径，一般在 `cmd/` 下）。
 
 - `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。
 - `type = luci` 表示“该包包含/依赖 LuCI Web UI”。如果声明了 `type = luci`，必须同时声明 `luci = lua1|js2`。
 - `type = cli` 表示“该包提供纯命令行程序/脚本”。
+- 仅声明 `type = cli` 时，不需要 `luci = ...`。
+- `source` 用于记录安装来源（例如 `pica` / `opkg` / `local` / `url`），便于升级与排错。默认可不写；安装后 CLI 会在本地数据库里补全 `source`。
 
 ## arch（OpenWrt/opkg）
 
@@ -319,8 +322,8 @@ luci-i18n-myapp-zh-cn # i18n
 因此建议：
 
 - `pkgname` 用“应用名”做 pica 包唯一标识。
-- 用多条 `opkg = ...` 列出该应用对应的 opkg 子包（core/luci/i18n…）。
-- 卸载时 pica 只卸载 `opkg =` 明确列出的包，不猜测、不扩展。
+- 安装清单用 `app = ...`（以及可选 `app_i18n = ...`）列出应用子包。
+- 卸载时 pica 按 `app` + `app_i18n` 映射处理（当前仅 `i18n=zh-cn` 时处理 i18n 包）。
 
 ## cmd/.env 预留
 
@@ -421,27 +424,34 @@ pkgrel = 1
 pkgdesc = Example LuCI application
 url = https://example.com
 packager = example
+license = GPL-3.0-only
+proprietary = false
 
 arch = all
-platform = openwrt
+platform = openwrt-any
 uname = x86_64
 
-pica = 0.1.9
+pica = 0.1.11
+source = pica
 
 type = luci
 luci = lua1
 
+# Install plan (repeatable)
+app = luci-app-example
+app_i18n = luci-i18n-example-{lang}
 base = luci-base
 base = rpcd
-
-opkg = luci-app-example
-opkg = luci-i18n-example-zh-cn
-
-cmd = example-cli
-
 base = ca-bundle
 kmod = kmod-tun
 
-license = GPL-3.0-only
-proprietary = false
+# Optional uninstall whitelist (repeatable)
+app = luci-app-example
+app_i18n = luci-i18n-example-{lang}
+cmd = example-cli
+
+# Lifecycle scripts (optional)
+cmd_install = cmd/install
+cmd_update = cmd/update
+cmd_remove = cmd/remove
 ```

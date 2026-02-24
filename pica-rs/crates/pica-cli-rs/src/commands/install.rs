@@ -81,11 +81,10 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
     opkg_update_ignore();
     let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
 
-    let candidates = vec![
-        appname.clone(),
-        format!("luci-app-{appname}"),
-        format!("luci-i18n-{appname}-{lang}"),
-    ];
+    let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
+    if lang == "zh-cn" {
+        candidates.push(format!("luci-i18n-{appname}-{lang}"));
+    }
 
     let mut to_install = Vec::new();
     for pkg in candidates {
@@ -371,7 +370,7 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     let mut app_list = manifest.get_array("app");
     let lang = resolve_lang(&app.paths.conf_file);
     let i18n_template = manifest.get_first("app_i18n");
-    if !i18n_template.is_empty() {
+    if !i18n_template.is_empty() && lang == "zh-cn" {
         app_list.push(i18n_template.replace("{lang}", &lang));
     }
     app_list = reorder_app_list(app_list);

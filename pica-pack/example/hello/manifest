@@ -5,7 +5,7 @@ version = rolling
 branch = stable
 protocol = luci
 
-pkgver = 0.1.9
+pkgver = 0.1.11
 pkgrel = 1
 pkgdesc = Example lifecycle package
 url = https://example.invalid
@@ -15,7 +15,7 @@ proprietary = false
 
 platform = all
 arch = all
-pica = 0.1.9
+pica = 0.1.11
 
 # Optional compatibility tags (recommended):
 # uname = arm64
@@ -23,6 +23,7 @@ pica = 0.1.9
 # Optional type tags (repeatable):
 # type = cli
 # type = luci
+source = pica
 #
 # If type includes luci, declare the implementation variant:
 # luci = lua1
@@ -33,10 +34,6 @@ app = hello
 app_i18n = luci-i18n-hello-{lang}
 base = busybox
 # kmod = kmod-tun
-
-# Optional: uninstall whitelist (repeatable)
-opkg = hello
-opkg = luci-i18n-hello-{lang}
 
 # Optional: if you want pica -R to delete installed /usr/bin files safely,
 # list them explicitly (relative paths under /usr/bin):
