@@ -301,10 +301,6 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
     if !tmpdir.join("cmd").is_dir() {
         return Err(CliError::new(E_PACKAGE_INVALID, "package missing cmd/"));
     }
-    if !tmpdir.join("binary").is_dir() {
-        return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
-    }
-
     let manifest = Manifest::from_file(&manifest_file)
         .map_err(|err| CliError::new(E_MANIFEST_INVALID, format!("invalid manifest: {err}")))?;
 
@@ -384,6 +380,10 @@ pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) 
             E_CONFIG_INVALID,
             format!("invalid pkgmgr value: {pkgmgr} (supported: opkg, none)"),
         ));
+    }
+
+    if pkgmgr == "opkg" && !tmpdir.join("binary").is_dir() {
+        return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
     }
 
     if visibility != "open" && visibility != "mix" && visibility != "closed" {
