@@ -88,7 +88,9 @@ pub fn opkg_update_ignore() {
         return;
     }
 
-    clear_opkg_lock_files();
+    if !clear_opkg_lock_files_if_stale() {
+        return;
+    }
     let _ = Command::new("opkg").arg("update").output();
 }
 
@@ -301,13 +303,53 @@ fn is_opkg_lock_error(detail: &str) -> bool {
     mentions_lock && lock_failure
 }
 
-fn clear_opkg_lock_files() {
+fn clear_opkg_lock_files_if_stale() -> bool {
+    let mut cleared_any = false;
+
     for lock_path in OPKG_LOCK_FILES {
         let path = Path::new(lock_path);
-        if path.exists() {
-            let _ = fs::remove_file(path);
+        if !path.exists() {
+            continue;
+        }
+
+        match read_opkg_lock_pid(path) {
+            Some(pid) if pid_is_running(pid) => {
+                return false;
+            }
+            Some(_) | None => {
+                if fs::remove_file(path).is_ok() {
+                    cleared_any = true;
+                }
+            }
         }
     }
+
+    cleared_any
+}
+
+fn read_opkg_lock_pid(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+
+    for token in text.split(|ch: char| !ch.is_ascii_digit()) {
+        if token.is_empty() {
+            continue;
+        }
+        if let Ok(pid) = token.parse::<u32>() {
+            if pid > 0 {
+                return Some(pid);
+            }
+        }
+    }
+
+    None
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
@@ -326,7 +368,10 @@ fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_opkg_lock_error, opkg_list_dir_has_files};
+    use super::{
+        clear_opkg_lock_files_if_stale, is_opkg_lock_error, opkg_list_dir_has_files,
+        read_opkg_lock_pid,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -362,5 +407,24 @@ mod tests {
         assert!(opkg_list_dir_has_files(&dir));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_opkg_lock_pid_extracts_numeric_token() {
+        let dir = make_temp_dir("opkg-lock-pid");
+        let lock_file = dir.join("opkg.lock");
+
+        fs::write(&lock_file, "pid: 1234\n").expect("write lock file");
+        assert_eq!(read_opkg_lock_pid(&lock_file), Some(1234));
+
+        fs::write(&lock_file, "nonsense").expect("write non pid lock file");
+        assert_eq!(read_opkg_lock_pid(&lock_file), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_lock_cleanup_skips_missing_default_paths() {
+        assert!(!clear_opkg_lock_files_if_stale());
     }
 }

@@ -56,18 +56,17 @@ jobs:
             -p pica-cli-rs \
             -p pica-pack-rs
 
-      - name: Pack artifacts
+      - name: Prepare artifacts
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/pica-rs" dist/
-          cp "target/${{ matrix.target }}/release/pica-pack-rs" dist/
-          tar -C dist -czf "pica-${{ matrix.target }}.tar.gz" pica-rs pica-pack-rs
+          cp "target/${{ matrix.target }}/release/pica-rs" "dist/pica-rs-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/pica-pack-rs" "dist/pica-pack-rs-${{ matrix.target }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: pica-${{ matrix.target }}
-          path: pica-${{ matrix.target }}.tar.gz
+          path: dist/*
 
   release:
     name: Release assets
@@ -88,4 +87,4 @@ jobs:
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*.tar.gz
+          files: release-assets/*
