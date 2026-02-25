@@ -29,7 +29,7 @@
 
 - `fetch_url` 下载后直接写盘安装，无任何 hash 校验
 - `repo.json` 文档已预留 `md5`/`size` 字段，代码未实现
-- hook 脚本以 root 权限通过 `bash` 执行无沙箱
+- hook 脚本以 root 权限通过 `sh` 执行无沙箱
 - HTTP 场景存在 MITM 攻击面
 
 至少实现 `sha256` 校验（推荐替代 md5），在 `repo.json` schema 中添加 `sha256` 字段。

@@ -31,7 +31,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.1.39`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.2.1`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -234,10 +234,10 @@ luci-i18n-myapp-zh-cn
 输出日志风格参考 Arch `makepkg`：
 
 ```
-==> Making package: hello 0.1.39-1 (openwrt-any)
-  -> Pica version: 0.1.39
+==> Making package: hello 0.2.1-1 (openwrt-any)
+  -> Pica version: 0.2.1
   -> Creating archive...
-==> Finished: /tmp/pica-test/hello-0.1.39-1-openwrt-any.pkg.tar.gz
+==> Finished: /tmp/pica-test/hello-0.2.1-1-openwrt-any.pkg.tar.gz
 ```
 
 ### 示例
@@ -253,7 +253,7 @@ luci-i18n-myapp-zh-cn
 
 ### 依赖
 
-- `bash`
+- `sh`（BusyBox 默认 shell）
 - `jq`
 - `tar`
 - 下载工具其一：`uclient-fetch`（OpenWrt 常见）/ `wget` / `curl`
@@ -328,7 +328,7 @@ pica -S
 #### 安装/更新（-U）
 
 ```
-pica -U ./hello-0.1.39-1-openwrt-any.pkg.tar.gz
+pica -U ./hello-0.2.1-1-openwrt-any.pkg.tar.gz
 
 #### 全量升级（-Syu）
 
@@ -375,7 +375,7 @@ pica -R myapp
 
 ```
 pica -Q
-hello	0.1.39-1	amd64
+hello	0.2.1-1	amd64
 ```
 
 ## 仓库协议（repo.json，最小实现）
@@ -413,7 +413,7 @@ repo-root/
   "packages": [
     {
       "pkgname": "hello",
-      "pkgver": "0.1.39",
+      "pkgver": "0.2.1",
       "pkgrel": "1",
       "appname": "hello",
       "url": "https://github.com/miaoermua/pica",
@@ -422,8 +422,8 @@ repo-root/
       "branch": "stable",
       "os": "openwrt",
       "platform": "amd64",
-      "pica": "0.1.39",
-      "filename": "hello-0.1.39-1-amd64-all.pkg.tar.gz",
+      "pica": "0.2.1",
+      "filename": "hello-0.2.1-1-amd64-all.pkg.tar.gz",
       "sha256": "<sha256>",
       "size": 465
     }

@@ -101,5 +101,5 @@ fn run_cmd_install_tree(app: &mut App, cmd_rel: &str, label: &str) -> CliResult<
     }
 
     app.log_info(format!("Running {label} cmd: {cmd_rel}"));
-    run_command_capture_output("bash", &[cmd_path.to_string_lossy().as_ref()]).map(|_| ())
+    run_command_capture_output("sh", &[cmd_path.to_string_lossy().as_ref()]).map(|_| ())
 }

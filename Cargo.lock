@@ -16,7 +16,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "pica-cli-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pica-core",
  "serde",
@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "pica-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "pica-pack-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pica-core",
  "serde_json",

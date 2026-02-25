@@ -111,8 +111,8 @@ pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.1.39-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.1.39-1-all.pkg.tar.gz
+pica -U ./hello-0.2.1-1-all.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.2.1-1-all.pkg.tar.gz
 ```
 
 允许的 URL 协议：
@@ -191,7 +191,7 @@ arch = all
 pica = <min pica-cli version>
 ```
 
-### 最新推荐字段模板（0.1.39）
+### 最新推荐字段模板（0.2.1）
 
 ```ini
 # Required
@@ -203,12 +203,12 @@ branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
 
-pkgver = 0.1.39
+pkgver = 0.2.1
 pkgrel = 1
 os = openwrt
 platform = arm64
 arch = all
-pica = 0.1.39
+pica = 0.2.1
 
 # Optional metadata
 pkgdesc = Example lifecycle package
@@ -330,7 +330,8 @@ luci = lua1
 - 当 `pkgmgr = none` 时：跳过包管理器安装/卸载，仅执行 `cmd_install/cmd_update/cmd_remove` 与 `cmd/` 文件部署。
 - 若包内存在 `src/`：安装阶段复制到 `/usr/lib/pica/src/<pkgname>/`，卸载阶段清理该目录。
 - `src/` 可用于携带脚本/模板/Compose 清单，但容器运行与编排策略由外部工具负责（不由 Pica 托管）。
-- `cmd_install/cmd_update/cmd_remove` 是生命周期脚本（包内路径，一般在 `cmd/` 下）。
+- `cmd_install/cmd_update/cmd_remove` 是生命周期脚本（包内路径，一般在 `cmd/` 下），应按 POSIX `sh` 语法编写。
+- 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不再依赖 `bash`。
 
 - `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。
 - `type = luci` 表示“该包包含/依赖 LuCI Web UI”。如果声明了 `type = luci`，必须同时声明 `luci = lua1|js2`。
@@ -484,7 +485,7 @@ os = openwrt
 platform = amd64
 uname = x86_64
 
-pica = 0.1.39
+pica = 0.2.1
 source = pica
 
 type = luci

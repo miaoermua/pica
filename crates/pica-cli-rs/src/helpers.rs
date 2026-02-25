@@ -525,7 +525,7 @@ pub(crate) fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str
     }
 
     app.log_info(format!("Running {label} hook: {hook_rel}"));
-    run_command_capture_output("bash", &[hook_path.to_string_lossy().as_ref()]).map(|_| ())
+    run_command_capture_output("sh", &[hook_path.to_string_lossy().as_ref()]).map(|_| ())
 }
 
 
