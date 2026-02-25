@@ -7,6 +7,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+const OPKG_LISTS_DIRS: [&str; 2] = ["/var/opkg-lists", "/tmp/opkg-lists"];
+const OPKG_LOCK_FILES: [&str; 2] = ["/var/lock/opkg.lock", "/tmp/lock/opkg.lock"];
+
 pub fn fetch_url(url: &str, is_supported_url: fn(&str) -> bool) -> CliResult<Vec<u8>> {
     if !is_supported_url(url) {
         return Err(CliError::new(
@@ -67,6 +70,25 @@ pub fn opkg_update_ignore() {
     if !has_command("opkg") {
         return;
     }
+
+    if opkg_lists_ready() {
+        return;
+    }
+
+    let Ok(output) = Command::new("opkg").arg("update").output() else {
+        return;
+    };
+
+    if output.status.success() {
+        return;
+    }
+
+    let detail = stderr_or_stdout(&output.stdout, &output.stderr);
+    if !is_opkg_lock_error(&detail) {
+        return;
+    }
+
+    clear_opkg_lock_files();
     let _ = Command::new("opkg").arg("update").output();
 }
 
@@ -103,6 +125,8 @@ pub fn opkg_installed_version(name: &str) -> Option<String> {
 }
 
 pub fn opkg_install_pkg(label: &str, target: &str) -> CliResult<()> {
+    opkg_update_ignore();
+
     let output = Command::new("opkg")
         .arg("install")
         .arg(target)
@@ -246,6 +270,46 @@ fn run_fetch(command: &str, args: &[&str]) -> CliResult<Vec<u8>> {
     }
 }
 
+fn opkg_lists_ready() -> bool {
+    OPKG_LISTS_DIRS
+        .iter()
+        .map(Path::new)
+        .any(opkg_list_dir_has_files)
+}
+
+fn opkg_list_dir_has_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| entry.path().is_file())
+}
+
+fn is_opkg_lock_error(detail: &str) -> bool {
+    let text = detail.to_ascii_lowercase();
+
+    if text.contains("opkg.lock") {
+        return true;
+    }
+
+    let mentions_lock = text.contains(" lock") || text.starts_with("lock") || text.contains("locked");
+    let lock_failure = text.contains("resource temporarily unavailable")
+        || text.contains("could not lock")
+        || text.contains("failed to lock")
+        || text.contains("cannot lock");
+
+    mentions_lock && lock_failure
+}
+
+fn clear_opkg_lock_files() {
+    for lock_path in OPKG_LOCK_FILES {
+        let path = Path::new(lock_path);
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
     let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
     if !stderr_text.is_empty() {
@@ -257,5 +321,46 @@ fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
         stdout_text
     } else {
         "unknown error".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_opkg_lock_error, opkg_list_dir_has_files};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time must move forward")
+            .as_nanos();
+        path.push(format!("pica-test-{prefix}-{}-{now}", std::process::id()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn lock_error_detection_handles_common_messages() {
+        assert!(is_opkg_lock_error("Could not lock /var/lock/opkg.lock: Resource temporarily unavailable"));
+        assert!(is_opkg_lock_error("Cannot lock package database"));
+        assert!(!is_opkg_lock_error("wget: bad address"));
+    }
+
+    #[test]
+    fn list_dir_check_requires_regular_files() {
+        let dir = make_temp_dir("opkg-lists");
+        assert!(!opkg_list_dir_has_files(&dir));
+
+        let nested = dir.join("subdir");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        assert!(!opkg_list_dir_has_files(&dir));
+
+        fs::write(dir.join("generic"), b"Package: test\n").expect("write list file");
+        assert!(opkg_list_dir_has_files(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

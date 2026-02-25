@@ -72,6 +72,57 @@ pub(crate) fn find_pica_candidates_in_index(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let protocol = pkg
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pkg_url = pkg
+                .get("url")
+                .or_else(|| pkg.get("origin"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let luci_url = pkg
+                .get("luci_url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let luci_desc = pkg
+                .get("luci_desc")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pkgmgr = pkg
+                .get("pkgmgr")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pkgdesc = pkg
+                .get("pkgdesc")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    pkg.get("manifest")
+                        .and_then(|manifest| manifest.get("pkgdesc"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            let pkg_platform = pkg
+                .get("platform")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pkg_arch = pkg
+                .get("arch")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let size = match pkg.get("size") {
+                Some(Value::Number(number)) => number.as_u64(),
+                Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
+                _ => None,
+            };
             let filename = pkg
                 .get("filename")
                 .and_then(Value::as_str)
@@ -113,6 +164,20 @@ pub(crate) fn find_pica_candidates_in_index(
                 cmpver: pkgver_cmp_key(&pkgver, &pkgrel),
                 repo: repo_name.to_string(),
                 url: repo_url.clone(),
+                appname,
+                branch,
+                pkgver,
+                pkgrel,
+                protocol,
+                pkg_url,
+                luci_url,
+                luci_desc,
+                pkgmgr,
+                pkgdesc,
+                os: pkg_os,
+                platform: pkg_platform,
+                arch: pkg_arch,
+                size,
                 filename,
                 download_url,
                 min_pica,
@@ -130,6 +195,20 @@ pub(crate) struct RepoCandidate {
     pub(crate) cmpver: String,
     pub(crate) repo: String,
     pub(crate) url: String,
+    pub(crate) appname: String,
+    pub(crate) branch: String,
+    pub(crate) pkgver: String,
+    pub(crate) pkgrel: String,
+    pub(crate) protocol: String,
+    pub(crate) pkg_url: String,
+    pub(crate) luci_url: String,
+    pub(crate) luci_desc: String,
+    pub(crate) pkgmgr: String,
+    pub(crate) pkgdesc: String,
+    pub(crate) os: String,
+    pub(crate) platform: String,
+    pub(crate) arch: String,
+    pub(crate) size: Option<u64>,
     pub(crate) filename: String,
     pub(crate) download_url: Option<String>,
     pub(crate) min_pica: Option<String>,

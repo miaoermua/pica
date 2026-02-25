@@ -31,7 +31,7 @@
 
 ## 版本约定
 
-- `pica-cli` 内置协议版本：`PICA_VERSION=0.2.1`
+- `pica-cli` 内置协议版本：`PICA_VERSION=0.2.3`
 - `manifest` 的 `pica` 字段表示最低兼容版本：`pica = <min pica-cli version>`（可选，不写不检查）
 - `pica -U` 安装时会校验 `manifest` 的 `pica` 与 CLI 是否一致；不一致直接失败（非 0 退出）。
 
@@ -125,7 +125,7 @@ arch = all
 uname = <uname -m>
 ```
 
-应用选择器（`-Si/-Sp`）：
+应用选择器（`-S <selector>`/`-Si`/`-Sp`）：
 
 ```
 app
@@ -234,10 +234,10 @@ luci-i18n-myapp-zh-cn
 输出日志风格参考 Arch `makepkg`：
 
 ```
-==> Making package: hello 0.2.1-1 (openwrt-any)
-  -> Pica version: 0.2.1
+==> Making package: hello 0.2.3-1 (openwrt-any)
+  -> Pica version: 0.2.3
   -> Creating archive...
-==> Finished: /tmp/pica-test/hello-0.2.1-1-openwrt-any.pkg.tar.gz
+==> Finished: /tmp/pica-test/hello-0.2.3-1-openwrt-any.pkg.tar.gz
 ```
 
 ### 示例
@@ -321,6 +321,28 @@ pica -S
 - 对每个 repo 下载 `<url>/repo.json`
 - 写入/更新 `/var/lib/pica/index.json`
 
+#### 安装（-S <selector>）
+
+```
+pica -S myapp
+```
+
+行为：
+
+- 当 `-S` 带 selector 参数时，直接进入安装流程（auto 模式）
+- 自动在 `opkg` 与 `pica` 仓库安装路径之间决策
+
+#### 远端查询（-Si <selector>）
+
+```
+pica -Si myapp
+```
+
+行为：
+
+- 从已同步的 `index.json` 中筛选 selector 命中的候选包
+- 按版本选择最新候选并展示仓库远端元信息（不安装）
+
 错误规则：
 
 - 未配置软件源（`repos` 为空）会直接失败（非 0 退出）
@@ -328,7 +350,7 @@ pica -S
 #### 安装/更新（-U）
 
 ```
-pica -U ./hello-0.2.1-1-openwrt-any.pkg.tar.gz
+pica -U ./hello-0.2.3-1-openwrt-any.pkg.tar.gz
 
 #### 全量升级（-Syu）
 
@@ -346,6 +368,8 @@ pica -Syu
   - 校验 `arch`：OpenWrt/opkg 架构字段，推荐 `arch = all`；若不是 all，则必须出现在 `opkg print-architecture`
 - 读取 `manifest` 的安装清单字段：`kmod/base/app`（以及可选的 `app_i18n`）。
 - 先处理 `kmod`：缺失/不可安装则拒绝继续。
+- 在执行 `opkg install` 前会先检查索引缓存（`/var/opkg-lists/`，OpenWrt 常见映射为 `/tmp/opkg-lists/`）：仅当缓存缺失时才执行 `opkg update`，避免每次重复更新。
+- 若 `opkg update` 因锁冲突失败（`/var/lock/opkg.lock`），会尝试清理锁文件并自动重试一次更新。
 - 再处理 `base`：软件源有则可选择走软件源；软件源没有则必须使用包内 `depend/*.ipk`，否则失败。
 - 最后处理 `app`：软件源有则可选择走软件源；软件源没有则必须使用包内 `binary/*.ipk`，否则失败。
 - 安装命令：将 `cmd/` 复制到 `/usr/bin/`
@@ -375,7 +399,7 @@ pica -R myapp
 
 ```
 pica -Q
-hello	0.2.1-1	amd64
+hello	0.2.3-1	amd64
 ```
 
 ## 仓库协议（repo.json，最小实现）
@@ -413,7 +437,7 @@ repo-root/
   "packages": [
     {
       "pkgname": "hello",
-      "pkgver": "0.2.1",
+      "pkgver": "0.2.3",
       "pkgrel": "1",
       "appname": "hello",
       "url": "https://github.com/miaoermua/pica",
@@ -422,8 +446,8 @@ repo-root/
       "branch": "stable",
       "os": "openwrt",
       "platform": "amd64",
-      "pica": "0.2.1",
-      "filename": "hello-0.2.1-1-amd64-all.pkg.tar.gz",
+      "pica": "0.2.3",
+      "filename": "hello-0.2.3-1-amd64-all.pkg.tar.gz",
       "sha256": "<sha256>",
       "size": 465
     }
@@ -444,6 +468,6 @@ repo-root/
   - `platform = all`：`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz`
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`；安装时优先使用该 URL 下载
 
-当前 `pica -S` 只负责下载并缓存 `repo.json` 与写入索引；后续如果要做 `-Ss/-Si/从仓库安装`，会基于该索引扩展。
+当前 `pica -S` 语义为：无参数时同步；带 selector 时安装。
 
-当前 `pica -Si/-Sp` 从仓库下载 `.pkg.tar.gz` 时，会在写入缓存和安装前执行 SHA-256 校验；若不匹配会直接失败。
+当前 `pica -S <selector>/-Sp` 从仓库下载 `.pkg.tar.gz` 时，会在写入缓存和安装前执行 SHA-256 校验；若不匹配会直接失败。

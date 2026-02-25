@@ -36,7 +36,7 @@ Rust workspace for pica migration.
 
 ### `pica-rs`
 
-- `-S` (sync repo metadata, strict `repo.json` validation)
+- `-S [selector]` (no selector: sync repo metadata; with selector: install auto)
 - `-Q`, `-Qi`, `-Ql` (query installed db)
 - `-So`, `-Si`, `-Sp`
 - `-U`, `-R`, `-Su`, `-Syu`

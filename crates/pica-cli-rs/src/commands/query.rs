@@ -1,6 +1,6 @@
 use crate::{
-    ensure_dirs, manifest_get_first, pkgver_cmp_key, App, CliError, CliResult, E_ARG_INVALID,
-    E_DB_INVALID,
+    ensure_dirs, find_pica_candidates_in_index, manifest_get_first, pkgver_cmp_key, pkgver_ge,
+    App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
 };
 use crate::state::read_json_file;
 use serde_json::Value;
@@ -54,6 +54,60 @@ pub fn query_installed(app: &mut App) -> CliResult<()> {
 
         println!("{pkgname}\t{version}\t{platform}");
     }
+
+    Ok(())
+}
+
+pub fn query_sync_info(app: &mut App, selector: &str) -> CliResult<()> {
+    ensure_dirs(&app.paths)?;
+
+    let candidates = find_pica_candidates_in_index(app, selector)?;
+    if candidates.is_empty() {
+        return Err(CliError::new(
+            E_CONFIG_INVALID,
+            format!("package not found in pica repos: {selector}"),
+        ));
+    }
+
+    let mut best = &candidates[0];
+    for candidate in &candidates[1..] {
+        if pkgver_ge(&candidate.cmpver, &best.cmpver) {
+            best = candidate;
+        }
+    }
+
+    let download_url = if let Some(url) = &best.download_url {
+        url.clone()
+    } else {
+        format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename)
+    };
+
+    println!("Repository      : {}", best.repo);
+    println!("Name            : {}", best.pkgname);
+    println!("AppName         : {}", best.appname);
+    println!("Version         : {}", best.cmpver);
+    println!("Pkgver          : {}", best.pkgver);
+    println!("Pkgrel          : {}", best.pkgrel);
+    println!("Branch          : {}", best.branch);
+    println!("Protocol        : {}", best.protocol);
+    println!("Program URL     : {}", best.pkg_url);
+    println!("LuCI URL        : {}", best.luci_url);
+    println!("LuCI Desc       : {}", best.luci_desc);
+    println!("PkgDesc         : {}", best.pkgdesc);
+    println!("OS              : {}", best.os);
+    println!("Platform        : {}", best.platform);
+    println!("Arch            : {}", best.arch);
+    println!("PkgMgr          : {}", best.pkgmgr);
+    println!("Pica Required   : {}", best.min_pica.as_deref().unwrap_or(""));
+    println!("Download URL    : {}", download_url);
+    println!("Filename        : {}", best.filename);
+    println!("Sha256          : {}", best.sha256);
+    println!(
+        "Size            : {}",
+        best.size
+            .map(|value| format_size_display(&value.to_string()))
+            .unwrap_or_default()
+    );
 
     Ok(())
 }

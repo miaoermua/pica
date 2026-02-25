@@ -22,7 +22,7 @@ use pica_core::PICA_VERSION;
 use std::env;
 use std::process::{self};
 use crate::lock::LockGuard;
-use crate::commands::query::{query_files, query_info, query_installed};
+use crate::commands::query::{query_files, query_info, query_installed, query_sync_info};
 use crate::commands::remove::remove_pkg;
 use crate::commands::sync::sync_repos;
 use crate::commands::upgrade::upgrade_all;
@@ -32,7 +32,7 @@ use crate::commands::install::{
 
 fn usage() {
     println!(
-        "Usage:\n  pica-rs -S                 Sync (download repo.json and update index)\n  pica-rs -Su                Upgrade all installed pica packages\n  pica-rs -Syu               Sync, then upgrade all installed pica packages\n  pica-rs -Si <selector>     Install by selector (auto: opkg if available, else pica)\n  pica-rs -So <selector>     Install by selector (force opkg)\n  pica-rs -Sp <selector>     Install by selector (force pica repo)\n  pica-rs -U <pkgfile|url>   Install/Update from local file or URL\n  pica-rs -R <pkgname>       Remove package (no dependency handling)\n  pica-rs -Q                 List installed pica packages\n  pica-rs -Qi <pkgname>      Show installed package info\n  pica-rs -Ql <pkgname>      List installed package files\n  pica-rs --json ...         Emit JSON on success and error (explicit only)\n  pica-rs --json-errors ...  Emit JSON only on error\n  pica-rs --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica-rs --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica-rs -V\n  pica-rs --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
+        "Usage:\n  pica-rs -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica-rs -Su                Upgrade all installed pica packages\n  pica-rs -Syu               Sync, then upgrade all installed pica packages\n  pica-rs -Si <selector>     Show remote package info from synced index\n  pica-rs -So <selector>     Install by selector (force opkg)\n  pica-rs -Sp <selector>     Install by selector (force pica repo)\n  pica-rs -U <pkgfile|url>   Install/Update from local file or URL\n  pica-rs -R <pkgname>       Remove package (no dependency handling)\n  pica-rs -Q                 List installed pica packages\n  pica-rs -Qi <pkgname>      Show installed package info\n  pica-rs -Ql <pkgname>      List installed package files\n  pica-rs --json ...         Emit JSON on success and error (explicit only)\n  pica-rs --json-errors ...  Emit JSON only on error\n  pica-rs --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica-rs --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica-rs -V\n  pica-rs --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
     );
 }
 
@@ -108,9 +108,16 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     let command = args[0].as_str();
     match command {
         "-S" => {
-            app.set_phase("sync");
-            sync_repos(app)?;
-            Ok(("-S", "repos".to_string()))
+            if let Some(selector) = args.get(1) {
+                app.set_phase("install");
+                need_cmd("opkg")?;
+                install_app_auto(app, selector)?;
+                Ok(("-S", selector.to_string()))
+            } else {
+                app.set_phase("sync");
+                sync_repos(app)?;
+                Ok(("-S", "repos".to_string()))
+            }
         }
         "-Su" => {
             app.set_phase("upgrade");
@@ -151,10 +158,9 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
             Ok(("-So", selector.to_string()))
         }
         "-Si" => {
-            app.set_phase("install");
-            need_cmd("opkg")?;
+            app.set_phase("query");
             let selector = require_arg(args, 1, "-Si requires <selector>")?;
-            install_app_auto(app, selector)?;
+            query_sync_info(app, selector)?;
             Ok(("-Si", selector.to_string()))
         }
         "-Sp" => {
