@@ -75,6 +75,7 @@ jobs:
             -p pica-pack-rs
 
       - name: Prepare artifacts
+        id: prepare_artifacts
         run: |
           mkdir -p dist
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
@@ -85,12 +86,19 @@ jobs:
 
           cp "target/${{ matrix.target }}/release/pica" "dist/pica.${arch}"
           cp "target/${{ matrix.target }}/release/pica-pack" "dist/pica-pack.${arch}"
+          echo "arch=${arch}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifact
+      - name: Upload pica artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pica-${{ matrix.target }}
-          path: dist/*
+          name: pica.${{ steps.prepare_artifacts.outputs.arch }}
+          path: dist/pica.${{ steps.prepare_artifacts.outputs.arch }}
+
+      - name: Upload pica-pack artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pica-pack.${{ steps.prepare_artifacts.outputs.arch }}
+          path: dist/pica-pack.${{ steps.prepare_artifacts.outputs.arch }}
 
   release:
     name: Release assets
@@ -105,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
-          pattern: pica-*
+          pattern: pica*
           merge-multiple: true
 
       - name: Publish GitHub Release assets
