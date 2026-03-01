@@ -1,15 +1,13 @@
-use crate::{
-  ensure_dirs, manifest_get_first, CliError, CliResult, Selector, E_DB_INVALID, E_IO,
-  E_JSON_INVALID, E_RUNTIME,
-};
+use crate::app::{ensure_dirs, App, CliError, CliResult, Paths, E_DB_INVALID, E_RUNTIME};
 use pica_pkg_core::io::now_unix_secs;
+use pica_pkg_core::manifest::get_first as manifest_get_first;
+use pica_pkg_core::selector::Selector;
 use serde_json::{json, Map, Value};
-use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn report_set_install_result(
-  paths: &crate::Paths,
+  paths: &Paths,
   pkgname: &str,
   selector: &str,
   manifest: &Value,
@@ -144,31 +142,11 @@ pub fn db_find_installed_pkgname_by_selector(
 }
 
 pub fn read_json_file(path: &Path) -> CliResult<Value> {
-  let content = fs::read_to_string(path)
-    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", path.display())))?;
-
-  serde_json::from_str(&content)
-    .map_err(|err| CliError::new(E_JSON_INVALID, format!("parse {} failed: {err}", path.display())))
+  pica_pkg_core::io::read_json_file(path).map_err(CliError::from)
 }
 
 pub fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
-  let mut tmp_name = OsString::from(path.as_os_str());
-  tmp_name.push(".tmp");
-  let tmp_path = PathBuf::from(tmp_name);
-
-  if let Some(parent) = path.parent() {
-    fs::create_dir_all(parent)
-      .map_err(|err| CliError::new(E_IO, format!("mkdir {} failed: {err}", parent.display())))?;
-  }
-
-  let content = serde_json::to_string_pretty(value)
-    .map_err(|err| CliError::new(E_JSON_INVALID, err.to_string()))?;
-  fs::write(&tmp_path, content)
-    .map_err(|err| CliError::new(E_IO, format!("write {} failed: {err}", tmp_path.display())))?;
-  fs::rename(&tmp_path, path)
-    .map_err(|err| CliError::new(E_IO, format!("rename {} failed: {err}", path.display())))?;
-
-  Ok(())
+  pica_pkg_core::io::write_json_file_pretty(path, value).map_err(CliError::from)
 }
 
 pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
@@ -187,21 +165,44 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   Ok(())
 }
 
+pub(crate) fn cleanup_pkg_cache_with_notice(app: &mut App) {
+  app.log_info("Cleaning up Pica cache");
+
+  let cache_pkgs_dir = app.paths.cache_dir.join("pkgs");
+  if !cache_pkgs_dir.is_dir() {
+    return;
+  }
+
+  let entries = match fs::read_dir(&cache_pkgs_dir) {
+    Ok(entries) => entries,
+    Err(err) => {
+      app.log_warn(format!(
+        "cleanup cache skipped: cannot read {}: {err}",
+        cache_pkgs_dir.display()
+      ));
+      return;
+    }
+  };
+
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+
+    if let Err(err) = result {
+      app.log_warn(format!("cleanup cache failed: {}: {err}", path.display()));
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
     db_find_installed_pkgname_by_selector, ensure_json_object_field, write_json_atomic_pretty,
   };
-  use crate::{Selector, E_RUNTIME};
+  use crate::app::E_RUNTIME;
+  use pica_pkg_core::selector::Selector;
+  use pretty_assertions::assert_eq;
   use serde_json::{json, Value};
-  use std::fs;
-  use std::path::PathBuf;
-  use std::time::{SystemTime, UNIX_EPOCH};
-
-  fn unique_tmp_path(name: &str) -> PathBuf {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    std::env::temp_dir().join(format!("pica-state-test-{name}-{now}-{}", std::process::id()))
-  }
 
   #[test]
   fn ensure_json_object_field_creates_and_validates() {
@@ -216,7 +217,8 @@ mod tests {
 
   #[test]
   fn db_find_installed_pkgname_by_selector_matches_branch() {
-    let db_file = unique_tmp_path("selector");
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db_file = dir.path().join("selector-db.json");
     let db = json!({
         "schema": 1,
         "installed": {
@@ -242,7 +244,5 @@ mod tests {
     let selector_miss = Selector::parse("hello-app(dev)").expect("parse selector");
     let miss = db_find_installed_pkgname_by_selector(&db_file, &selector_miss).expect("query miss");
     assert!(miss.is_none());
-
-    let _ = fs::remove_file(&db_file);
   }
 }

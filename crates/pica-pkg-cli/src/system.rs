@@ -1,5 +1,5 @@
-use crate::{
-  CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL,
+use crate::app::{
+  App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL,
   E_OPKG_REMOVE, E_RUNTIME,
 };
 use std::env;
@@ -371,6 +371,20 @@ fn pid_is_running(pid: u32) -> bool {
   Path::new("/proc").join(pid.to_string()).exists()
 }
 
+pub fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str) -> CliResult<()> {
+  if hook_rel.is_empty() {
+    return Ok(());
+  }
+
+  let hook_path = tmpdir.join(hook_rel);
+  if !hook_path.is_file() {
+    return Err(CliError::new(E_CONFIG_INVALID, format!("{label} hook not found: {hook_rel}")));
+  }
+
+  app.log_info(format!("Running {label} hook: {hook_rel}"));
+  run_command_capture_output("sh", &[hook_path.to_string_lossy().as_ref()]).map(|_| ())
+}
+
 fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
   let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
   if !stderr_text.is_empty() {
@@ -390,18 +404,8 @@ mod tests {
   use super::{
     clear_opkg_lock_files_if_stale, is_opkg_lock_error, opkg_list_dir_has_files, read_opkg_lock_pid,
   };
+  use pretty_assertions::assert_eq;
   use std::fs;
-  use std::path::PathBuf;
-  use std::time::{SystemTime, UNIX_EPOCH};
-
-  fn make_temp_dir(prefix: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let now =
-      SystemTime::now().duration_since(UNIX_EPOCH).expect("time must move forward").as_nanos();
-    path.push(format!("pica-test-{prefix}-{}-{now}", std::process::id()));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
-  }
 
   #[test]
   fn lock_error_detection_handles_common_messages() {
@@ -414,31 +418,27 @@ mod tests {
 
   #[test]
   fn list_dir_check_requires_regular_files() {
-    let dir = make_temp_dir("opkg-lists");
-    assert!(!opkg_list_dir_has_files(&dir));
+    let dir = tempfile::tempdir().expect("create temp dir");
+    assert!(!opkg_list_dir_has_files(dir.path()));
 
-    let nested = dir.join("subdir");
+    let nested = dir.path().join("subdir");
     fs::create_dir_all(&nested).expect("create nested dir");
-    assert!(!opkg_list_dir_has_files(&dir));
+    assert!(!opkg_list_dir_has_files(dir.path()));
 
-    fs::write(dir.join("generic"), b"Package: test\n").expect("write list file");
-    assert!(opkg_list_dir_has_files(&dir));
-
-    let _ = fs::remove_dir_all(&dir);
+    fs::write(dir.path().join("generic"), b"Package: test\n").expect("write list file");
+    assert!(opkg_list_dir_has_files(dir.path()));
   }
 
   #[test]
   fn read_opkg_lock_pid_extracts_numeric_token() {
-    let dir = make_temp_dir("opkg-lock-pid");
-    let lock_file = dir.join("opkg.lock");
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let lock_file = dir.path().join("opkg.lock");
 
     fs::write(&lock_file, "pid: 1234\n").expect("write lock file");
     assert_eq!(read_opkg_lock_pid(&lock_file), Some(1234));
 
     fs::write(&lock_file, "nonsense").expect("write non pid lock file");
     assert_eq!(read_opkg_lock_pid(&lock_file), None);
-
-    let _ = fs::remove_dir_all(&dir);
   }
 
   #[test]

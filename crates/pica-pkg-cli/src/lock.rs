@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::{CliError, CliResult, E_IO, E_LOCK_BUSY, E_RUNTIME};
+use crate::app::{CliError, CliResult, E_IO, E_LOCK_BUSY, E_RUNTIME};
 
 pub struct LockGuard {
   lock_dir: PathBuf,
@@ -120,6 +120,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(target_os = "linux")]
   fn acquire_reports_busy_when_pid_alive() {
     let lock_file = unique_lock_file();
     let mut lock_name = lock_file.as_os_str().to_os_string();

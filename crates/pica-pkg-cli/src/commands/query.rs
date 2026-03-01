@@ -1,8 +1,10 @@
-use crate::state::read_json_file;
-use crate::{
-  ensure_dirs, find_pica_candidates_in_index, manifest_get_first, pkgver_cmp_key, pkgver_ge, App,
-  CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
+use crate::app::{
+  ensure_dirs, App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
 };
+use crate::candidate::find_pica_candidates_in_index;
+use crate::state::read_json_file;
+use pica_pkg_core::manifest::get_first as manifest_get_first;
+use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
 #[allow(clippy::cast_precision_loss)]
@@ -197,6 +199,7 @@ pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
   use super::format_size_display;
+  use pretty_assertions::assert_eq;
 
   #[test]
   fn format_size_display_handles_empty_and_invalid() {

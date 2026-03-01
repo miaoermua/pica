@@ -1,8 +1,7 @@
+use crate::app::{ensure_dirs, App, CliError, CliResult, E_ARG_INVALID};
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::{opkg_remove_pkg, run_command_capture_output};
-use crate::{
-  ensure_dirs, manifest_get_array, manifest_get_scalar, App, CliError, CliResult, E_ARG_INVALID,
-};
+use pica_pkg_core::manifest::{get_array as manifest_get_array, get_scalar as manifest_get_scalar};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;

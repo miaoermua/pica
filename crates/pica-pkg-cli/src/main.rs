@@ -1,34 +1,22 @@
+mod app;
+mod candidate;
 mod commands;
-mod helpers;
 mod lock;
+mod platform;
 mod state;
 mod system;
-mod types;
 
+use crate::app::{
+  parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode, Options, Paths,
+  E_ARG_INVALID, E_MISSING_COMMAND,
+};
 use crate::commands::{install, query, remove, sync, upgrade};
-use crate::helpers::{
-  build_precheck_report, canonicalize_display, cleanup_pkg_cache_with_notice, conf_get_i18n,
-  copy_dir_recursive, detect_luci_variant, detect_opkg_arches, detect_os, detect_platform,
-  ensure_dir, find_pica_candidates_in_index, has_command, install_via_feeds_or_ipk, make_temp_dir,
-  manifest_get_array, manifest_get_scalar, need_cmd, normalize_uname, pkg_list_diff_added,
-  reorder_app_list, required_manifest_field, resolve_lang, run_hook, write_file_atomic,
-};
 use crate::lock::LockGuard;
-use crate::state::read_json_file;
-use crate::types::{
-  ensure_dirs, parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode, Options,
-  Paths, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, E_INDEX_INVALID, E_INTEGRITY_INVALID, E_IO,
-  E_JSON_INVALID, E_LOCK_BUSY, E_MANIFEST_INVALID, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL,
-  E_OPKG_REMOVE, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED, E_POLICY_INVALID, E_REPO_INVALID,
-  E_RUNTIME, E_VERSION_INCOMPATIBLE,
-};
-use pica_pkg_core::manifest::{get_first as manifest_get_first, Manifest};
-use pica_pkg_core::repo::is_supported_url;
-use pica_pkg_core::selector::Selector;
-use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge, ver_ge};
+use crate::state::cleanup_pkg_cache_with_notice;
+use crate::system::{has_command, need_cmd};
 use pica_pkg_core::PICA_VERSION;
 use std::env;
-use std::process::{self};
+use std::process;
 
 fn usage() {
   println!(

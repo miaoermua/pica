@@ -1,4 +1,5 @@
 use crate::error::{PicaError, PicaResult};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,25 @@ pub fn ensure_dir(path: &Path) -> PicaResult<()> {
   Ok(())
 }
 
+#[must_use]
+pub fn sha256_hex(content: &[u8]) -> String {
+  let hash = Sha256::digest(content);
+  format!("{hash:x}")
+}
+
+/// # Errors
+/// Returns an error if the file cannot be read.
+pub fn sha256_file(path: &Path) -> PicaResult<String> {
+  let content = fs::read(path)?;
+  Ok(sha256_hex(&content))
+}
+
+/// Creates a temporary directory with a unique name.
+///
+/// Note: This returns an owned `PathBuf` rather than using `tempfile::TempDir`
+/// because callers (e.g., install's `TempDirGuard`) need ownership of the path
+/// and manage the directory lifetime themselves.
+///
 /// # Errors
 /// Returns an error if the temporary directory cannot be created.
 pub fn make_temp_dir(prefix: &str) -> PicaResult<PathBuf> {

@@ -1,8 +1,8 @@
-use crate::state::write_json_atomic_pretty;
+use crate::state::{read_json_file, write_json_atomic_pretty};
 use pica_pkg_core::error::PicaError;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ETC_DIR: &str = "/etc/pica";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/pica";
@@ -336,6 +336,41 @@ where
   V: Into<PathBuf>,
 {
   env::var_os(key).map_or_else(|| default.into(), PathBuf::from)
+}
+
+pub(crate) fn prompt_yn(question: &str, default_yes: bool) -> bool {
+  use std::io::{self, BufRead, Write};
+
+  let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+  eprint!("{question} {hint} ");
+  let _ = io::stderr().flush();
+
+  let mut input = String::new();
+  let stdin = io::stdin();
+  let mut handle = stdin.lock();
+  if handle.read_line(&mut input).is_err() {
+    return default_yes;
+  }
+
+  let answer = input.trim().to_ascii_lowercase();
+  match answer.as_str() {
+    "y" | "yes" => true,
+    "n" | "no" => false,
+    _ => default_yes,
+  }
+}
+
+pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
+  let conf = read_json_file(conf_file).ok()?;
+  let value = conf.get("i18n").and_then(Value::as_str).unwrap_or("zh-cn");
+  Some(value.to_string())
+}
+
+pub(crate) fn resolve_lang(conf_file: &Path) -> String {
+  let conf = read_json_file(conf_file).ok();
+  conf
+    .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
+    .unwrap_or_else(|| "zh-cn".to_string())
 }
 
 #[cfg(test)]

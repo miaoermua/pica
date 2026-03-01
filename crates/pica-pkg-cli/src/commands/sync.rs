@@ -1,11 +1,11 @@
+use crate::app::{
+  ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID,
+};
+use crate::platform::detect_platform;
 use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
 use crate::system::{fetch_url, has_command, opkg_has_package, opkg_update_ignore};
-use crate::{
-  detect_platform, ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID,
-  E_REPO_INVALID,
-};
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::repo::parse_repo_json;
+use pica_pkg_core::repo::{is_supported_url, parse_repo_json};
 use serde_json::{json, Value};
 
 pub fn repos(app: &mut App) -> CliResult<()> {
@@ -48,7 +48,7 @@ pub fn repos(app: &mut App) -> CliResult<()> {
     let repo_json_url = format!("{}/repo.json", url.trim_end_matches('/'));
     let repo_raw = fetch_url(
       &repo_json_url,
-      crate::is_supported_url,
+      is_supported_url,
       app.options.fetch_timeout,
       app.options.fetch_retry,
       app.options.fetch_retry_delay,
@@ -171,6 +171,7 @@ fn append_dep_list(output: &mut Vec<String>, value: Option<&Value>) {
 #[cfg(test)]
 mod tests {
   use super::{append_dep_list, collect_declared_dependencies};
+  use pretty_assertions::assert_eq;
   use serde_json::json;
 
   #[test]

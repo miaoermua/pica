@@ -225,12 +225,12 @@ mod tests {
 
   #[test]
   fn parse_manifest_repeatable() {
-    let text = r#"
+    let text = r"
         pkgname = hello
         app = hello
         app = luci-app-hello
         # comment
-        "#;
+        ";
 
     let manifest = Manifest::from_text(text).expect("parse manifest");
     assert_eq!(manifest.get_first("pkgname"), "hello");
@@ -239,11 +239,11 @@ mod tests {
 
   #[test]
   fn parse_manifest_selector() {
-    let text = r#"
+    let text = r"
         pkgname = hello
         appname = hello
         branch = stable
-        "#;
+        ";
     let manifest = Manifest::from_text(text).expect("parse manifest");
     assert_eq!(manifest.canonical_selector("hello"), "hello(stable)");
   }
