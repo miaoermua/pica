@@ -343,7 +343,35 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))
 }
 
-#[allow(clippy::too_many_lines)] // will be split in a subsequent commit
+struct PackageFields {
+  pkgname: String,
+  pkgver_display: String,
+  platform: String,
+  os: String,
+  arch: String,
+  uname: String,
+  luci: String,
+  pkgmgr: String,
+  visibility: String,
+}
+
+struct DependencyResult {
+  precheck: Value,
+  tx_added: Vec<String>,
+  app_added: Vec<String>,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct HookConfig {
+  cmd_install: String,
+  cmd_update: String,
+  cmd_remove: String,
+  keep_all: bool,
+  keep_install: bool,
+  keep_update: bool,
+  keep_remove: bool,
+}
+
 pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
   if !pkgfile.is_file() {
     return Err(CliError::new(
@@ -375,32 +403,36 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
   let pica_required = manifest.get_first("pica");
   let pkgver = required_manifest_field(&manifest, "pkgver")?;
   let pkgrel = manifest.get_first("pkgrel");
-  let pkgver_display = pkgver_cmp_key(&pkgver, &pkgrel);
-  let pkg_platform = required_manifest_field(&manifest, "platform")?;
-  let pkg_os = required_manifest_field(&manifest, "os")?;
-  let pkg_arch = required_manifest_field(&manifest, "arch")?;
-  let pkg_uname = manifest.get_first("uname");
-  let pkg_luci = manifest.get_first("luci");
-  let pkgmgr = manifest.get_first("pkgmgr");
-  let visibility = manifest.get_first("visibility");
+  let pkgmgr_raw = manifest.get_first("pkgmgr");
 
-  let cmd_install = manifest.get_scalar("cmd_install");
-  let cmd_update = manifest.get_scalar("cmd_update");
-  let cmd_remove = manifest.get_scalar("cmd_remove");
+  let pkg = PackageFields {
+    pkgname: pkgname.clone(),
+    pkgver_display: pkgver_cmp_key(&pkgver, &pkgrel),
+    platform: required_manifest_field(&manifest, "platform")?,
+    os: required_manifest_field(&manifest, "os")?,
+    arch: required_manifest_field(&manifest, "arch")?,
+    uname: manifest.get_first("uname"),
+    luci: manifest.get_first("luci"),
+    pkgmgr: if pkgmgr_raw.is_empty() { "opkg".to_string() } else { pkgmgr_raw },
+    visibility: manifest.get_first("visibility"),
+  };
 
   let env_file = tmpdir.join("cmd/.env");
   let (env_keep_all, env_keep_install, env_keep_update, env_keep_remove) =
     if env_file.is_file() { read_env_keep_flags(&env_file) } else { (None, None, None, None) };
 
-  let keep_all_hooks = env_keep_all.unwrap_or(false);
-  let keep_install_hook = env_keep_install.unwrap_or(false);
-  let keep_update_hook = env_keep_update.unwrap_or(false);
-  let keep_remove_hook = env_keep_remove.unwrap_or(true);
+  let hooks = HookConfig {
+    cmd_install: manifest.get_scalar("cmd_install"),
+    cmd_update: manifest.get_scalar("cmd_update"),
+    cmd_remove: manifest.get_scalar("cmd_remove"),
+    keep_all: env_keep_all.unwrap_or(false),
+    keep_install: env_keep_install.unwrap_or(false),
+    keep_update: env_keep_update.unwrap_or(false),
+    keep_remove: env_keep_remove.unwrap_or(true),
+  };
 
   let canonical_selector = manifest.canonical_selector(&pkgname);
   let selector = selector.unwrap_or(canonical_selector);
-
-  let mut installed_files = Vec::new();
 
   let is_upgrade = db_has_installed(&app.paths.db_file, &pkgname)?;
 
@@ -411,95 +443,120 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
     ));
   }
 
+  validate_package(app, &manifest, &tmpdir, &pkg)?;
+
+  let deps = resolve_dependencies(app, &manifest, &tmpdir, &pkg.pkgmgr)?;
+
+  execute_hooks(app, &tmpdir, &pkgname, is_upgrade, &hooks)?;
+
+  let installed_files = deploy_files(&tmpdir, &pkgname)?;
+
+  record_installation(app, &pkgname, &selector, &manifest, pkgfile, &deps, &installed_files)
+}
+
+fn validate_package(
+  app: &mut App,
+  manifest: &Manifest,
+  tmpdir: &Path,
+  pkg: &PackageFields,
+) -> CliResult<()> {
   let host_platform = detect_platform();
   let host_os = detect_os();
   let host_uname_raw = run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string());
   let host_uname = normalize_uname(&host_uname_raw);
-  let pkg_uname_norm = normalize_uname(&pkg_uname);
+  let pkg_uname_norm = normalize_uname(&pkg.uname);
 
-  if !pkg_uname.is_empty() && pkg_uname_norm != host_uname {
+  if !pkg.uname.is_empty() && pkg_uname_norm != host_uname {
     return Err(CliError::new(
       E_PLATFORM_UNSUPPORTED,
-      format!("unsupported uname: pkg={pkg_uname} host={host_uname_raw}"),
+      format!("unsupported uname: pkg={} host={host_uname_raw}", pkg.uname),
     ));
   }
 
-  if pkg_os != "all" && pkg_os != host_os {
+  if pkg.os != "all" && pkg.os != host_os {
     return Err(CliError::new(
       E_PLATFORM_UNSUPPORTED,
-      format!("unsupported os: pkg={pkg_os} host={host_os}"),
+      format!("unsupported os: pkg={} host={host_os}", pkg.os),
     ));
   }
 
-  if pkg_arch != "all" {
+  if pkg.arch != "all" {
     let host_arches = detect_opkg_arches();
-    if !host_arches.iter().any(|arch| arch == &pkg_arch) {
+    if !host_arches.iter().any(|arch| arch == &pkg.arch) {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
-        format!("unsupported arch: pkg={pkg_arch} (opkg arches: {})", host_arches.join(" ")),
+        format!("unsupported arch: pkg={} (opkg arches: {})", pkg.arch, host_arches.join(" ")),
       ));
     }
   }
 
-  let pkgmgr = if pkgmgr.is_empty() { "opkg".to_string() } else { pkgmgr };
-  if pkgmgr != "opkg" && pkgmgr != "none" {
+  if pkg.pkgmgr != "opkg" && pkg.pkgmgr != "none" {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("invalid pkgmgr value: {pkgmgr} (supported: opkg, none)"),
+      format!("invalid pkgmgr value: {} (supported: opkg, none)", pkg.pkgmgr),
     ));
   }
 
-  if pkgmgr == "opkg" && !tmpdir.join("binary").is_dir() {
+  if pkg.pkgmgr == "opkg" && !tmpdir.join("binary").is_dir() {
     return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
   }
 
-  if visibility != "open" && visibility != "mix" && visibility != "closed" {
+  if pkg.visibility != "open" && pkg.visibility != "mix" && pkg.visibility != "closed" {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("invalid visibility value: {visibility} (supported: open, mix, closed)"),
+      format!("invalid visibility value: {} (supported: open, mix, closed)", pkg.visibility),
     ));
   }
 
   if manifest.has_type("luci") {
-    if pkg_luci.is_empty() {
+    if pkg.luci.is_empty() {
       return Err(CliError::new(E_CONFIG_INVALID, "type=luci requires luci=<lua1|js2>"));
     }
-    if pkg_luci != "lua1" && pkg_luci != "js2" {
-      return Err(CliError::new(E_CONFIG_INVALID, format!("invalid luci value: {pkg_luci}")));
+    if pkg.luci != "lua1" && pkg.luci != "js2" {
+      return Err(CliError::new(E_CONFIG_INVALID, format!("invalid luci value: {}", pkg.luci)));
     }
     let host_luci = detect_luci_variant();
     if host_luci == "unknown" {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
-        format!("luci variant required ({pkg_luci}) but cannot detect host"),
+        format!("luci variant required ({}) but cannot detect host", pkg.luci),
       ));
     }
-    if host_luci != pkg_luci {
+    if host_luci != pkg.luci {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
-        format!("unsupported luci variant: pkg={pkg_luci} host={host_luci}"),
+        format!("unsupported luci variant: pkg={} host={host_luci}", pkg.luci),
       ));
     }
   }
 
-  app.log_info(format!("Installing {pkgname}..."));
-  app.log_info(format!("  version: {pkgver_display}"));
-  app.log_info(format!("  os: {pkg_os} (host: {host_os})"));
-  app.log_info(format!("  platform: {pkg_platform} (host: {host_platform})"));
-  app.log_info(format!("  arch: {pkg_arch}"));
-  app.log_info(format!("  pkgmgr: {pkgmgr}"));
-  app.log_info(format!("  visibility: {visibility}"));
-  if !pkg_uname.is_empty() {
-    app.log_info(format!("  uname: {pkg_uname} (host: {host_uname_raw})"));
+  app.log_info(format!("Installing {}...", pkg.pkgname));
+  app.log_info(format!("  version: {}", pkg.pkgver_display));
+  app.log_info(format!("  os: {} (host: {host_os})", pkg.os));
+  app.log_info(format!("  platform: {} (host: {host_platform})", pkg.platform));
+  app.log_info(format!("  arch: {}", pkg.arch));
+  app.log_info(format!("  pkgmgr: {}", pkg.pkgmgr));
+  app.log_info(format!("  visibility: {}", pkg.visibility));
+  if !pkg.uname.is_empty() {
+    app.log_info(format!("  uname: {} (host: {host_uname_raw})", pkg.uname));
   }
   let pkg_type = manifest.get_first("type");
   if !pkg_type.is_empty() {
     app.log_info(format!("  type: {pkg_type}"));
   }
-  if !pkg_luci.is_empty() {
-    app.log_info(format!("  luci: {pkg_luci}"));
+  if !pkg.luci.is_empty() {
+    app.log_info(format!("  luci: {}", pkg.luci));
   }
 
+  Ok(())
+}
+
+fn resolve_dependencies(
+  app: &mut App,
+  manifest: &Manifest,
+  tmpdir: &Path,
+  pkgmgr: &str,
+) -> CliResult<DependencyResult> {
   let depend_dir = tmpdir.join("depend");
   let binary_dir = tmpdir.join("binary");
 
@@ -525,7 +582,7 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
 
     opkg_update_ignore();
 
-    precheck = build_precheck_report(&manifest, &depend_dir, &binary_dir, &app_list);
+    precheck = build_precheck_report(manifest, &depend_dir, &binary_dir, &app_list);
     let missing = summarize_missing_precheck(&precheck);
     if !missing.is_empty() {
       app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));
@@ -560,26 +617,33 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
     app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
   }
 
+  Ok(DependencyResult { precheck, tx_added, app_added })
+}
+
+fn execute_hooks(
+  app: &mut App,
+  tmpdir: &Path,
+  pkgname: &str,
+  is_upgrade: bool,
+  hooks: &HookConfig,
+) -> CliResult<()> {
   if is_upgrade {
-    run_hook(app, &tmpdir, &cmd_update, "update")?;
+    run_hook(app, tmpdir, &hooks.cmd_update, "update")?;
   } else {
-    run_hook(app, &tmpdir, &cmd_install, "install")?;
+    run_hook(app, tmpdir, &hooks.cmd_install, "install")?;
   }
 
-  cleanup_previous_hook_dir(&pkgname);
+  cleanup_previous_hook_dir(pkgname);
 
   let mut hook_items: Vec<(&str, bool)> = Vec::new();
-  if !cmd_install.is_empty() && !cmd_install.starts_with('/') {
-    let keep = keep_all_hooks || keep_install_hook;
-    hook_items.push((cmd_install.as_str(), keep));
+  if !hooks.cmd_install.is_empty() && !hooks.cmd_install.starts_with('/') {
+    hook_items.push((&hooks.cmd_install, hooks.keep_all || hooks.keep_install));
   }
-  if !cmd_update.is_empty() && !cmd_update.starts_with('/') {
-    let keep = keep_all_hooks || keep_update_hook;
-    hook_items.push((cmd_update.as_str(), keep));
+  if !hooks.cmd_update.is_empty() && !hooks.cmd_update.starts_with('/') {
+    hook_items.push((&hooks.cmd_update, hooks.keep_all || hooks.keep_update));
   }
-  if !cmd_remove.is_empty() && !cmd_remove.starts_with('/') {
-    let keep = keep_all_hooks || keep_remove_hook;
-    hook_items.push((cmd_remove.as_str(), keep));
+  if !hooks.cmd_remove.is_empty() && !hooks.cmd_remove.starts_with('/') {
+    hook_items.push((&hooks.cmd_remove, hooks.keep_all || hooks.keep_remove));
   }
 
   let mut kept_any_hook = false;
@@ -596,22 +660,27 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
       continue;
     }
 
-    let target = Path::new("/usr/lib/pica/cmd").join(&pkgname).join(hook_rel);
+    let target = Path::new("/usr/lib/pica/cmd").join(pkgname).join(hook_rel);
     if let Some(parent) = target.parent() {
       ensure_dir(parent)?;
     }
     fs::copy(&source, &target)
       .map_err(|err| CliError::new(E_IO, format!("copy hook failed: {err}")))?;
-    installed_files.push(target.display().to_string());
     kept_any_hook = true;
   }
 
   if !kept_any_hook {
-    let hook_dir = Path::new("/usr/lib/pica/cmd").join(&pkgname);
+    let hook_dir = Path::new("/usr/lib/pica/cmd").join(pkgname);
     if hook_dir.is_dir() {
       let _ = fs::remove_dir_all(&hook_dir);
     }
   }
+
+  Ok(())
+}
+
+fn deploy_files(tmpdir: &Path, pkgname: &str) -> CliResult<Vec<String>> {
+  let mut installed_files = Vec::new();
 
   let cmd_dir = tmpdir.join("cmd");
   if cmd_dir.is_dir() {
@@ -633,7 +702,7 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
 
   let src_dir = tmpdir.join("src");
   if src_dir.is_dir() {
-    let src_target_dir = Path::new("/usr/lib/pica/src").join(&pkgname);
+    let src_target_dir = Path::new("/usr/lib/pica/src").join(pkgname);
     ensure_dir(&src_target_dir)?;
     copy_dir_recursive(&src_dir, &src_target_dir)?;
     installed_files.push(src_target_dir.display().to_string());
@@ -649,14 +718,37 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
       .push(Path::new("/etc/pica/env.d").join(format!("{pkgname}.env")).display().to_string());
   }
 
+  let hook_dir = Path::new("/usr/lib/pica/cmd").join(pkgname);
+  if hook_dir.is_dir() {
+    if let Ok(entries) = fs::read_dir(&hook_dir) {
+      for entry in entries.flatten() {
+        if entry.path().is_file() {
+          installed_files.push(entry.path().display().to_string());
+        }
+      }
+    }
+  }
+
+  Ok(installed_files)
+}
+
+fn record_installation(
+  app: &mut App,
+  pkgname: &str,
+  selector: &str,
+  manifest: &Manifest,
+  pkgfile: &Path,
+  deps: &DependencyResult,
+  installed_files: &[String],
+) -> CliResult<()> {
   report_set_install_result(
     &app.paths,
-    &pkgname,
-    &selector,
+    pkgname,
+    selector,
     &manifest.value,
-    &precheck,
-    &tx_added,
-    &app_added,
+    &deps.precheck,
+    &deps.tx_added,
+    &deps.app_added,
   )?;
 
   let mut manifest_stored = manifest.value.clone();
@@ -678,10 +770,10 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
 
   db_set_installed(
     &app.paths.db_file,
-    &pkgname,
+    pkgname,
     &manifest_stored,
     &canonicalize_display(pkgfile),
-    &installed_files,
+    installed_files,
   )?;
 
   app.log_info("Transaction completed");
