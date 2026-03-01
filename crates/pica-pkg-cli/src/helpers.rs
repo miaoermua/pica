@@ -308,36 +308,36 @@ pub(crate) fn should_use_feeds(
   label: &str,
   pkg_list: &[String],
   have_ipk_dir: bool,
-) -> CliResult<i8> {
+) -> i8 {
   match app.options.feed_policy {
     FeedPolicy::FeedOnly => {
       if pkg_list.is_empty() {
-        Ok(-1)
+        -1
       } else {
-        Ok(1)
+        1
       }
     }
-    FeedPolicy::PackagedOnly => Ok(0),
+    FeedPolicy::PackagedOnly => 0,
     FeedPolicy::FeedFirst => {
       if pkg_list.is_empty() {
-        Ok(0)
+        0
       } else {
-        Ok(1)
+        1
       }
     }
     FeedPolicy::PackagedFirst => {
       if have_ipk_dir {
-        Ok(0)
+        0
       } else {
-        Ok(1)
+        1
       }
     }
     FeedPolicy::Ask => {
       if !have_ipk_dir {
-        return Ok(1);
+        return 1;
       }
       if pkg_list.is_empty() {
-        return Ok(0);
+        return 0;
       }
 
       opkg_update_ignore();
@@ -354,23 +354,23 @@ pub(crate) fn should_use_feeds(
       }
 
       if available == 0 {
-        return Ok(0);
+        return 0;
       }
 
       if app.options.non_interactive {
-        return Ok(1);
+        return 1;
       }
 
       if prompt_yn(
-                &format!(
-                    "Found {available}/{total} {label} packages in opkg feeds. Use feeds instead of packaged ipks?"
-                ),
-                true,
-            ) {
-                Ok(1)
-            } else {
-                Ok(0)
-            }
+        &format!(
+          "Found {available}/{total} {label} packages in opkg feeds. Use feeds instead of packaged ipks?"
+        ),
+        true,
+      ) {
+        1
+      } else {
+        0
+      }
     }
   }
 }
@@ -386,7 +386,7 @@ pub(crate) fn install_via_feeds_or_ipk(
     return Ok(());
   }
 
-  let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir)?;
+  let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir);
   if use_feeds == -1 {
     return Err(CliError::new(
       E_POLICY_INVALID,
@@ -687,30 +687,25 @@ mod tests {
       },
     );
 
-    let decision = should_use_feeds(&base, "app", &["a".to_string()], true)
-      .expect("feed-only with feeds must pass");
+    let decision = should_use_feeds(&base, "app", &["a".to_string()], true);
     assert_eq!(decision, 1);
 
-    let no_feed =
-      should_use_feeds(&base, "app", &[], true).expect("feed-only without feeds returns sentinel");
+    let no_feed = should_use_feeds(&base, "app", &[], true);
     assert_eq!(no_feed, -1);
 
     let mut packaged_only = base;
     packaged_only.options.feed_policy = FeedPolicy::PackagedOnly;
-    let packaged = should_use_feeds(&packaged_only, "app", &["a".to_string()], true)
-      .expect("packaged-only should choose ipk");
+    let packaged = should_use_feeds(&packaged_only, "app", &["a".to_string()], true);
     assert_eq!(packaged, 0);
 
     let mut feed_first = packaged_only;
     feed_first.options.feed_policy = FeedPolicy::FeedFirst;
-    let feed_first_choice = should_use_feeds(&feed_first, "app", &["a".to_string()], true)
-      .expect("feed-first with list should choose feed");
+    let feed_first_choice = should_use_feeds(&feed_first, "app", &["a".to_string()], true);
     assert_eq!(feed_first_choice, 1);
 
     let mut packaged_first = feed_first;
     packaged_first.options.feed_policy = FeedPolicy::PackagedFirst;
-    let packaged_first_choice = should_use_feeds(&packaged_first, "app", &["a".to_string()], true)
-      .expect("packaged-first with ipk should choose ipk");
+    let packaged_first_choice = should_use_feeds(&packaged_first, "app", &["a".to_string()], true);
     assert_eq!(packaged_first_choice, 0);
   }
 

@@ -5,7 +5,12 @@ use crate::{
 };
 use serde_json::Value;
 
+#[allow(clippy::cast_precision_loss)]
 fn format_size_display(size_text: &str) -> String {
+  const KIB: f64 = 1024.0;
+  const MIB: f64 = 1024.0 * 1024.0;
+  const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
   if size_text.is_empty() {
     return String::new();
   }
@@ -13,10 +18,6 @@ fn format_size_display(size_text: &str) -> String {
   let Ok(size_bytes) = size_text.parse::<u64>() else {
     return size_text.to_string();
   };
-
-  const KIB: f64 = 1024.0;
-  const MIB: f64 = 1024.0 * 1024.0;
-  const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
   let human = if (size_bytes as f64) >= GIB {
     format!("{:.2} GiB", (size_bytes as f64) / GIB)

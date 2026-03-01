@@ -80,11 +80,11 @@ pub fn repos(app: &mut App) -> CliResult<()> {
         "data": repo_value,
     });
 
-    let repos_obj = index
+    let index_repos = index
       .get_mut("repos")
       .and_then(Value::as_object_mut)
       .ok_or_else(|| CliError::new(E_INDEX_INVALID, "index repos is not object"))?;
-    repos_obj.insert(name.to_string(), repo_obj);
+    index_repos.insert(name.to_string(), repo_obj);
 
     app.log_info(format!("{name} updated"));
   }
