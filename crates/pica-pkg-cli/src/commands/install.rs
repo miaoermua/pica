@@ -118,7 +118,7 @@ fn summarize_missing_precheck(precheck: &Value) -> Vec<String> {
   missing
 }
 
-pub fn install_app_auto(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
@@ -135,11 +135,11 @@ pub fn install_app_auto(app: &mut App, selector: &str) -> CliResult<()> {
 
     match source.as_str() {
       "opkg" => {
-        install_app_via_opkg(app, selector)?;
+        app_via_opkg(app, selector)?;
         return Ok(());
       }
       "pica" => {
-        install_pica_from_repo(app, selector)?;
+        pica_from_repo(app, selector)?;
         return Ok(());
       }
       _ => {}
@@ -159,15 +159,15 @@ pub fn install_app_auto(app: &mut App, selector: &str) -> CliResult<()> {
     };
 
     if should_install_opkg {
-      install_app_via_opkg(app, selector)?;
+      app_via_opkg(app, selector)?;
       return Ok(());
     }
   }
 
-  install_pica_from_repo(app, selector)
+  pica_from_repo(app, selector)
 }
 
-pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   need_cmd("opkg")?;
 
@@ -224,7 +224,7 @@ pub fn install_app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
   Ok(())
 }
 
-pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   need_cmd("tar")?;
 
@@ -308,12 +308,12 @@ pub fn install_pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   write_file_atomic(&cached, &raw)?;
 
-  install_pkgfile(app, &cached, Some(selector.to_string()))
+  pkgfile(app, &cached, Some(selector.to_string()))
 }
 
-pub fn install_pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliResult<()> {
+pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliResult<()> {
   if Path::new(source).is_file() {
-    return install_pkgfile(app, Path::new(source), selector);
+    return pkgfile(app, Path::new(source), selector);
   }
 
   if is_supported_url(source) {
@@ -337,13 +337,13 @@ pub fn install_pkg_source(app: &mut App, source: &str, selector: Option<String>)
       app.options.fetch_retry_delay,
     )?;
     write_file_atomic(&cached, &raw)?;
-    return install_pkgfile(app, &cached, selector);
+    return pkgfile(app, &cached, selector);
   }
 
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))
 }
 
-pub fn install_pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
+pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
   if !pkgfile.is_file() {
     return Err(CliError::new(
       E_PACKAGE_INVALID,

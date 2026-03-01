@@ -8,7 +8,7 @@ use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::parse_repo_json;
 use serde_json::{json, Value};
 
-pub fn sync_repos(app: &mut App) -> CliResult<()> {
+pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   app.log_info("Synchronizing package databases...");
 

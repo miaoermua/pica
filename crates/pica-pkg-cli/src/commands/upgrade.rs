@@ -1,10 +1,11 @@
+use super::install;
 use crate::{
-  ensure_dirs, find_pica_candidates_in_index, install_pica_from_repo, manifest_get_first,
-  pkgver_cmp_key, pkgver_ge, read_json_file, App, CliResult,
+  ensure_dirs, find_pica_candidates_in_index, manifest_get_first, pkgver_cmp_key, pkgver_ge,
+  read_json_file, App, CliResult,
 };
 use serde_json::Value;
 
-pub fn upgrade_all(app: &mut App) -> CliResult<()> {
+pub fn all(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
   let db = read_json_file(&app.paths.db_file)?;
@@ -77,7 +78,7 @@ pub fn upgrade_all(app: &mut App) -> CliResult<()> {
     }
 
     app.log_info(format!("Upgrading {pkgname}: {installed_ver} -> {best_ver}"));
-    install_pica_from_repo(app, &selector)?;
+    install::pica_from_repo(app, &selector)?;
     updated_any = true;
   }
 

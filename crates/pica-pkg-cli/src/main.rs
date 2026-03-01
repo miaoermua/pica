@@ -5,13 +5,7 @@ mod state;
 mod system;
 mod types;
 
-use crate::commands::install::{
-  install_app_auto, install_app_via_opkg, install_pica_from_repo, install_pkg_source,
-};
-use crate::commands::query::{query_files, query_info, query_installed, query_sync_info};
-use crate::commands::remove::remove_pkg;
-use crate::commands::sync::sync_repos;
-use crate::commands::upgrade::upgrade_all;
+use crate::commands::{install, query, remove, sync, upgrade};
 use crate::helpers::{
   build_precheck_report, canonicalize_display, cleanup_pkg_cache_with_notice, conf_get_i18n,
   copy_dir_recursive, detect_luci_variant, detect_opkg_arches, detect_os, detect_platform,
@@ -117,56 +111,56 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
       if let Some(selector) = args.get(1) {
         app.set_phase("install");
         need_cmd("opkg")?;
-        install_app_auto(app, selector)?;
+        install::app_auto(app, selector)?;
         Ok(("-S", selector.clone()))
       } else {
         app.set_phase("sync");
-        sync_repos(app)?;
+        sync::repos(app)?;
         Ok(("-S", "repos".to_string()))
       }
     }
     "-Su" => {
       app.set_phase("upgrade");
       need_cmd("opkg")?;
-      upgrade_all(app)?;
+      upgrade::all(app)?;
       Ok(("-Su", "all".to_string()))
     }
     "-Syu" => {
       app.set_phase("sync");
       need_cmd("opkg")?;
-      sync_repos(app)?;
+      sync::repos(app)?;
       app.set_phase("upgrade");
-      upgrade_all(app)?;
+      upgrade::all(app)?;
       Ok(("-Syu", "all".to_string()))
     }
     "-Q" => {
       app.set_phase("query");
-      query_installed(app)?;
+      query::installed(app)?;
       Ok(("-Q", "installed".to_string()))
     }
     "-Qi" => {
       app.set_phase("query");
       let pkgname = require_arg(args, 1, "-Qi requires <pkgname>")?;
-      query_info(app, pkgname)?;
+      query::info(app, pkgname)?;
       Ok(("-Qi", pkgname.to_string()))
     }
     "-Ql" => {
       app.set_phase("query");
       let pkgname = require_arg(args, 1, "-Ql requires <pkgname>")?;
-      query_files(app, pkgname)?;
+      query::files(app, pkgname)?;
       Ok(("-Ql", pkgname.to_string()))
     }
     "-So" => {
       app.set_phase("install");
       need_cmd("opkg")?;
       let selector = require_arg(args, 1, "-So requires <selector>")?;
-      install_app_via_opkg(app, selector)?;
+      install::app_via_opkg(app, selector)?;
       Ok(("-So", selector.to_string()))
     }
     "-Si" => {
       app.set_phase("query");
       let selector = require_arg(args, 1, "-Si requires <selector>")?;
-      query_sync_info(app, selector)?;
+      query::sync_info(app, selector)?;
       Ok(("-Si", selector.to_string()))
     }
     "-Sp" => {
@@ -174,7 +168,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
       need_cmd("opkg")?;
       need_cmd("tar")?;
       let selector = require_arg(args, 1, "-Sp requires <selector>")?;
-      install_pica_from_repo(app, selector)?;
+      install::pica_from_repo(app, selector)?;
       Ok(("-Sp", selector.to_string()))
     }
     "-U" => {
@@ -182,14 +176,14 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
       need_cmd("opkg")?;
       need_cmd("tar")?;
       let source = require_arg(args, 1, "-U requires <pkgfile|url>")?;
-      install_pkg_source(app, source, None)?;
+      install::pkg_source(app, source, None)?;
       Ok(("-U", source.to_string()))
     }
     "-R" => {
       app.set_phase("remove");
       need_cmd("opkg")?;
       let pkgname = require_arg(args, 1, "-R requires <pkgname>")?;
-      remove_pkg(app, pkgname)?;
+      remove::pkg(app, pkgname)?;
       Ok(("-R", pkgname.to_string()))
     }
     other => Err(CliError::new(E_ARG_INVALID, format!("unknown arg: {other}"))),

@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 
 #[derive(Debug)]
+#[allow(clippy::module_name_repetitions)]
 pub enum PicaError {
   Message(String),
   Io(io::Error),

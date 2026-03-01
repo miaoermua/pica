@@ -31,7 +31,7 @@ fn format_size_display(size_text: &str) -> String {
   format!("{size_bytes} ({human})")
 }
 
-pub fn query_installed(app: &mut App) -> CliResult<()> {
+pub fn installed(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
   let installed = db
@@ -58,7 +58,7 @@ pub fn query_installed(app: &mut App) -> CliResult<()> {
   Ok(())
 }
 
-pub fn query_sync_info(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
   let candidates = find_pica_candidates_in_index(app, selector)?;
@@ -110,7 +110,7 @@ pub fn query_sync_info(app: &mut App, selector: &str) -> CliResult<()> {
   Ok(())
 }
 
-pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
+pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
 
@@ -172,7 +172,7 @@ pub fn query_info(app: &mut App, pkgname: &str) -> CliResult<()> {
   Ok(())
 }
 
-pub fn query_files(app: &mut App, pkgname: &str) -> CliResult<()> {
+pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
 

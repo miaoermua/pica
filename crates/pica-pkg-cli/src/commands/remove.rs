@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub fn remove_pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
+pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
   let db = read_json_file(&app.paths.db_file)?;

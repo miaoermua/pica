@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoJson {
+pub struct PackageIndex {
   pub schema: i64,
-  pub packages: Vec<RepoPackage>,
+  pub packages: Vec<Package>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoPackage {
+pub struct Package {
   pub pkgname: String,
   pub pkgver: String,
   pub pkgrel: String,
@@ -40,7 +40,7 @@ pub struct RepoPackage {
   pub manifest: Option<Value>,
 }
 
-impl RepoPackage {
+impl Package {
   #[must_use]
   pub fn app_key(&self) -> &str {
     self.appname.as_deref().unwrap_or(&self.pkgname)
@@ -54,15 +54,15 @@ impl RepoPackage {
 
 /// # Errors
 /// Returns an error if JSON parsing fails or validation detects invalid entries.
-pub fn parse_repo_json(content: &str) -> PicaResult<RepoJson> {
-  let parsed: RepoJson = serde_json::from_str(content)?;
-  validate_repo(&parsed)?;
+pub fn parse_repo_json(content: &str) -> PicaResult<PackageIndex> {
+  let parsed: PackageIndex = serde_json::from_str(content)?;
+  validate(&parsed)?;
   Ok(parsed)
 }
 
 /// # Errors
 /// Returns an error if the schema version is wrong or any package entry is invalid.
-pub fn validate_repo(repo: &RepoJson) -> PicaResult<()> {
+pub fn validate(repo: &PackageIndex) -> PicaResult<()> {
   if repo.schema != 1 {
     return Err(PicaError::msg("schema must be 1"));
   }
@@ -97,7 +97,7 @@ pub fn validate_repo(repo: &RepoJson) -> PicaResult<()> {
   Ok(())
 }
 
-fn validate_sha256(pkg: &RepoPackage) -> PicaResult<()> {
+fn validate_sha256(pkg: &Package) -> PicaResult<()> {
   let value = pkg.sha256.trim();
   if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
     return Err(PicaError::msg(format!("package {}: invalid sha256 {}", pkg.pkgname, pkg.sha256)));
@@ -106,7 +106,7 @@ fn validate_sha256(pkg: &RepoPackage) -> PicaResult<()> {
   Ok(())
 }
 
-fn validate_filename(pkg: &RepoPackage) -> PicaResult<()> {
+fn validate_filename(pkg: &Package) -> PicaResult<()> {
   let filename = &pkg.filename;
   if filename.contains('/') || filename.contains("..") || !filename.ends_with(".pkg.tar.gz") {
     return Err(PicaError::msg(format!("package {}: invalid filename {}", pkg.pkgname, filename)));
