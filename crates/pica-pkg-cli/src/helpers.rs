@@ -580,23 +580,8 @@ pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> CliResult<()> 
   core_copy_dir_recursive(source, target).map_err(CliError::from)
 }
 
-pub(crate) fn manifest_get_array(value: &Value, key: &str) -> Vec<String> {
-  let Some(entry) = value.get(key) else {
-    return Vec::new();
-  };
-
-  match entry {
-    Value::Array(items) => {
-      items.iter().filter_map(Value::as_str).map(ToString::to_string).collect()
-    }
-    Value::String(text) => vec![text.clone()],
-    _ => Vec::new(),
-  }
-}
-
-pub(crate) fn manifest_get_scalar(value: &Value, key: &str) -> String {
-  value.get(key).and_then(Value::as_str).map(ToString::to_string).unwrap_or_default()
-}
+pub(crate) use pica_pkg_core::manifest::get_array as manifest_get_array;
+pub(crate) use pica_pkg_core::manifest::get_scalar as manifest_get_scalar;
 
 #[cfg(test)]
 mod tests {
@@ -654,7 +639,7 @@ mod tests {
 
     assert_eq!(manifest_get_array(&value, "app"), vec!["foo", "bar"]);
     assert_eq!(manifest_get_array(&value, "single"), vec!["baz"]);
-    assert!(manifest_get_array(&value, "num").is_empty());
+    assert_eq!(manifest_get_array(&value, "num"), vec!["1"]);
 
     assert_eq!(manifest_get_scalar(&value, "single"), "baz");
     assert_eq!(manifest_get_scalar(&value, "app"), "");

@@ -1,7 +1,8 @@
+use crate::state::write_json_atomic_pretty;
 use pica_pkg_core::error::PicaError;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const DEFAULT_ETC_DIR: &str = "/etc/pica";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/pica";
@@ -326,26 +327,6 @@ pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
     });
     write_json_atomic_pretty(&paths.report_file, &content)?;
   }
-
-  Ok(())
-}
-
-fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
-  let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
-  tmp_name.push(".tmp");
-  let tmp_path = PathBuf::from(tmp_name);
-
-  if let Some(parent) = path.parent() {
-    std::fs::create_dir_all(parent)
-      .map_err(|err| CliError::new(E_IO, format!("mkdir {} failed: {err}", parent.display())))?;
-  }
-
-  let content = serde_json::to_string_pretty(value)
-    .map_err(|err| CliError::new(E_JSON_INVALID, err.to_string()))?;
-  std::fs::write(&tmp_path, content)
-    .map_err(|err| CliError::new(E_IO, format!("write {} failed: {err}", tmp_path.display())))?;
-  std::fs::rename(&tmp_path, path)
-    .map_err(|err| CliError::new(E_IO, format!("rename {} failed: {err}", path.display())))?;
 
   Ok(())
 }
