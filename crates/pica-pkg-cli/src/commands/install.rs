@@ -219,7 +219,7 @@ pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
       "opkg": to_install,
   });
 
-  db_set_installed(&app.paths.db_file, &appname, manifest, "opkg", &to_install)?;
+  db_set_installed(&app.paths.db_file, &appname, &manifest, "opkg", &to_install)?;
   app.log_info("Transaction completed");
   Ok(())
 }
@@ -678,7 +678,7 @@ pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliRe
   db_set_installed(
     &app.paths.db_file,
     &pkgname,
-    manifest_stored,
+    &manifest_stored,
     &canonicalize_display(pkgfile),
     &installed_files,
   )?;

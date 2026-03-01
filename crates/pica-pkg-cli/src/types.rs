@@ -187,7 +187,7 @@ pub fn require_arg<'a>(args: &'a [String], index: usize, message: &str) -> CliRe
   args.get(index).map(String::as_str).ok_or_else(|| CliError::new(E_ARG_INVALID, message))
 }
 
-pub fn parse_options(args: Vec<String>) -> CliResult<(Options, Vec<String>)> {
+pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut json_mode = JsonMode::None;
   let mut non_interactive = false;
   let mut feed_policy = FeedPolicy::Ask;

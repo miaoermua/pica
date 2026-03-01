@@ -170,7 +170,7 @@ fn main_build(staging_dir: &Path, outdir: Option<PathBuf>) -> PicaResult<()> {
     for build_platform in platforms {
       let archs = collect_archs(&roots, &build_platform)?;
       for build_arch in archs {
-        build_one(BuildRequest {
+        build_one(&BuildRequest {
           staging_dir,
           output_dir: &output_dir,
           pkgname: &pkgname,
@@ -184,7 +184,7 @@ fn main_build(staging_dir: &Path, outdir: Option<PathBuf>) -> PicaResult<()> {
       }
     }
   } else {
-    build_one(BuildRequest {
+    build_one(&BuildRequest {
       staging_dir,
       output_dir: &output_dir,
       pkgname: &pkgname,
@@ -212,7 +212,7 @@ struct BuildRequest<'a> {
   has_matrix: bool,
 }
 
-fn build_one(req: BuildRequest<'_>) -> PicaResult<()> {
+fn build_one(req: &BuildRequest<'_>) -> PicaResult<()> {
   let pkgfile =
     expected_filename(req.pkgname, req.pkgver, req.pkgrel, req.build_platform, req.build_arch);
 

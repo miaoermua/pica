@@ -39,7 +39,8 @@ fn usage() {
 fn main() {
   let paths = Paths::from_env();
 
-  let (options, args) = match parse_options(env::args().skip(1).collect()) {
+  let raw_args: Vec<String> = env::args().skip(1).collect();
+  let (options, args) = match parse_options(&raw_args) {
     Ok(value) => value,
     Err(err) => {
       let app = App::new(

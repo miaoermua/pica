@@ -67,7 +67,7 @@ pub fn report_set_install_result(
 pub fn db_set_installed(
   db_file: &Path,
   pkgname: &str,
-  manifest: Value,
+  manifest: &Value,
   pkgfile: &str,
   files: &[String],
 ) -> CliResult<()> {
