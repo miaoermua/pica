@@ -318,20 +318,8 @@ pub(crate) fn should_use_feeds(
       }
     }
     FeedPolicy::PackagedOnly => 0,
-    FeedPolicy::FeedFirst => {
-      if pkg_list.is_empty() {
-        0
-      } else {
-        1
-      }
-    }
-    FeedPolicy::PackagedFirst => {
-      if have_ipk_dir {
-        0
-      } else {
-        1
-      }
-    }
+    FeedPolicy::FeedFirst => i8::from(!pkg_list.is_empty()),
+    FeedPolicy::PackagedFirst => i8::from(!have_ipk_dir),
     FeedPolicy::Ask => {
       if !have_ipk_dir {
         return 1;
@@ -361,16 +349,12 @@ pub(crate) fn should_use_feeds(
         return 1;
       }
 
-      if prompt_yn(
+      i8::from(prompt_yn(
         &format!(
           "Found {available}/{total} {label} packages in opkg feeds. Use feeds instead of packaged ipks?"
         ),
         true,
-      ) {
-        1
-      } else {
-        0
-      }
+      ))
     }
   }
 }

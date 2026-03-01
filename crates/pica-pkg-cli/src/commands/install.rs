@@ -343,6 +343,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))
 }
 
+#[allow(clippy::too_many_lines)] // will be split in a subsequent commit
 pub fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
   if !pkgfile.is_file() {
     return Err(CliError::new(
