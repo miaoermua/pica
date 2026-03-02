@@ -1,23 +1,22 @@
 # Pica 喜鹊
 
+The ultimate OpenWrt Pkgmgr solution
+
 Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
 
 ![rust](https://ziadoua.github.io/m3-Markdown-Badges/badges/Rust/rust1.svg)
 ![shell](https://ziadoua.github.io/m3-Markdown-Badges/badges/Shell/shell1.svg)
 ![licence](https://ziadoua.github.io/m3-Markdown-Badges/badges/LicenceGPLv3/licencegplv31.svg)
 
-The ultimate OpenWrt Pkgmgr solution
-
-该名字继承自 Wine 递归浪漫，简单紧凑而不落后，运用 Arch 系包管理器相似的滚动更新机制，在 OpenWrt 上体验强大统一且先进的软件包管理器。
+Pica 简单紧凑而不落后，运用 Arch 系包管理器类似的滚动更新机制，在 OpenWrt 上体验强大统一且先进的软件包管理器。
 
 ## 特性
 
-> 说明：Bash 版本已归档到 `legacy/`，后续以 Rust 核心实现为主。
+> 说明：Bash 版本被完整实现重构，后续以 Rust 核心实现为主，当前版本仍为实验性，不代表 Pica 最终品质。
 
 - 🆓 **高度自由**：用户友好，全开源，自建用户仓库
 - 😎 **功能强大**：支持多分支应用声明、生命周期管理以及多种 OpenWrt 分支
 - 🧭 **小巧玲珑**：基于 openwrt 深度打造，设计时就考虑体积敏感
-
 
 ---
 
@@ -39,7 +38,7 @@ The ultimate OpenWrt Pkgmgr solution
 - `pica --fetch-retry <count>`：下载重试次数（默认 2，表示总尝试次数=1+count）
 - `pica --fetch-retry-delay <seconds>`：重试间隔（默认 1 秒）
 
-说明：当前核心实现为 Rust（`crates/pica-pkg-cli` / `crates/pica-pkg-pack`），Bash 版本已归档到 `legacy/`（不再作为核心维护）。更完整的包标准/字段约定见 `docs/standard.md`。
+说明：当前核心实现为 Rust（`crates/pica-pkg-cli` / `crates/pica-pkg-pack`），更完整的包标准/字段约定见 `docs/standard.md`。
 
 补充：`pkgmgr=none` 的生命周期包可使用 `src/` 携带原始资源，安装时会落地到 `/usr/lib/pica/src/<pkgname>/`，供 `cmd_install/cmd_update/cmd_remove` 使用。
 
@@ -53,6 +52,7 @@ The ultimate OpenWrt Pkgmgr solution
 - 非目标：Pica 不提供 Docker 管理服务，不负责容器编排、守护进程管理或 Compose 生命周期托管。
 
 对于开发者来说，只需要将你的固件适配好部分依赖的 kmod 并且支持 Pica，即可以最小化的形式实现应用类似滚动更新特性，Pica 还是受限于 openwrt 包管理器和 openwrt 的轻量化以及内核裁切特性，这是无法避免的。
+
 对于用户来说，你只需要使用 pica 完成包的管理，定期进行 pica 的升级。
 
 ## 配置文件
@@ -81,5 +81,5 @@ The ultimate OpenWrt Pkgmgr solution
 
 此项目的诞生借鉴了这些优秀的开源项目：
 
-- Paru
+- [Paru](https://github.com/Morganamilo/paru)
 - Pacman
