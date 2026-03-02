@@ -71,8 +71,8 @@ jobs:
         run: |
           cargo zigbuild --release \
             --target "${{ matrix.target }}" \
-            -p pica-cli-rs \
-            -p pica-pack-rs
+            -p pica-pkg-cli \
+            -p pica-pkg-pack
 
       - name: Prepare artifacts
         id: prepare_artifacts
