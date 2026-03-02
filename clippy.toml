@@ -1,0 +1,2 @@
+msrv = "1.74"
+too-many-lines-threshold = 100

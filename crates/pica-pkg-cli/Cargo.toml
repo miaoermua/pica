@@ -3,11 +3,21 @@ name = "pica-pkg-cli"
 version = "0.3.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "pica"
 path = "src/main.rs"
 
 [dependencies]
 pica-pkg-core = { path = "../pica-pkg-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+assert_cmd = "2"
+predicates = "3"
+insta = { version = "1", features = ["json"] }

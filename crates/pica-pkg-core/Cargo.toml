@@ -3,6 +3,15 @@ name = "pica-pkg-core"
 version = "0.3.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
