@@ -69,27 +69,25 @@ enum Token<'a> {
 
 fn tokenize_version(input: &str) -> Vec<Token<'_>> {
   let mut out = Vec::new();
-  let mut start = 0usize;
-  let chars: Vec<char> = input.chars().collect();
+  let mut it = input.char_indices().peekable();
 
-  while start < chars.len() {
-    if !chars[start].is_ascii_alphanumeric() {
-      start += 1;
+  while let Some((start, ch)) = it.next() {
+    if !ch.is_ascii_alphanumeric() {
       continue;
     }
 
-    let is_digit = chars[start].is_ascii_digit();
-    let mut end = start + 1;
-    while end < chars.len() {
-      let ch = chars[end];
-      if !ch.is_ascii_alphanumeric() || ch.is_ascii_digit() != is_digit {
+    let is_digit = ch.is_ascii_digit();
+    let mut end = start + ch.len_utf8();
+
+    while let Some(&(next_idx, next_ch)) = it.peek() {
+      if !next_ch.is_ascii_alphanumeric() || next_ch.is_ascii_digit() != is_digit {
         break;
       }
-      end += 1;
+      end = next_idx + next_ch.len_utf8();
+      it.next();
     }
 
-    let segment = &input[chars[..start].iter().map(|ch| ch.len_utf8()).sum::<usize>()
-      ..chars[..end].iter().map(|ch| ch.len_utf8()).sum::<usize>()];
+    let segment = &input[start..end];
 
     if is_digit {
       let value = segment.parse::<u64>().unwrap_or(0);
@@ -97,8 +95,6 @@ fn tokenize_version(input: &str) -> Vec<Token<'_>> {
     } else {
       out.push(Token::Text(segment));
     }
-
-    start = end;
   }
 
   out
