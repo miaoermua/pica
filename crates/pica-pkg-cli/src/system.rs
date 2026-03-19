@@ -313,7 +313,7 @@ fn is_opkg_lock_error(detail: &str) -> bool {
     return true;
   }
 
-  let mentions_lock = [" lock", "lock", "locked"].iter().any(|&pat| text.contains(pat));
+  let mentions_lock = text.contains(" lock") || text.starts_with("lock") || text.contains("locked");
   let lock_failure = [
     "resource temporarily unavailable",
     "could not lock",
