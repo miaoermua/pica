@@ -7,6 +7,18 @@ use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
+fn installed_entry<'a>(db: &'a Value, pkgname: &str) -> CliResult<&'a Value> {
+  db
+    .get("installed")
+    .and_then(Value::as_object)
+    .and_then(|installed| installed.get(pkgname))
+    .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))
+}
+
+fn entry_manifest(entry: &Value) -> &Value {
+  entry.get("manifest").unwrap_or(&Value::Null)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn format_size_display(size_text: &str) -> String {
   const KIB: f64 = 1024.0;
@@ -49,7 +61,7 @@ pub fn installed(app: &mut App) -> CliResult<()> {
     let Some(entry) = installed.get(&pkgname) else {
       continue;
     };
-    let manifest = entry.get("manifest").unwrap_or(&Value::Null);
+    let manifest = entry_manifest(entry);
     let pkgver = manifest_get_first(manifest, "pkgver");
     let pkgrel = manifest_get_first(manifest, "pkgrel");
     let version = pkgver_cmp_key(&pkgver, &pkgrel);
@@ -116,14 +128,8 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
 pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
-
-  let Some(entry) =
-    db.get("installed").and_then(Value::as_object).and_then(|installed| installed.get(pkgname))
-  else {
-    return Err(CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")));
-  };
-
-  let manifest = entry.get("manifest").unwrap_or(&Value::Null);
+  let entry = installed_entry(&db, pkgname)?;
+  let manifest = entry_manifest(entry);
 
   println!("Name            : {pkgname}");
   println!(
@@ -178,16 +184,9 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
 pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
+  let entry = installed_entry(&db, pkgname)?;
 
-  let Some(entry) =
-    db.get("installed").and_then(Value::as_object).and_then(|installed| installed.get(pkgname))
-  else {
-    return Err(CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")));
-  };
-
-  let files = entry.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
-
-  for item in files {
+  for item in entry.get("files").and_then(Value::as_array).into_iter().flatten() {
     if let Some(path) = item.as_str() {
       println!("{path}");
     }

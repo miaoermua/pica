@@ -13,7 +13,13 @@ pub fn repos(app: &mut App) -> CliResult<()> {
   app.log_info("Synchronizing package databases...");
 
   let conf = read_json_file(&app.paths.conf_file)?;
-  let repos = conf.get("repos").and_then(Value::as_array).cloned().unwrap_or_default();
+  let repos =
+    conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
+      CliError::new(
+        E_CONFIG_INVALID,
+        format!("no repos configured in {}", app.paths.conf_file.display()),
+      )
+    })?;
 
   if repos.is_empty() {
     return Err(CliError::new(
