@@ -131,13 +131,41 @@ impl From<PicaError> for CliError {
 pub struct App {
   pub paths: Paths,
   pub options: Options,
+  pub package_manager: Option<Box<dyn crate::pkgmgr::PackageManager>>,
   pub json_last_phase: String,
   pub json_has_text: bool,
 }
 
 impl App {
   pub fn new(paths: Paths, options: Options) -> Self {
-    Self { paths, options, json_last_phase: String::new(), json_has_text: false }
+    Self {
+      paths,
+      options,
+      package_manager: crate::pkgmgr::detect_package_manager(),
+      json_last_phase: String::new(),
+      json_has_text: false,
+    }
+  }
+
+  pub fn package_manager(&self) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
+    self.package_manager.as_deref().ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
+  }
+
+  pub fn select_package_manager(&mut self, value: &str) -> CliResult<()> {
+    if value == "none" {
+      self.package_manager = None;
+      return Ok(());
+    }
+    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
+    if self.package_manager.as_ref().is_some_and(|manager| manager.kind() == kind) {
+      return Ok(());
+    }
+    let manager = crate::pkgmgr::package_manager_for(kind).ok_or_else(|| {
+      CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
+    })?;
+    self.package_manager = Some(manager);
+    Ok(())
   }
 
   pub fn set_phase(&mut self, phase: &str) {

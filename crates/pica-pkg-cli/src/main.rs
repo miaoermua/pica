@@ -3,6 +3,7 @@ mod candidate;
 mod commands;
 mod lock;
 mod platform;
+mod pkgmgr;
 mod state;
 mod system;
 
@@ -20,7 +21,7 @@ use std::process;
 
 fn usage() {
   println!(
-        "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install by selector (force opkg)\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: opkg, tar, and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
+        "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install by detected system package manager\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: apk or opkg, tar, and one fetcher (apk is preferred when both exist) (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
     );
 }
 
@@ -99,8 +100,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     "-S" => {
       if let Some(selector) = args.get(1) {
         app.set_phase("install");
-        need_cmd("opkg")?;
-        install::app_auto(app, selector)?;
+          install::app_auto(app, selector)?;
         Ok(("-S", selector.clone()))
       } else {
         app.set_phase("sync");
@@ -110,13 +110,11 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-Su" => {
       app.set_phase("upgrade");
-      need_cmd("opkg")?;
       upgrade::all(app)?;
       Ok(("-Su", "all".to_string()))
     }
     "-Syu" => {
       app.set_phase("sync");
-      need_cmd("opkg")?;
       sync::repos(app)?;
       app.set_phase("upgrade");
       upgrade::all(app)?;
@@ -141,9 +139,8 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-So" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       let selector = require_arg(args, 1, "-So requires <selector>")?;
-      install::app_via_opkg(app, selector)?;
+      install::app_via_package_manager(app, selector)?;
       Ok(("-So", selector.to_string()))
     }
     "-Si" => {
@@ -154,7 +151,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-Sp" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       need_cmd("tar")?;
       let selector = require_arg(args, 1, "-Sp requires <selector>")?;
       install::pica_from_repo(app, selector)?;
@@ -162,7 +158,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-U" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       need_cmd("tar")?;
       let source = require_arg(args, 1, "-U requires <pkgfile|url>")?;
       install::pkg_source(app, source, None)?;
@@ -170,7 +165,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-R" => {
       app.set_phase("remove");
-      need_cmd("opkg")?;
       let pkgname = require_arg(args, 1, "-R requires <pkgname>")?;
       remove::pkg(app, pkgname)?;
       Ok(("-R", pkgname.to_string()))

@@ -9,10 +9,7 @@ use crate::app::{
 use crate::candidate::find_pica_candidates_in_index;
 use crate::platform::{detect_os, detect_platform};
 use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
-use crate::system::{
-  fetch_url, need_cmd, opkg_has_package, opkg_install_pkg, opkg_installed_version,
-  opkg_update_ignore,
-};
+use crate::system::{fetch_url, need_cmd};
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::repo::is_supported_url;
@@ -38,8 +35,9 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
       .unwrap_or_default();
 
     match source.as_str() {
-      "opkg" => {
-        app_via_opkg(app, selector)?;
+      "opkg" | "apk" => {
+        app.select_package_manager(&source)?;
+        app_via_package_manager(app, selector)?;
         return Ok(());
       }
       "pica" => {
@@ -50,9 +48,10 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
-  opkg_update_ignore();
+  let package_manager = app.package_manager()?;
+  package_manager.update_index();
 
-  if !Selector::is_structured(selector) && opkg_has_package(&parsed.appname) {
+  if !Selector::is_structured(selector) && package_manager.package_exists(&parsed.appname) {
     let should_install_opkg = if app.options.non_interactive {
       matches!(
         app.options.feed_policy,
@@ -65,7 +64,7 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
     };
 
     if should_install_opkg {
-      app_via_opkg(app, selector)?;
+      app_via_package_manager(app, selector)?;
       return Ok(());
     }
   }
@@ -73,15 +72,14 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   pica_from_repo(app, selector)
 }
 
-pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  need_cmd("opkg")?;
-
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let appname = parsed.appname.clone();
 
-  opkg_update_ignore();
   let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
+  let package_manager = app.package_manager()?;
+  package_manager.update_index();
 
   let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
   if lang == "zh-cn" {
@@ -90,25 +88,22 @@ pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
 
   let mut to_install = Vec::new();
   for pkg in candidates {
-    if opkg_has_package(&pkg) {
+    if package_manager.package_exists(&pkg) {
       to_install.push(pkg);
     }
   }
 
   if to_install.is_empty() {
-    return Err(CliError::new(E_CONFIG_INVALID, format!("opkg: package not found: {appname}")));
+    return Err(CliError::new(E_CONFIG_INVALID, format!("{}: package not found: {appname}", package_manager.kind().as_str())));
   }
-
-  app.log_info(format!("Installing (opkg): {}", to_install.join(" ")));
 
   for pkg in &to_install {
-    opkg_install_pkg("opkg", pkg)?;
+    package_manager.install(package_manager.kind().as_str(), pkg)?;
   }
-
-  let mut base_ver = opkg_installed_version(&appname).unwrap_or_default();
+  let mut base_ver = package_manager.installed_version(&appname).unwrap_or_default();
   if base_ver.is_empty() {
     if let Some(first_pkg) = to_install.first() {
-      base_ver = opkg_installed_version(first_pkg).unwrap_or_default();
+      base_ver = package_manager.installed_version(first_pkg).unwrap_or_default();
     }
   }
 
@@ -120,12 +115,13 @@ pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
       "os": detect_os(),
       "platform": detect_platform(),
       "arch": "all",
-      "source": "opkg",
-      "pkgmgr": "opkg",
-      "opkg": to_install,
+      "source": package_manager.kind().as_str(),
+      "pkgmgr": package_manager.kind().as_str(),
+      package_manager.kind().as_str(): to_install,
   });
 
-  db_set_installed(&app.paths.db_file, &appname, &manifest, "opkg", &to_install)?;
+  let manager_name = package_manager.kind().as_str();
+  db_set_installed(&app.paths.db_file, &appname, &manifest, manager_name, &to_install)?;
   app.log_info("Transaction completed");
   Ok(())
 }

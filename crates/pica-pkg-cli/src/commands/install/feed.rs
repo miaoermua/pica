@@ -2,7 +2,6 @@ use crate::app::{
   prompt_yn, App, CliError, CliResult, FeedPolicy, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID,
   E_RUNTIME,
 };
-use crate::system::{opkg_has_package, opkg_install_pkg, opkg_update_ignore};
 use std::fs;
 use std::path::Path;
 
@@ -31,7 +30,9 @@ pub(crate) fn should_use_feeds(
         return 0;
       }
 
-      opkg_update_ignore();
+      if let Ok(package_manager) = app.package_manager() {
+        package_manager.update_index();
+      }
       let mut total = 0usize;
       let mut available = 0usize;
       for dep in pkg_list {
@@ -39,7 +40,7 @@ pub(crate) fn should_use_feeds(
           continue;
         }
         total += 1;
-        if opkg_has_package(dep) {
+        if app.package_manager().is_ok_and(|manager| manager.package_exists(dep)) {
           available += 1;
         }
       }
@@ -92,13 +93,13 @@ pub(crate) fn install_via_feeds_or_ipk(
       if dep.is_empty() {
         continue;
       }
-      opkg_install_pkg(label, dep)?;
+      app.package_manager()?.install(label, dep)?;
     }
     return Ok(());
   }
 
   if have_ipk_dir {
-    install_ipk_dir(label, ipk_dir)?;
+    install_ipk_dir(app, label, ipk_dir)?;
     return Ok(());
   }
 
@@ -108,7 +109,7 @@ pub(crate) fn install_via_feeds_or_ipk(
   ))
 }
 
-pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
+pub(crate) fn install_ipk_dir(app: &App, label: &str, dir: &Path) -> CliResult<()> {
   if !dir.is_dir() {
     return Ok(());
   }
@@ -119,17 +120,18 @@ pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
 
   for entry in entries.flatten() {
     let path = entry.path();
-    if path.extension().and_then(|v| v.to_str()) != Some("ipk") {
+    let extension = path.extension().and_then(|v| v.to_str());
+    if extension != Some("ipk") && extension != Some("apk") {
       continue;
     }
-    opkg_install_pkg(label, &path.display().to_string())?;
+    app.package_manager()?.install(label, &path.display().to_string())?;
     installed_any = true;
   }
 
   if !installed_any {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("no ipk files found in {label} dir: {}", dir.display()),
+      format!("no ipk/apk files found in {label} dir: {}", dir.display()),
     ));
   }
 

@@ -5,9 +5,7 @@ use crate::app::{
   E_PACKAGE_INVALID, E_RUNTIME, E_VERSION_INCOMPATIBLE,
 };
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
-use crate::system::{
-  opkg_is_installed, opkg_snapshot_installed, opkg_update_ignore, run_hook, run_tar_extract,
-};
+use crate::system::{run_hook, run_tar_extract};
 use pica_pkg_core::io::copy_dir_recursive;
 use pica_pkg_core::io::make_temp_dir;
 use pica_pkg_core::manifest::Manifest;
@@ -165,6 +163,10 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
   let pkgrel = manifest.get_first("pkgrel");
   let pkgmgr_raw = manifest.get_first("pkgmgr");
 
+  let default_pkgmgr = app.package_manager().ok().map_or_else(
+    || "opkg".to_string(),
+    |manager| manager.kind().as_str().to_string(),
+  );
   let pkg = PackageFields {
     pkgname: pkgname.clone(),
     pkgver_display: pkgver_cmp_key(&pkgver, &pkgrel),
@@ -173,7 +175,7 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
     arch: required_manifest_field(&manifest, "arch")?,
     uname: manifest.get_first("uname"),
     luci: manifest.get_first("luci"),
-    pkgmgr: if pkgmgr_raw.is_empty() { "opkg".to_string() } else { pkgmgr_raw },
+    pkgmgr: if pkgmgr_raw.is_empty() { default_pkgmgr } else { pkgmgr_raw },
     visibility: manifest.get_first("visibility"),
   };
 
@@ -203,6 +205,7 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
     ));
   }
 
+  app.select_package_manager(&pkg.pkgmgr)?;
   validate_package(app, &manifest, &tmpdir, &pkg)?;
 
   let deps = resolve_dependencies(app, &manifest, &tmpdir, &pkg.pkgmgr)?;
@@ -235,17 +238,18 @@ fn resolve_dependencies(
   let mut tx_added = Vec::new();
   let mut app_added = Vec::new();
 
-  if pkgmgr == "opkg" {
-    app.log_info("Resolving opkg dependencies and app list...");
+  if pkgmgr == "opkg" || pkgmgr == "apk" {
+    app.log_info(format!("Resolving {pkgmgr} dependencies and app list..."));
 
     let kmod_list =
       manifest.get_array("kmod").into_iter().filter(|item| !item.is_empty()).collect::<Vec<_>>();
     let base_list =
       manifest.get_array("base").into_iter().filter(|item| !item.is_empty()).collect::<Vec<_>>();
 
-    opkg_update_ignore();
+    let package_manager = app.package_manager()?;
+    package_manager.update_index();
 
-    precheck = build_precheck_report(manifest, &depend_dir, &binary_dir, &app_list);
+    precheck = build_precheck_report(app, manifest, &depend_dir, &binary_dir, &app_list);
     let missing = summarize_missing_precheck(&precheck);
     if !missing.is_empty() {
       app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));
@@ -255,26 +259,26 @@ fn resolve_dependencies(
       ));
     }
 
-    let snap_before_tx = opkg_snapshot_installed();
+    let snap_before_tx = package_manager.snapshot_installed();
 
     for dep in &kmod_list {
       if dep.is_empty() {
         continue;
       }
-      if !opkg_is_installed(dep) {
-        crate::system::opkg_install_pkg("kmod", dep)?;
+      if !package_manager.is_installed(dep) {
+        package_manager.install("kmod", dep)?;
       }
     }
 
     let has_depend_dir = depend_dir.is_dir();
     install_via_feeds_or_ipk(app, "base", &base_list, &depend_dir, has_depend_dir)?;
 
-    let snap_before_app = opkg_snapshot_installed();
+    let snap_before_app = package_manager.snapshot_installed();
 
     install_via_feeds_or_ipk(app, "app", &app_list, &binary_dir, true)?;
 
-    let snap_after_app = opkg_snapshot_installed();
-    let snap_after_tx = opkg_snapshot_installed();
+    let snap_after_app = package_manager.snapshot_installed();
+    let snap_after_tx = package_manager.snapshot_installed();
 
     tx_added = pkg_list_diff_added(&snap_before_tx, &snap_after_tx);
     app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);

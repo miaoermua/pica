@@ -11,11 +11,12 @@ pub(crate) fn rewrite_manifest_for_build(
   pkgrel: &str,
   platform: &str,
   arch: &str,
+  pkgmgr: &str,
 ) -> PicaResult<()> {
   let content = fs::read_to_string(source)?;
   let mut lines = Vec::new();
   let remove_keys: HashSet<&str> =
-    ["builddate", "size", "platform", "arch", "pkgver", "pkgrel", "uname"].into_iter().collect();
+    ["builddate", "size", "platform", "arch", "pkgver", "pkgrel", "uname", "pkgmgr"].into_iter().collect();
 
   for raw_line in content.lines() {
     let trimmed = raw_line.trim_start();
@@ -41,6 +42,7 @@ pub(crate) fn rewrite_manifest_for_build(
   lines.push(format!("pkgrel = {pkgrel}"));
   lines.push(format!("platform = {platform}"));
   lines.push(format!("arch = {arch}"));
+  lines.push(format!("pkgmgr = {pkgmgr}"));
 
   let mut output = lines.join("\n");
   output.push('\n');
@@ -79,7 +81,7 @@ mod tests {
     )
     .expect("write source manifest");
 
-    rewrite_manifest_for_build(&source, &target, "1.2.3", "4", "all", "arm64")
+    rewrite_manifest_for_build(&source, &target, "1.2.3", "4", "all", "arm64", "opkg")
       .expect("rewrite manifest");
 
     let out = fs::read_to_string(&target).expect("read target manifest");
@@ -88,6 +90,7 @@ mod tests {
     assert!(out.contains("pkgrel = 4"));
     assert!(out.contains("platform = all"));
     assert!(out.contains("arch = arm64"));
+    assert!(out.contains("pkgmgr = opkg"));
     assert!(out.contains("builddate = "));
     assert!(!out.contains("size = 1"));
     assert!(!out.contains("platform = old"));
@@ -103,7 +106,7 @@ mod tests {
     fs::write(&source, "pkgname = hello\npkgver = 0.1.0-7\nplatform = old\narch = old\n")
       .expect("write source manifest");
 
-    rewrite_manifest_for_build(&source, &target, "0.1.0", "7", "all", "all")
+    rewrite_manifest_for_build(&source, &target, "0.1.0", "7", "all", "all", "apk")
       .expect("rewrite manifest");
 
     let out = fs::read_to_string(&target).expect("read target manifest");
@@ -111,6 +114,7 @@ mod tests {
     assert!(out.contains("pkgrel = 7"));
     assert!(out.contains("platform = all"));
     assert!(out.contains("arch = all"));
+    assert!(out.contains("pkgmgr = apk"));
     assert!(!out.contains("platform = old"));
   }
 }

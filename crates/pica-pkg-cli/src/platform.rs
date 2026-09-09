@@ -1,6 +1,6 @@
-use crate::system::{opkg_is_installed, run_command_text};
+use crate::app::App;
+use crate::system::run_command_text;
 use std::fs;
-use std::process::Command;
 
 pub(crate) fn detect_platform() -> String {
   let uname = run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string());
@@ -28,28 +28,18 @@ pub(crate) fn normalize_uname(value: &str) -> String {
   }
 }
 
-pub(crate) fn detect_opkg_arches() -> Vec<String> {
-  let Ok(output) = Command::new("opkg").arg("print-architecture").output() else {
-    return Vec::new();
-  };
-
-  let text = String::from_utf8_lossy(&output.stdout);
-  let mut out = Vec::new();
-  for line in text.lines() {
-    let mut parts = line.split_whitespace();
-    let _ = parts.next();
-    if let Some(arch) = parts.next() {
-      out.push(arch.to_string());
-    }
-  }
-  out
+pub(crate) fn detect_package_arches(app: &App) -> Vec<String> {
+  app.package_manager().map(crate::pkgmgr::PackageManager::architectures).unwrap_or_default()
 }
 
-pub(crate) fn detect_luci_variant() -> String {
-  if opkg_is_installed("luci") {
+pub(crate) fn detect_luci_variant(app: &App) -> String {
+  let Ok(package_manager) = app.package_manager() else {
+    return "unknown".to_string();
+  };
+  if package_manager.is_installed("luci") {
     return "lua1".to_string();
   }
-  if opkg_is_installed("luci2") {
+  if package_manager.is_installed("luci2") {
     return "js2".to_string();
   }
   "unknown".to_string()

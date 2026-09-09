@@ -1,4 +1,5 @@
 mod archive;
+mod backend;
 mod build;
 mod platform;
 mod rewrite;
@@ -12,7 +13,7 @@ use std::process;
 
 fn usage() {
   println!(
-        "Usage:\n  pica-pack build <staging_dir> [--outdir DIR]\n\
+        "Usage:\n  pica-pack build <staging_dir> [--outdir DIR] [--pkgmgr opkg|apk|none|opkg,apk]\n\
 \nstaging_dir must contain:\n  - manifest\n  - cmd/\n  - binary/ is optional\n  - src/ is optional\n  - depend/ is optional\n  - LICENSE is optional\n\
 \nIf binary/ exists, the recommended layout is:\n  binary/<platform>/<arch>/*.ipk\n\
 \nIf depend/ exists, the recommended layout is:\n  depend/<platform>/<arch>/*.ipk\n\
@@ -58,6 +59,7 @@ fn run() -> PicaResult<()> {
       };
 
       let mut outdir: Option<PathBuf> = None;
+      let mut pkgmgr: Option<String> = None;
       let rest: Vec<String> = args.collect();
       let mut index = 0;
       while index < rest.len() {
@@ -67,6 +69,13 @@ fn run() -> PicaResult<()> {
               return Err(PicaError::msg("--outdir requires DIR"));
             };
             outdir = Some(PathBuf::from(value));
+            index += 2;
+          }
+          "--pkgmgr" => {
+            let Some(value) = rest.get(index + 1) else {
+              return Err(PicaError::msg("--pkgmgr requires opkg, apk, none, or a comma-separated list"));
+            };
+            pkgmgr = Some(value.clone());
             index += 2;
           }
           "-h" | "--help" => {
@@ -79,7 +88,7 @@ fn run() -> PicaResult<()> {
         }
       }
 
-      main_build(Path::new(&staging_dir_arg), outdir)
+      main_build(Path::new(&staging_dir_arg), outdir, pkgmgr.as_deref())
     }
     other => Err(PicaError::msg(format!("unknown command: {other}"))),
   }

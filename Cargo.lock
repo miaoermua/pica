@@ -336,6 +336,7 @@ version = "0.3.0"
 dependencies = [
  "pica-pkg-core",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "tempfile",
 ]
