@@ -3,6 +3,7 @@ mod candidate;
 mod commands;
 mod lock;
 mod platform;
+mod pkgmgr;
 mod state;
 mod system;
 
@@ -99,8 +100,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     "-S" => {
       if let Some(selector) = args.get(1) {
         app.set_phase("install");
-        need_cmd("opkg")?;
-        install::app_auto(app, selector)?;
+          install::app_auto(app, selector)?;
         Ok(("-S", selector.clone()))
       } else {
         app.set_phase("sync");
@@ -110,13 +110,11 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-Su" => {
       app.set_phase("upgrade");
-      need_cmd("opkg")?;
       upgrade::all(app)?;
       Ok(("-Su", "all".to_string()))
     }
     "-Syu" => {
       app.set_phase("sync");
-      need_cmd("opkg")?;
       sync::repos(app)?;
       app.set_phase("upgrade");
       upgrade::all(app)?;
@@ -141,9 +139,8 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-So" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       let selector = require_arg(args, 1, "-So requires <selector>")?;
-      install::app_via_opkg(app, selector)?;
+      install::app_via_package_manager(app, selector)?;
       Ok(("-So", selector.to_string()))
     }
     "-Si" => {
@@ -154,7 +151,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-Sp" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       need_cmd("tar")?;
       let selector = require_arg(args, 1, "-Sp requires <selector>")?;
       install::pica_from_repo(app, selector)?;
@@ -162,7 +158,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-U" => {
       app.set_phase("install");
-      need_cmd("opkg")?;
       need_cmd("tar")?;
       let source = require_arg(args, 1, "-U requires <pkgfile|url>")?;
       install::pkg_source(app, source, None)?;
@@ -170,7 +165,6 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     }
     "-R" => {
       app.set_phase("remove");
-      need_cmd("opkg")?;
       let pkgname = require_arg(args, 1, "-R requires <pkgname>")?;
       remove::pkg(app, pkgname)?;
       Ok(("-R", pkgname.to_string()))

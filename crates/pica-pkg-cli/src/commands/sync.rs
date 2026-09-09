@@ -3,7 +3,7 @@ use crate::app::{
 };
 use crate::platform::detect_platform;
 use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
-use crate::system::{fetch_url, has_command, opkg_has_package, opkg_update_ignore};
+use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::{is_supported_url, parse_repo_json};
 use serde_json::{json, Value};
@@ -102,26 +102,30 @@ pub fn repos(app: &mut App) -> CliResult<()> {
 }
 
 fn check_index_dependencies(app: &mut App) {
-  if !has_command("opkg") {
-    return;
-  }
-
-  opkg_update_ignore();
-
   let Ok(index) = read_json_file(&app.paths.index_file) else {
     return;
   };
 
-  let mut missing_any = false;
-  for dep in collect_declared_dependencies(&index) {
-    if !opkg_has_package(&dep) {
-      app.log_warn(format!("opkg feed missing dependency: {dep}"));
-      missing_any = true;
-    }
+  let (manager_name, missing) = {
+    let Ok(package_manager) = app.package_manager() else {
+      return;
+    };
+    package_manager.update_index();
+    let manager_name = match package_manager.kind() {
+      crate::pkgmgr::PackageManagerKind::Opkg => "opkg",
+      crate::pkgmgr::PackageManagerKind::Apk => "apk",
+    };
+    let missing = collect_declared_dependencies(&index)
+      .into_iter()
+      .filter(|dep| !package_manager.package_exists(dep))
+      .collect::<Vec<_>>();
+    (manager_name, missing)
+  };
+  for dep in &missing {
+    app.log_warn(format!("{manager_name} feed missing dependency: {dep}"));
   }
-
-  if missing_any {
-    app.log_warn("Some declared dependencies are missing in opkg feeds");
+  if !missing.is_empty() {
+    app.log_warn(format!("Some declared dependencies are missing in {manager_name} feeds"));
   }
 }
 

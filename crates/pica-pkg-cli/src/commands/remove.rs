@@ -1,6 +1,6 @@
 use crate::app::{ensure_dirs, App, CliError, CliResult, E_ARG_INVALID};
 use crate::state::{db_del_installed, read_json_file};
-use crate::system::{opkg_remove_pkg, run_command_capture_output};
+use crate::system::run_command_capture_output;
 use pica_pkg_core::manifest::{get_array as manifest_get_array, get_scalar as manifest_get_scalar};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -29,6 +29,7 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     }
   };
 
+  app.select_package_manager(&pkgmgr)?;
   app.log_info(format!("Removing {pkgname}..."));
 
   let remove_target = if cmd_remove.starts_with('/') || cmd_remove.is_empty() {
@@ -57,10 +58,10 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     }
   }
 
-  if pkgmgr == "opkg" {
-    for opkg_name in remove_set {
-      app.log_info(format!("removing opkg package: {opkg_name}"));
-      opkg_remove_pkg(&opkg_name)?;
+  if pkgmgr == "opkg" || pkgmgr == "apk" {
+    for package_name in remove_set {
+      app.log_info(format!("removing {pkgmgr} package: {package_name}"));
+      app.package_manager()?.remove(&package_name)?;
     }
   } else {
     app.log_info(format!("skip package-manager remove (pkgmgr={pkgmgr})"));

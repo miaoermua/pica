@@ -3,9 +3,9 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
 };
 use crate::platform::{
-  detect_luci_variant, detect_opkg_arches, detect_os, detect_platform, normalize_uname,
+  detect_luci_variant, detect_package_arches, detect_os, detect_platform, normalize_uname,
 };
-use crate::system::{opkg_has_package, opkg_is_installed, run_command_text};
+use crate::system::run_command_text;
 use pica_pkg_core::manifest::Manifest;
 use serde_json::{json, Value};
 use std::fs;
@@ -22,7 +22,8 @@ pub(crate) fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
       continue;
     }
     let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("").to_string();
-    if name.starts_with(&format!("{pkg}_")) || name.starts_with(&format!("{pkg}-")) {
+    let is_package_file = path.extension().and_then(|value| value.to_str()).is_some_and(|ext| ext == "ipk" || ext == "apk");
+    if is_package_file && (name.starts_with(&format!("{pkg}_")) || name.starts_with(&format!("{pkg}-"))) {
       return true;
     }
   }
@@ -30,11 +31,11 @@ pub(crate) fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
   false
 }
 
-pub(crate) fn precheck_dep_source(dep: &str, ipk_dir: &Path) -> String {
-  if opkg_is_installed(dep) {
+pub(crate) fn precheck_dep_source(app: &App, dep: &str, ipk_dir: &Path) -> String {
+  if app.package_manager().is_ok_and(|manager| manager.is_installed(dep)) {
     return "installed".to_string();
   }
-  if opkg_has_package(dep) {
+  if app.package_manager().is_ok_and(|manager| manager.package_exists(dep)) {
     return "feed".to_string();
   }
   if ipk_dir_has_pkg(ipk_dir, dep) {
@@ -44,6 +45,7 @@ pub(crate) fn precheck_dep_source(dep: &str, ipk_dir: &Path) -> String {
 }
 
 pub(crate) fn build_precheck_report(
+  app: &App,
   manifest: &Manifest,
   depend_dir: &Path,
   binary_dir: &Path,
@@ -53,20 +55,20 @@ pub(crate) fn build_precheck_report(
     .get_array("kmod")
     .into_iter()
     .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(&dep, Path::new(""))}))
+    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, Path::new(""))}))
     .collect::<Vec<Value>>();
 
   let base = manifest
     .get_array("base")
     .into_iter()
     .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(&dep, depend_dir)}))
+    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, depend_dir)}))
     .collect::<Vec<Value>>();
 
   let app = app_list
     .iter()
     .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(dep, binary_dir)}))
+    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, dep, binary_dir)}))
     .collect::<Vec<Value>>();
 
   json!({
@@ -129,7 +131,7 @@ pub(super) fn validate_package(
   }
 
   if pkg.arch != "all" {
-    let host_arches = detect_opkg_arches();
+    let host_arches = detect_package_arches(app);
     if !host_arches.iter().any(|arch| arch == &pkg.arch) {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
@@ -138,14 +140,14 @@ pub(super) fn validate_package(
     }
   }
 
-  if pkg.pkgmgr != "opkg" && pkg.pkgmgr != "none" {
+  if pkg.pkgmgr != "opkg" && pkg.pkgmgr != "apk" && pkg.pkgmgr != "none" {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("invalid pkgmgr value: {} (supported: opkg, none)", pkg.pkgmgr),
+      format!("invalid pkgmgr value: {} (supported: opkg, apk, none)", pkg.pkgmgr),
     ));
   }
 
-  if pkg.pkgmgr == "opkg" && !tmpdir.join("binary").is_dir() {
+  if (pkg.pkgmgr == "opkg" || pkg.pkgmgr == "apk") && !tmpdir.join("binary").is_dir() {
     return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
   }
 
@@ -163,7 +165,7 @@ pub(super) fn validate_package(
     if pkg.luci != "lua1" && pkg.luci != "js2" {
       return Err(CliError::new(E_CONFIG_INVALID, format!("invalid luci value: {}", pkg.luci)));
     }
-    let host_luci = detect_luci_variant();
+    let host_luci = detect_luci_variant(app);
     if host_luci == "unknown" {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
