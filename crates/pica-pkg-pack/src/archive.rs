@@ -1,5 +1,5 @@
 use pica_pkg_core::error::{PicaError, PicaResult};
-use pica_pkg_core::io::sha256_file;
+use pica_pkg_core::io::{sha256_file, write_atomic};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -42,7 +42,7 @@ pub(crate) fn write_sha256sum_entry(path: &Path, filename: &str, sha256: &str) -
 
   let mut content = lines.join("\n");
   content.push('\n');
-  fs::write(path, content)?;
+  write_atomic(path, content.as_bytes())?;
   Ok(())
 }
 

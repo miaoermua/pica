@@ -112,8 +112,14 @@ fn validate_filename(pkg: &Package) -> PicaResult<()> {
     return Err(PicaError::msg(format!("package {}: invalid filename {}", pkg.pkgname, filename)));
   }
 
-  let expected =
+  let mut expected =
     expected_filename(&pkg.pkgname, &pkg.pkgver, &pkg.pkgrel, &pkg.platform, &pkg.arch);
+  let backend = pkg.manifest.as_ref().and_then(|manifest| manifest.get("pkgmgr")).and_then(Value::as_str).unwrap_or("opkg");
+  match backend {
+    "apk" => expected = expected.replace(".pkg.tar.gz", "-apk.pkg.tar.gz"),
+    "opkg" | "none" => {},
+    _ => return Err(PicaError::msg(format!("unsupported pkgmgr: {backend}"))),
+  }
   if expected != *filename {
     return Err(PicaError::msg(format!(
       "package {}: filename mismatch, expected {}, got {}",
@@ -177,6 +183,26 @@ mod tests {
 
     let parsed = parse_repo_json(input).expect("valid repo");
     assert_eq!(parsed.packages.len(), 1);
+  }
+
+  #[test]
+  fn parse_valid_apk_filename_from_manifest() {
+    let input = r#"
+        {
+          "schema": 1,
+          "packages": [{
+            "pkgname": "hello",
+            "pkgver": "1.0.0",
+            "pkgrel": "1",
+            "platform": "all",
+            "arch": "all",
+            "filename": "hello-1.0.0-1-all-apk.pkg.tar.gz",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "manifest": {"pkgmgr": "apk"}
+          }]
+        }
+        "#;
+    assert_eq!(parse_repo_json(input).expect("valid apk repo").packages.len(), 1);
   }
 
   #[test]

@@ -108,6 +108,7 @@ fn check_index_dependencies(app: &mut App) {
 
   let (manager_name, missing) = {
     let Ok(package_manager) = app.package_manager() else {
+      app.log_warn("skip dependency check: no supported package manager found");
       return;
     };
     package_manager.update_index();

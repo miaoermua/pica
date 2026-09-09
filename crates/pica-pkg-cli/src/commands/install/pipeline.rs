@@ -163,6 +163,10 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
   let pkgrel = manifest.get_first("pkgrel");
   let pkgmgr_raw = manifest.get_first("pkgmgr");
 
+  let default_pkgmgr = app.package_manager().ok().map_or_else(
+    || "opkg".to_string(),
+    |manager| manager.kind().as_str().to_string(),
+  );
   let pkg = PackageFields {
     pkgname: pkgname.clone(),
     pkgver_display: pkgver_cmp_key(&pkgver, &pkgrel),
@@ -171,7 +175,7 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
     arch: required_manifest_field(&manifest, "arch")?,
     uname: manifest.get_first("uname"),
     luci: manifest.get_first("luci"),
-    pkgmgr: if pkgmgr_raw.is_empty() { "opkg".to_string() } else { pkgmgr_raw },
+    pkgmgr: if pkgmgr_raw.is_empty() { default_pkgmgr } else { pkgmgr_raw },
     visibility: manifest.get_first("visibility"),
   };
 
