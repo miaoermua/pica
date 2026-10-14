@@ -69,7 +69,7 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     }
   }
 
-  if kind.is_native() {
+  if kind.requires_system_binary() {
     for package_name in remove_set {
       app.log_info(format!("removing {pkgmgr} package: {package_name}"));
       app.package_manager()?.remove(&package_name)?;
@@ -87,7 +87,7 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     .filter(|path| path.starts_with('/'))
     .collect::<Vec<_>>();
   let payload = PayloadInstall {
-    files: exclude_native_owned(app, kind, files),
+    files: exclude_system_owned(app, kind, files),
     dirs: json_string_list(&entry, "dirs"),
     size: 0,
   };
@@ -106,14 +106,14 @@ fn json_string_list(entry: &Value, key: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Drops payload paths the native backend still attributes to another package.
+/// Drops payload paths the system backend still attributes to another package.
 ///
 /// A payload may have overwritten a file the backend tracks (the usually
 /// read-only filesystem makes this rare, but a user can install into a writable
 /// overlay). Deleting it would leave that package inconsistent, and Pica cannot
 /// restore the original, so the file is left in place and reported.
-fn exclude_native_owned(app: &mut App, kind: PackageManagerKind, files: Vec<String>) -> Vec<String> {
-  if !kind.is_native() {
+fn exclude_system_owned(app: &mut App, kind: PackageManagerKind, files: Vec<String>) -> Vec<String> {
+  if !kind.requires_system_binary() {
     return files;
   }
 

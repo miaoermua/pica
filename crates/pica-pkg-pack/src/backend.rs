@@ -6,7 +6,7 @@ use pica_pkg_core::manifest::split_targets;
 pub(crate) enum BuildBackend {
   Opkg,
   Apk,
-  None,
+  Pica,
 }
 
 impl BuildBackend {
@@ -14,7 +14,7 @@ impl BuildBackend {
     match value.trim().to_ascii_lowercase().as_str() {
       "opkg" => Ok(Self::Opkg),
       "apk" => Ok(Self::Apk),
-      "none" => Ok(Self::None),
+      "pica" => Ok(Self::Pica),
       other => Err(PicaError::msg(format!("unsupported package manager: {other}"))),
     }
   }
@@ -23,30 +23,43 @@ impl BuildBackend {
     match self {
       Self::Opkg => "opkg",
       Self::Apk => "apk",
-      Self::None => "none",
+      Self::Pica => "pica",
     }
   }
 
   /// Subdirectory of `--outdir` holding this backend's artifacts.
   ///
   /// Every backend gets its own directory. Deciding the backend from a file
-  /// extension is what let a `none` build pick up `.apk` inputs, so the layout
+  /// extension is what let a `pica` build pick up `.apk` inputs, so the layout
   /// now states the backend instead of implying it.
   pub(crate) fn output_subdir(self) -> &'static str {
     self.as_str()
   }
 
-  pub(crate) fn package_extension(self) -> Option<&'static str> {
+  /// Container formats `pkgs/<backend>/` may hold.
+  ///
+  /// `opkg` and `apk` accept exactly their own format, so a stray `.apk` under
+  /// `pkgs/opkg/` is reported instead of packed. `pica` unpacks the containers
+  /// itself and understands both formats, so it keeps both.
+  pub(crate) fn package_extensions(self) -> &'static [&'static str] {
     match self {
-      Self::Opkg => Some(".ipk"),
-      Self::Apk => Some(".apk"),
-      Self::None => None,
+      Self::Opkg => &[".ipk"],
+      Self::Apk => &[".apk"],
+      Self::Pica => &[".ipk", ".apk"],
     }
   }
 
-  /// `none` ships no system packages: it delegates nothing to a package manager.
-  pub(crate) fn is_native(self) -> bool {
-    !matches!(self, Self::None)
+  /// Whether an artifact of this backend ships `pkgs/` containers.
+  ///
+  /// All three do, which is why the answer is uniform: `opkg`/`apk` hand the
+  /// containers to the system package manager on the target, and `pica` unpacks
+  /// them itself. The accessor states the layout rule in one place, so a backend
+  /// that owns its files *without* shipping any container has somewhere to say
+  /// so — and so call sites read as "does this rebuild include `pkgs/`".
+  pub(crate) fn expects_containers(self) -> bool {
+    match self {
+      Self::Opkg | Self::Apk | Self::Pica => true,
+    }
   }
 }
 
@@ -93,18 +106,34 @@ mod tests {
 
   #[test]
   fn backend_drives_extension_and_output_dir() {
-    assert_eq!(BuildBackend::Apk.package_extension(), Some(".apk"));
-    assert_eq!(BuildBackend::Opkg.package_extension(), Some(".ipk"));
-    assert_eq!(BuildBackend::None.package_extension(), None);
+    assert_eq!(BuildBackend::Apk.package_extensions(), [".apk"]);
+    assert_eq!(BuildBackend::Opkg.package_extensions(), [".ipk"]);
+    assert_eq!(
+      BuildBackend::Pica.package_extensions(),
+      [".ipk", ".apk"],
+      "pica unpacks containers itself and keeps both formats"
+    );
     assert_eq!(BuildBackend::Opkg.output_subdir(), "opkg");
     assert_eq!(BuildBackend::Apk.output_subdir(), "apk");
-    assert_eq!(BuildBackend::None.output_subdir(), "none");
-    assert!(!BuildBackend::None.is_native());
-    assert!(BuildBackend::Apk.is_native());
+    assert_eq!(BuildBackend::Pica.output_subdir(), "pica");
+  }
+
+  #[test]
+  fn every_backend_ships_containers() {
+    for backend in [BuildBackend::Opkg, BuildBackend::Apk, BuildBackend::Pica] {
+      assert!(backend.expects_containers(), "{backend:?}");
+      assert!(!backend.package_extensions().is_empty(), "{backend:?}");
+    }
   }
 
   #[test]
   fn rejects_unknown_backend() {
     assert!(parse_targets(Some("pacman"), &[]).is_err());
+  }
+
+  #[test]
+  fn the_retired_none_target_is_rejected() {
+    let err = parse_targets(Some("none"), &[]).expect_err("`none` was replaced by `pica`");
+    assert!(err.to_string().contains("unsupported package manager"), "{err}");
   }
 }

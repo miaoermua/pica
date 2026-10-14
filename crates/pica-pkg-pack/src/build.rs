@@ -72,7 +72,8 @@ pub(crate) fn main_build(pkgdir: &Path, outdir: Option<PathBuf>, pkgmgr: Option<
   }
 
   let pkgs_dir = pkgdir.join(PKGS);
-  warn_on_unbuilt_backends(&pkgs_dir, &backends);
+  check_unbuilt_backends(&pkgs_dir, &backends)?;
+  check_pica_declares_no_dependencies(&manifest, &backends)?;
 
   if !has_payload(pkgdir, &pkgs_dir, &backends) {
     return Err(PicaError::msg(format!(
@@ -100,7 +101,7 @@ pub(crate) fn main_build(pkgdir: &Path, outdir: Option<PathBuf>, pkgmgr: Option<
     // Matrix layout is resolved per backend, so an arch-specific opkg build and
     // a noarch-only apk build can coexist in one pkgdir.
     let backend_root = pkgs_dir.join(backend.as_str());
-    let has_matrix = backend.is_native() && has_platform_arch_matrix(&backend_root);
+    let has_matrix = backend.expects_containers() && has_platform_arch_matrix(&backend_root);
 
     if has_matrix {
       for build_platform in collect_platforms(&[backend_root.as_path()])? {
@@ -140,17 +141,23 @@ pub(crate) fn main_build(pkgdir: &Path, outdir: Option<PathBuf>, pkgmgr: Option<
   Ok(())
 }
 
+/// `pkgs/<backend>/` counts as payload for every backend that ships containers,
+/// `pica` included: it is the containers, not `root/`, that make such a package
+/// worth installing.
 fn has_payload(pkgdir: &Path, pkgs_dir: &Path, backends: &[BuildBackend]) -> bool {
   if pkgdir.join(SCRIPTS).is_dir() || pkgdir.join(ROOT).is_dir() {
     return true;
   }
-  backends.iter().any(|backend| backend.is_native() && pkgs_dir.join(backend.as_str()).is_dir())
+  backends
+    .iter()
+    .any(|backend| backend.expects_containers() && pkgs_dir.join(backend.as_str()).is_dir())
 }
 
 /// A pkgdir that ships `pkgs/apk/` but declares only `targets = opkg` is almost
-/// always a forgotten declaration, and used to fail silently.
-fn warn_on_unbuilt_backends(pkgs_dir: &Path, backends: &[BuildBackend]) {
-  let Ok(entries) = fs::read_dir(pkgs_dir) else { return };
+/// always a forgotten declaration. Warning about it dropped those containers
+/// from every artifact, so the build stops instead.
+fn check_unbuilt_backends(pkgs_dir: &Path, backends: &[BuildBackend]) -> PicaResult<()> {
+  let Ok(entries) = fs::read_dir(pkgs_dir) else { return Ok(()) };
 
   for entry in entries.flatten() {
     let path = entry.path();
@@ -161,9 +168,42 @@ fn warn_on_unbuilt_backends(pkgs_dir: &Path, backends: &[BuildBackend]) {
     let known = BuildBackend::parse(&name).is_ok();
     let selected = backends.iter().any(|backend| backend.as_str() == name);
     if known && !selected {
-      msg2(format!("warning: {PKGS}/{name}/ present but not in targets, skipping"));
+      return Err(PicaError::msg(format!(
+        "{PKGS}/{name}/ present but {name} is not in targets; add it to targets or remove the directory"
+      )));
     }
   }
+
+  Ok(())
+}
+
+/// Pica owns its files but does not resolve dependencies, so a `pica` target
+/// that declares any would ship a package whose dependencies nobody installs.
+/// Both the build and the install reject that combination (D3).
+fn check_pica_declares_no_dependencies(
+  manifest: &Manifest,
+  backends: &[BuildBackend],
+) -> PicaResult<()> {
+  if !backends.contains(&BuildBackend::Pica) {
+    return Ok(());
+  }
+
+  for key in ["app", "base", "kmod"] {
+    let declared: Vec<String> = manifest
+      .get_array_for(key, BuildBackend::Pica.as_str())
+      .into_iter()
+      .filter(|item| !item.trim().is_empty())
+      .collect();
+    if !declared.is_empty() {
+      return Err(PicaError::msg(format!(
+        "`{key}` declares {} but the pica backend cannot resolve dependencies; \
+         build it with `targets = opkg` or `targets = apk`, or declare the dependency per backend (`{key}.opkg = ...`)",
+        declared.join(" ")
+      )));
+    }
+  }
+
+  Ok(())
 }
 
 pub(crate) fn build_one(req: &BuildRequest<'_>) -> PicaResult<()> {
@@ -231,7 +271,7 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
     copy_dir_recursive(&root_src, &tmpdir.join(ROOT))?;
   }
 
-  if req.backend.is_native() {
+  if req.backend.expects_containers() {
     stage_packages(req, &tmpdir.join(PKGS))?;
   }
 
@@ -290,8 +330,8 @@ fn stage_packages(req: &BuildRequest<'_>, dst: &Path) -> PicaResult<()> {
     backend_root
   };
 
-  let extension = req.backend.package_extension().expect("native backend has an extension");
-  let copied = copy_packages_flat(&source, dst, extension)?;
+  let extensions = req.backend.package_extensions();
+  let copied = copy_packages_flat(&source, dst, extensions)?;
   if copied > 0 {
     return Ok(());
   }
@@ -303,7 +343,8 @@ fn stage_packages(req: &BuildRequest<'_>, dst: &Path) -> PicaResult<()> {
     Ok(())
   } else {
     Err(PicaError::msg(format!(
-      "no {extension} files found for the {} backend in {} (found: {})",
+      "no {} files found for the {} backend in {} (found: {})",
+      extensions.join(" or "),
       req.backend.as_str(),
       source.display(),
       found.join(" ")
@@ -311,9 +352,9 @@ fn stage_packages(req: &BuildRequest<'_>, dst: &Path) -> PicaResult<()> {
   }
 }
 
-fn copy_packages_flat(source: &Path, dst: &Path, extension: &str) -> PicaResult<usize> {
+fn copy_packages_flat(source: &Path, dst: &Path, extensions: &[&str]) -> PicaResult<usize> {
   let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
-  collect_packages(source, extension, &mut files)?;
+  collect_packages(source, extensions, &mut files)?;
   if files.is_empty() {
     return Ok(0);
   }
@@ -325,15 +366,19 @@ fn copy_packages_flat(source: &Path, dst: &Path, extension: &str) -> PicaResult<
   Ok(files.len())
 }
 
-fn collect_packages(dir: &Path, extension: &str, out: &mut BTreeMap<String, PathBuf>) -> PicaResult<()> {
+fn collect_packages(
+  dir: &Path,
+  extensions: &[&str],
+  out: &mut BTreeMap<String, PathBuf>,
+) -> PicaResult<()> {
   for entry in fs::read_dir(dir)? {
     let entry = entry?;
     let path = entry.path();
     if path.is_dir() {
-      collect_packages(&path, extension, out)?;
+      collect_packages(&path, extensions, out)?;
       continue;
     }
-    if !has_extension(&path, extension) {
+    if !has_extension(&path, extensions) {
       continue;
     }
     let name = entry.file_name().to_string_lossy().to_string();
@@ -370,11 +415,11 @@ fn list_extensions(dir: &Path) -> Vec<String> {
   found
 }
 
-fn has_extension(path: &Path, extension: &str) -> bool {
-  path
-    .extension()
-    .and_then(|value| value.to_str())
-    .is_some_and(|value| format!(".{value}").eq_ignore_ascii_case(extension))
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+  path.extension().and_then(|value| value.to_str()).is_some_and(|value| {
+    let dotted = format!(".{value}");
+    extensions.iter().any(|extension| dotted.eq_ignore_ascii_case(extension))
+  })
 }
 
 /// Writes the per-backend repo index. Top-level fields are filled from the
@@ -448,6 +493,37 @@ mod tests {
     fs::write(root.join("manifest"), manifest).expect("write manifest");
   }
 
+  /// Builds a pkgdir with `manifest` and returns the failure message as a plain
+  /// string, so assertions read without importing the error type.
+  fn build_with_manifest(root: &Path, manifest: &str) -> Result<(), String> {
+    write_pkgdir(root, manifest);
+    super::main_build(root, Some(root.join("out")), None).map_err(|err| err.to_string())
+  }
+
+  /// Names of the entries inside a built artifact, as `tar -tzf` prints them.
+  fn artifact_entries(artifact: &Path) -> String {
+    let output = std::process::Command::new("tar")
+      .arg("-tzf")
+      .arg(artifact)
+      .output()
+      .expect("run tar");
+    assert!(output.status.success(), "tar -tzf failed for {}", artifact.display());
+    String::from_utf8_lossy(&output.stdout).to_string()
+  }
+
+  /// The single artifact a build wrote under `out/<backend>/`.
+  fn artifact(root: &Path, backend: &str) -> std::path::PathBuf {
+    let dir = root.join("out").join(backend);
+    let mut found: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+      .unwrap_or_else(|err| panic!("no artifacts in {}: {err}", dir.display()))
+      .flatten()
+      .map(|entry| entry.path())
+      .filter(|path| path.to_string_lossy().ends_with(".pkg.tar.gz"))
+      .collect();
+    assert_eq!(found.len(), 1, "expected exactly one artifact in {}", dir.display());
+    found.remove(0)
+  }
+
   const BASE_MANIFEST: &str = "pkgname = hello\nappname = hello\npkgver = 1.0.0\npkgrel = 1\nos = linux\n";
 
   #[test]
@@ -459,11 +535,28 @@ mod tests {
     fs::write(source.join("one.ipk"), b"ipk").expect("write ipk");
 
     let dst = tmp.path().join("out");
-    let copied = copy_packages_flat(tmp.path().join("apk").as_path(), &dst, ".apk").expect("copy");
+    let copied = copy_packages_flat(tmp.path().join("apk").as_path(), &dst, &[".apk"]).expect("copy");
     assert_eq!(copied, 1);
     assert!(dst.join("one.apk").is_file());
     assert!(!dst.join("one.ipk").exists());
     assert_eq!(list_extensions(&dst), vec![".apk".to_string()]);
+  }
+
+  #[test]
+  fn pica_keeps_both_container_formats() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let source = tmp.path().join("pica");
+    fs::create_dir_all(&source).expect("mkdir nested");
+    fs::write(source.join("one.apk"), b"apk").expect("write apk");
+    fs::write(source.join("two.ipk"), b"ipk").expect("write ipk");
+    fs::write(source.join("notes.txt"), b"text").expect("write stray file");
+
+    let dst = tmp.path().join("out");
+    let copied = copy_packages_flat(&source, &dst, BuildBackend::Pica.package_extensions()).expect("copy");
+    assert_eq!(copied, 2, "pica unpacks both formats itself");
+    assert!(dst.join("one.apk").is_file());
+    assert!(dst.join("two.ipk").is_file());
+    assert!(!dst.join("notes.txt").exists());
   }
 
   #[test]
@@ -476,7 +569,7 @@ mod tests {
     fs::write(a.join("same.apk"), b"x").expect("write a");
     fs::write(b.join("same.apk"), b"y").expect("write b");
 
-    let err = copy_packages_flat(tmp.path(), &tmp.path().join("out"), ".apk").expect_err("must fail");
+    let err = copy_packages_flat(tmp.path(), &tmp.path().join("out"), &[".apk"]).expect_err("must fail");
     assert!(err.to_string().contains("duplicate package file name"));
   }
 
@@ -579,5 +672,115 @@ mod tests {
 
     let err = main_build(&root, Some(root.join("out")), None).expect_err("empty package");
     assert!(err.to_string().contains("would be empty"));
+  }
+
+  #[test]
+  fn builds_a_scripts_only_package_for_every_backend() {
+    for backend in ["opkg", "apk", "pica"] {
+      let tmp = tempfile::tempdir().expect("create temp dir");
+      let root = tmp.path().to_path_buf();
+      fs::create_dir_all(root.join("scripts")).expect("mkdir scripts");
+      fs::write(root.join("scripts/install"), "#!/bin/sh\nexit 0\n").expect("write script");
+
+      build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = {backend}\n")).expect("build");
+
+      let built = artifact(&root, backend);
+      assert!(built.is_file(), "{}", built.display());
+      assert!(artifact_entries(&built).contains("scripts/install"), "{backend}");
+    }
+  }
+
+  #[test]
+  fn builds_a_root_only_package() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
+
+    let built = artifact(&root, "pica");
+    assert!(built.is_file(), "{}", built.display());
+    assert!(artifact_entries(&built).contains("root/etc/demo.conf"));
+  }
+
+  #[test]
+  fn builds_a_pkgs_only_package_for_pica() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
+    fs::write(root.join("pkgs/pica/demo.ipk"), b"ipk").expect("write container");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
+
+    let built = artifact(&root, "pica");
+    assert!(built.is_file(), "{}", built.display());
+    assert!(
+      artifact_entries(&built).contains("pkgs/demo.ipk"),
+      "pkgs/<backend>/ counts as payload and must be flattened into the artifact"
+    );
+  }
+
+  #[test]
+  fn builds_a_pkgs_and_root_package() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
+    fs::write(root.join("pkgs/pica/demo.ipk"), b"ipk").expect("write container");
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
+
+    let entries = artifact_entries(&artifact(&root, "pica"));
+    assert!(entries.contains("pkgs/demo.ipk"), "{entries}");
+    assert!(entries.contains("root/etc/demo.conf"), "{entries}");
+  }
+
+  #[test]
+  fn pica_target_with_declared_dependencies_fails() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase = luci-base\n"))
+      .expect_err("pica cannot resolve dependencies");
+    assert!(err.contains("cannot resolve dependencies"), "{err}");
+    assert!(err.contains("targets = opkg"), "the message must suggest opkg/apk: {err}");
+    assert!(err.contains("base.opkg"), "the message must offer the scoped form: {err}");
+  }
+
+  #[test]
+  fn scoped_dependencies_do_not_block_a_pica_build() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    fs::create_dir_all(root.join("pkgs/opkg")).expect("mkdir pkgs");
+    fs::write(root.join("pkgs/opkg/demo.ipk"), b"ipk").expect("write container");
+
+    build_with_manifest(
+      &root,
+      &format!("{BASE_MANIFEST}targets = opkg, pica\nbase.opkg = luci-base\n"),
+    )
+    .expect("a dependency that only opkg installs must not block the pica target");
+
+    assert!(artifact(&root, "pica").is_file());
+  }
+
+  #[test]
+  fn pkgs_dir_for_an_unselected_backend_fails() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+    fs::create_dir_all(root.join("pkgs/opkg")).expect("mkdir pkgs");
+    fs::write(root.join("pkgs/opkg/demo.ipk"), b"ipk").expect("write container");
+
+    let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = apk\n"))
+      .expect_err("containers for an unbuilt backend must not be dropped silently");
+    assert!(err.contains("pkgs/opkg/ present but opkg is not in targets"), "{err}");
   }
 }

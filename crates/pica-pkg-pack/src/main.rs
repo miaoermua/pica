@@ -13,13 +13,13 @@ use std::process;
 
 fn usage() {
   println!(
-    "Usage:\n  pica-pack build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|none|opkg,apk]\n\
+    "Usage:\n  pica-pack build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|pica|opkg,apk]\n\
      \n\
      <pkgdir> layout:\n  \
        manifest                         required, key = value (see docs/standard.md)\n  \
        scripts/                         optional, lifecycle scripts (install/update/remove/.env)\n  \
        root/                            optional, files mirrored onto the target rootfs\n  \
-       pkgs/<backend>/                  optional, system packages for that backend\n  \
+       pkgs/<backend>/                  optional, containers for that backend; pica unpacks them itself\n  \
        pkgs/<backend>/<platform>/<arch>/  optional matrix layout\n  \
        LICENSE                          optional\n\
      \n\
@@ -30,11 +30,11 @@ fn usage() {
      that combination's packages, flattened into pkgs/.\n\
      \n\
      Artifact filename:\n  \
-       <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-none].pkg.tar.gz\n  \
+       <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-pica].pkg.tar.gz\n  \
        (the platform segment is omitted when platform = all)\n\
      \n\
      Output (one directory per backend):\n  \
-       opkg -> <outdir>/opkg/    apk -> <outdir>/apk/    none -> <outdir>/none/\n  \
+       opkg -> <outdir>/opkg/    apk -> <outdir>/apk/    pica -> <outdir>/pica/\n  \
        each with its own repo.json and SHA256SUMS"
   );
 }
@@ -90,7 +90,7 @@ fn run() -> PicaResult<()> {
           }
           "--pkgmgr" => {
             let Some(value) = rest.get(index + 1) else {
-              return Err(PicaError::msg("--pkgmgr requires opkg, apk, none, or a comma-separated list"));
+              return Err(PicaError::msg("--pkgmgr requires opkg, apk, pica, or a comma-separated list"));
             };
             pkgmgr = Some(value.clone());
             index += 2;

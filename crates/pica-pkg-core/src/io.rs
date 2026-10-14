@@ -78,9 +78,22 @@ pub fn sha256_file(path: &Path) -> PicaResult<String> {
 /// # Errors
 /// Returns an error if the temporary directory cannot be created.
 pub fn make_temp_dir(prefix: &str) -> PicaResult<PathBuf> {
-  let path = env::temp_dir().join(format!("{prefix}-{}-{}", process::id(), now_unix_nanos()));
-  fs::create_dir_all(&path)?;
-  Ok(path)
+  // The name has to be unique, and the clock does not guarantee that: it can
+  // report the same tick to two callers, which in one process means the same
+  // pid as well. `create_dir` refuses a path that is taken — including a
+  // leftover of an earlier, killed run — so a failed attempt just moves on
+  // instead of handing out a directory that is not empty and not ours.
+  for attempt in 0..64u32 {
+    let path =
+      env::temp_dir().join(format!("{prefix}-{}-{}-{attempt}", process::id(), now_unix_nanos()));
+    match fs::create_dir(&path) {
+      Ok(()) => return Ok(path),
+      Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(err) => return Err(PicaError::from(err)),
+    }
+  }
+
+  Err(PicaError::msg(format!("could not create a temporary directory for {prefix}")))
 }
 
 /// # Errors
@@ -307,9 +320,27 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-  use super::{install_payload, lexical_normalize, remove_payload, PayloadInstall};
+  use super::{
+    install_payload, lexical_normalize, make_temp_dir, remove_payload, PayloadInstall,
+  };
   use std::fs;
   use std::path::{Path, PathBuf};
+
+  #[test]
+  fn every_temporary_directory_is_a_new_one() {
+    // Callers unpack into these and expect them to be empty, so two calls that
+    // land on the same clock tick must not hand out the same directory.
+    let first = make_temp_dir("pica-test").expect("first temp dir");
+    let second = make_temp_dir("pica-test").expect("second temp dir");
+
+    assert_ne!(first, second);
+    assert!(first.is_dir());
+    assert!(second.is_dir());
+    assert_eq!(fs::read_dir(&first).expect("read first").count(), 0);
+
+    let _ = fs::remove_dir_all(&first);
+    let _ = fs::remove_dir_all(&second);
+  }
 
   #[cfg(unix)]
   use std::os::unix::fs::symlink;

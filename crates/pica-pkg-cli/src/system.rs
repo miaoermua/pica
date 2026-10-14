@@ -3,8 +3,41 @@ use crate::app::{
 };
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Filesystem root an install or removal writes into.
+///
+/// Real invocations use `/`. Tests pass a temporary directory, which is the only
+/// way to exercise the whole path — including what lands in `/usr/lib/pica` and
+/// what a rollback has to undo — without touching the host.
+#[derive(Debug, Clone)]
+pub struct TargetRoot {
+  root: PathBuf,
+}
+
+impl TargetRoot {
+  #[must_use]
+  pub fn system() -> Self {
+    Self::new("/")
+  }
+
+  #[must_use]
+  pub fn new(root: impl Into<PathBuf>) -> Self {
+    Self { root: root.into() }
+  }
+
+  #[must_use]
+  pub fn as_path(&self) -> &Path {
+    &self.root
+  }
+
+  /// Maps an absolute target path (such as `/usr/lib/pica`) onto this root.
+  #[must_use]
+  pub fn resolve(&self, absolute: &str) -> PathBuf {
+    self.root.join(absolute.trim_start_matches('/'))
+  }
+}
 
 pub fn fetch_url(
   url: &str,
@@ -130,9 +163,74 @@ pub fn run_command_capture_output(program: &str, args: &[&str]) -> CliResult<Vec
 }
 
 pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
+  run_tar(&["-xzf"], &[], pkgfile, target_dir)
+}
+
+/// Extracts a container that concatenates several tar members.
+///
+/// A `.apk` is a signature member, a control member and a data member gzipped
+/// one after another. Plain `tar -xzf` stops at the first end-of-archive marker
+/// and would unpack only the signature, so `--ignore-zeros` is what reads
+/// through the padding into the following members.
+///
+/// The flag goes *after* the archive because `-f` consumes the argument that
+/// follows it: `tar -xzf --ignore-zeros ARCHIVE` asks tar to open a member
+/// called `--ignore-zeros`. Where the flag itself is unknown the plain form is
+/// retried, which still unpacks single-member containers; the caller then
+/// reports the member it could not find.
+pub fn run_tar_extract_members(archive: &Path, target_dir: &Path) -> CliResult<()> {
+  match run_tar(&["-xzf"], &["--ignore-zeros"], archive, target_dir) {
+    Ok(()) => Ok(()),
+    Err(first) => run_tar(&["-xzf"], &[], archive, target_dir).map_err(|_| first),
+  }
+}
+
+/// Extracts a tar member whose compression is implied by its file name.
+///
+/// An `.ipk` keeps its payload in a `data.tar.<compression>` member, and the
+/// compression is whatever the builder chose, so the flags have to follow the
+/// name instead of assuming gzip. The compression is the last extension
+/// (`data.tar.gz` → `gz`), which is also what `.tgz`, `.txz` and `.tbz2` name
+/// with their short spellings, so matching on it covers both forms and reads
+/// the name case-insensitively.
+pub fn run_tar_extract_auto(archive: &Path, target_dir: &Path) -> CliResult<()> {
+  let extension = archive
+    .extension()
+    .and_then(|value| value.to_str())
+    .unwrap_or("")
+    .to_ascii_lowercase();
+
+  let flags = match extension.as_str() {
+    "gz" | "tgz" => "-xzf",
+    "xz" | "txz" => "-xJf",
+    "bz2" | "tbz2" => "-xjf",
+    "tar" => "-xf",
+    _ => {
+      return Err(CliError::new(
+        E_RUNTIME,
+        format!("unsupported container payload compression: {}", archive.display()),
+      ));
+    }
+  };
+
+  run_tar(&[flags], &[], archive, target_dir)
+}
+
+/// Runs `tar` with the archive in the place an option expects it.
+///
+/// `flags` come before the archive and `after` — anything else the archive needs
+/// to be read, such as `--ignore-zeros` — comes after it, because the argument
+/// of `-f` is whatever directly follows it.
+fn run_tar(
+  flags: &[&str],
+  after: &[&str],
+  archive: &Path,
+  target_dir: &Path,
+) -> CliResult<()> {
   let output = Command::new("tar")
-    .arg("-xzf")
-    .arg(pkgfile)
+    .args(flags)
+    .arg(archive)
+    .args(after)
     .arg("-C")
     .arg(target_dir)
     .output()
@@ -142,7 +240,10 @@ pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
     Ok(())
   } else {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    Err(CliError::new(E_RUNTIME, format!("tar extract failed: {detail}")))
+    Err(CliError::new(
+      E_RUNTIME,
+      format!("tar extract failed: {}: {detail}", archive.display()),
+    ))
   }
 }
 

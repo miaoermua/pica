@@ -4,7 +4,7 @@
 //! removal act on the wrong package database:
 //!
 //! - `pkgmgr` — *which backend owns the installed files*: `opkg`, `apk` or
-//!   `none`. Always present, never empty.
+//!   `pica`. Always present, never empty.
 //! - `source` — *how Pica obtained the package*: a repository index, a local
 //!   artifact, an artifact URL, or the backend's own feeds.
 //!
@@ -134,21 +134,24 @@ fn entry_pkgfile(entry: &Value) -> &str {
 /// 4. a recorded artifact path — Pica deployed the payload itself, so no
 ///    backend may be asked to remove anything.
 /// 5. otherwise `opkg`, the backend every earlier Pica release assumed.
+///
+/// Each field is read with [`PackageManagerKind::parse_legacy`], because a row
+/// may name the backend with the spelling it had before it became `pica`.
 #[must_use]
 pub fn entry_backend(entry: &Value) -> EntryBackend {
   let manifest = entry_manifest(entry);
 
-  if let Some(kind) = PackageManagerKind::parse(&get_scalar(manifest, "pkgmgr")) {
+  if let Some(kind) = PackageManagerKind::parse_legacy(&get_scalar(manifest, "pkgmgr")) {
     return EntryBackend { kind, origin: PkgmgrOrigin::Recorded };
   }
-  if let Some(kind) = PackageManagerKind::parse(&get_scalar(manifest, "source")) {
+  if let Some(kind) = PackageManagerKind::parse_legacy(&get_scalar(manifest, "source")) {
     return EntryBackend { kind, origin: PkgmgrOrigin::LegacySource };
   }
-  if let Some(kind) = PackageManagerKind::parse(entry_pkgfile(entry)) {
+  if let Some(kind) = PackageManagerKind::parse_legacy(entry_pkgfile(entry)) {
     return EntryBackend { kind, origin: PkgmgrOrigin::LegacyPkgfile };
   }
   if entry_pkgfile(entry).ends_with(ARTIFACT_SUFFIX) {
-    return EntryBackend { kind: PackageManagerKind::None, origin: PkgmgrOrigin::Default };
+    return EntryBackend { kind: PackageManagerKind::Pica, origin: PkgmgrOrigin::Default };
   }
 
   EntryBackend { kind: PackageManagerKind::Opkg, origin: PkgmgrOrigin::Default }
@@ -215,15 +218,54 @@ mod tests {
   }
 
   #[test]
+  fn migrates_a_row_recorded_before_the_backend_was_renamed() {
+    // `none` is what the `pica` backend was recorded as, so a row that still
+    // says it has to read back as `pica`. Falling through instead would end at
+    // the `opkg` default and hand it a payload it never installed.
+    let record = entry(&json!({ "source": "feed", "pkgmgr": "none" }), "none");
+    let resolved = entry_backend(&record);
+    assert_eq!(resolved.kind, PackageManagerKind::Pica);
+    assert_eq!(resolved.origin, PkgmgrOrigin::Recorded);
+    assert_eq!(entry_source(&record), EntrySource::Feed);
+
+    // The name may also be the only thing left in `pkgfile`.
+    let record = entry(&json!({ "source": "feed" }), "none");
+    let resolved = entry_backend(&record);
+    assert_eq!(resolved.kind, PackageManagerKind::Pica);
+    assert_eq!(resolved.origin, PkgmgrOrigin::LegacyPkgfile);
+  }
+
+  #[test]
   fn an_artifact_row_never_delegates_to_a_backend() {
     // The `opkg` default was injected at install time even for lifecycle
-    // packages, so an entry with no backend information at all must not run a
-    // package manager against a payload Pica deployed itself.
+    // packages, so a row that names no backend must not run a package manager
+    // against a payload Pica deployed itself.
+    //
+    // `pica` is both a channel name and a backend name, so a legacy `source`
+    // that says `pica` is read as naming the backend; either reading ends at the
+    // same place, which is what makes the upgrade path safe.
     let record = entry(&json!({ "source": "pica" }), "/tmp/demo.pkg.tar.gz");
     let resolved = entry_backend(&record);
-    assert_eq!(resolved.kind, PackageManagerKind::None);
-    assert_eq!(resolved.origin, PkgmgrOrigin::Default);
+    assert_eq!(resolved.kind, PackageManagerKind::Pica);
+    assert_eq!(resolved.origin, PkgmgrOrigin::LegacySource);
     assert_eq!(entry_source(&record), EntrySource::Repo);
+
+    // A channel that is not a backend name (`url`, `local`, `feed`) has to reach
+    // the same answer through the artifact rule, because otherwise the `opkg`
+    // fallback at the end of the ladder would claim it. Both that rule and the
+    // fallback report `Default`, so the backend — not the origin — is what says
+    // which one applied.
+    for (channel, source) in [
+      ("url", EntrySource::Url),
+      ("local", EntrySource::Local),
+      ("feed", EntrySource::Feed),
+    ] {
+      let record = entry(&json!({ "source": channel }), "/tmp/demo.pkg.tar.gz");
+      let resolved = entry_backend(&record);
+      assert_eq!(resolved.kind, PackageManagerKind::Pica, "source={channel}");
+      assert_eq!(resolved.origin, PkgmgrOrigin::Default, "source={channel}");
+      assert_eq!(entry_source(&record), source, "source={channel}");
+    }
   }
 
   #[test]

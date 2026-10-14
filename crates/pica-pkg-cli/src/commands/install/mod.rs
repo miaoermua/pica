@@ -79,7 +79,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let appname = parsed.appname.clone();
 
-  if !app.backend().is_native() {
+  if !app.backend().requires_system_binary() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
       format!(

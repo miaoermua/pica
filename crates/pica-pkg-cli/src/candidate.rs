@@ -82,11 +82,11 @@ pub(crate) fn find_pica_candidates_in_index(
         continue;
       }
 
-      // Backend identity: `none` packages ship a payload Pica installs itself,
-      // every other package needs its own native backend on this host.
+      // Backend identity: a `pica` package ships a payload Pica installs itself
+      // and needs nothing from the host, so it matches anywhere. `opkg` and
+      // `apk` packages need their own backend to be the one in use here.
       let backend_match = match PackageManagerKind::parse(&pkgmgr) {
-        Some(PackageManagerKind::None) => true,
-        Some(kind) => host_backend == kind,
+        Some(kind) => !kind.requires_system_binary() || host_backend == kind,
         None => false,
       };
       if !backend_match {

@@ -156,19 +156,19 @@ impl App {
     self.package_manager.as_deref().ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
   }
 
-  /// Backend identity of this invocation, including `none`.
+  /// Backend identity of this invocation, including the Pica-native `pica`.
   #[must_use]
   pub fn backend(&self) -> crate::pkgmgr::PackageManagerKind {
     self.backend
   }
 
-  /// Switches backend explicitly. A native backend whose command is absent is an
-  /// error rather than a silent fallback, so packages never land in the wrong
-  /// package database.
+  /// Switches backend explicitly. A backend that needs a system binary which is
+  /// absent is an error rather than a silent fallback, so packages never land in
+  /// the wrong package database; `pica` needs no command and always succeeds.
   pub fn select_package_manager(&mut self, value: &str) -> CliResult<()> {
     let kind = crate::pkgmgr::PackageManagerKind::parse(value)
       .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
-    if kind == crate::pkgmgr::PackageManagerKind::None {
+    if !kind.requires_system_binary() {
       self.backend = kind;
       self.package_manager = None;
       return Ok(());
@@ -301,7 +301,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       }
       "--pkgmgr" => {
         let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_CONFIG_INVALID, "--pkgmgr requires <opkg|apk|none>"));
+          return Err(CliError::new(E_CONFIG_INVALID, "--pkgmgr requires <opkg|apk|pica>"));
         };
         if crate::pkgmgr::PackageManagerKind::parse(value).is_none() {
           return Err(CliError::new(E_CONFIG_INVALID, format!("invalid --pkgmgr: {value}")));

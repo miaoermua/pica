@@ -328,7 +328,7 @@ mod tests {
       apk_base_raw.iter().map(String::as_str).filter(|item| !item.is_empty()).collect();
     assert!(apk_base.is_empty());
     assert_eq!(manifest.get_first_for("app", "apk"), "demo-v3");
-    assert_eq!(manifest.get_first_for("app", "none"), "demo");
+    assert_eq!(manifest.get_first_for("app", "pica"), "demo");
   }
 
   #[test]
@@ -339,8 +339,8 @@ mod tests {
     let comma = Manifest::from_text("targets = apk,opkg,apk\n").expect("parse");
     assert_eq!(comma.targets(), vec!["apk", "opkg"]);
 
-    let mixed = Manifest::from_text("targets = opkg, apk\ntargets = none\n").expect("parse");
-    assert_eq!(mixed.targets(), vec!["opkg", "apk", "none"]);
+    let mixed = Manifest::from_text("targets = opkg, apk\ntargets = pica\n").expect("parse");
+    assert_eq!(mixed.targets(), vec!["opkg", "apk", "pica"]);
 
     assert!(Manifest::from_text("pkgname = x").expect("parse").targets().is_empty());
   }

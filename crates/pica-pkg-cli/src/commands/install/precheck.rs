@@ -1,4 +1,4 @@
-use super::pipeline::PackageFields;
+use super::pipeline::{installs_declared_dependencies, PackageFields};
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
 };
@@ -154,6 +154,29 @@ pub(super) fn validate_package(
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
         format!("unsupported arch: pkg={} (host arches: {})", pkg.arch, host_arches.join(" ")),
+      ));
+    }
+  }
+
+  // The `pica` backend owns files but does not resolve dependencies, so a
+  // package that declares any would install cleanly while silently skipping
+  // them. The predicate is shared with the install-time gate in `pipeline`, so
+  // the check and the gate cannot disagree about who installs these.
+  if !installs_declared_dependencies(&pkg.pkgmgr) {
+    let declared: Vec<String> = ["app", "base", "kmod"]
+      .iter()
+      .flat_map(|key| manifest.get_array_for(key, &pkg.pkgmgr))
+      .filter(|dep| !dep.trim().is_empty())
+      .collect();
+    if !declared.is_empty() {
+      return Err(CliError::new(
+        E_PACKAGE_INVALID,
+        format!(
+          "package declares {} but pkgmgr={} cannot resolve dependencies; \
+           rebuild it with pkgmgr=opkg or pkgmgr=apk, or drop the dependency",
+          declared.join(" "),
+          pkg.pkgmgr
+        ),
       ));
     }
   }

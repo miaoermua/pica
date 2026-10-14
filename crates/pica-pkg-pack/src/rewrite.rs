@@ -111,6 +111,13 @@ mod tests {
   }
 
   #[test]
+  fn writes_the_pica_backend_into_the_artifact() {
+    let out = rewrite("pkgname = hello\ntargets = pica\n", "pica");
+    assert!(out.contains("pkgmgr = pica"));
+    assert!(!out.contains("targets"));
+  }
+
+  #[test]
   fn strips_build_only_targets_field() {
     let out = rewrite("pkgname = hello\ntargets = opkg\ntargets = apk\n", "apk");
     assert!(!out.contains("targets"), "targets is build-time only");

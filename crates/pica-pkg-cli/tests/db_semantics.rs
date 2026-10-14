@@ -182,9 +182,9 @@ impl Sandbox {
   }
 
   /// Builds a minimal artifact whose only payload is `pkgs/<declared>/`, which
-  /// is the one payload kind a `none` install ignores. That keeps install tests
-  /// from writing to the host file system, since `root/` and `scripts/` are
-  /// deployed at their real absolute paths.
+  /// a `pica` install ignores because it reads `pkgs/pica/` only. That keeps
+  /// install tests from writing to the host file system, since `root/` and
+  /// `scripts/` are deployed at their real absolute paths.
   fn artifact(&self, pkgname: &str, declared: &str) -> PathBuf {
     let src = self.dir.path().join(format!("src-{pkgname}"));
     fs::create_dir_all(src.join("pkgs").join(declared)).expect("create pkgdir");
@@ -253,13 +253,13 @@ fn qi_normalises_a_legacy_feed_row() {
 }
 
 #[test]
-fn qi_reports_none_for_a_backendless_artifact_row() {
+fn qi_reports_pica_for_a_backendless_artifact_row() {
   let sandbox = Sandbox::new(BACKENDLESS_ARTIFACT_ROW);
 
   let assert = sandbox.run(&["-Qi", "old-artifact"]).success();
   let stdout = stdout_of(&assert);
 
-  assert_eq!(field(&stdout, "PkgMgr"), "none");
+  assert_eq!(field(&stdout, "PkgMgr"), "pica");
   assert_eq!(
     sandbox.calls(),
     "",
@@ -347,18 +347,18 @@ fn upgrade_skips_rows_that_no_index_can_resolve() {
 
 #[test]
 fn install_records_the_backend_in_use_not_the_declared_one() {
-  // The artifact declares `apk`, but `--pkgmgr none` installs it without any
+  // The artifact declares `apk`, but `--pkgmgr pica` installs it without any
   // package manager. Recording the declared value would make `-R` drive apk
   // against files apk never touched.
   let sandbox = Sandbox::new(EMPTY_DB);
   let artifact = sandbox.artifact("declared-apk", "apk");
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
-  sandbox.run(&["--pkgmgr", "none", "-U", artifact]).success();
+  sandbox.run(&["--pkgmgr", "pica", "-U", artifact]).success();
 
   let manifest = &sandbox.db()["installed"]["declared-apk"]["manifest"];
   assert_eq!(manifest["source"], "local");
-  assert_eq!(manifest["pkgmgr"], "none");
+  assert_eq!(manifest["pkgmgr"], "pica");
 
   // Removal follows the record rather than the declaration.
   sandbox.run(&["-R", "declared-apk"]).success();

@@ -187,14 +187,13 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   Ok(())
 }
 
-/// Dependencies the native backend reports for an entry it installed.
+/// Dependencies the system backend reports for an entry it installed.
 ///
 /// The backend comes from the entry itself, so rows written before `pkgmgr`
-/// existed still resolve. Pica-native (`none`) packages have no backend to ask
-/// and declare their dependencies in the manifest instead, so the line is
-/// omitted for them. A missing backend command is not an error here: showing
-/// information must not fail because the host cannot talk to its package
-/// manager.
+/// existed still resolve. The `pica` backend has no command to ask and declares
+/// its dependencies in the manifest instead, so the line is omitted for it. A
+/// missing backend command is not an error here: showing information must not
+/// fail because the host cannot talk to its package manager.
 fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
   let manifest = entry_manifest(entry);
   let pkgname = manifest_get_first(manifest, "pkgname");
@@ -202,7 +201,7 @@ fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
     return None;
   }
   let kind = installed::entry_backend(entry).kind;
-  if !kind.is_native() {
+  if !kind.requires_system_binary() {
     return None;
   }
   app.select_package_manager(kind.as_str()).ok()?;

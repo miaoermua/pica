@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 pub const REPO_SCHEMA: i64 = 2;
 pub const PKG_EXTENSION: &str = ".pkg.tar.gz";
-pub const SUPPORTED_PKGMGRS: [&str; 3] = ["opkg", "apk", "none"];
+pub const SUPPORTED_PKGMGRS: [&str; 3] = ["opkg", "apk", "pica"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageIndex {
@@ -176,7 +176,7 @@ fn validate_filename(pkg: &Package) -> PicaResult<()> {
 pub fn filename_suffix(pkgmgr: &str) -> &'static str {
   match pkgmgr {
     "apk" => "-apk",
-    "none" => "-none",
+    "pica" => "-pica",
     _ => "",
   }
 }
@@ -229,7 +229,7 @@ mod tests {
   fn filename_carries_backend_suffix() {
     assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "opkg"), "hello-1.0.0-1-all.pkg.tar.gz");
     assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "apk"), "hello-1.0.0-1-all-apk.pkg.tar.gz");
-    assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "none"), "hello-1.0.0-1-all-none.pkg.tar.gz");
+    assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "pica"), "hello-1.0.0-1-all-pica.pkg.tar.gz");
     assert_eq!(
       package_filename("hello", "1.0.0", "1", "arm64", "aarch64_cortex-a53", "apk"),
       "hello-1.0.0-1-arm64-aarch64_cortex-a53-apk.pkg.tar.gz"
@@ -237,10 +237,25 @@ mod tests {
   }
 
   #[test]
-  fn none_and_opkg_artifacts_no_longer_collide() {
+  fn pica_and_opkg_artifacts_do_not_collide() {
     let opkg = package_filename("demo", "1.0.0", "1", "all", "all", "opkg");
-    let none = package_filename("demo", "1.0.0", "1", "all", "all", "none");
-    assert_ne!(opkg, none);
+    let pica = package_filename("demo", "1.0.0", "1", "all", "all", "pica");
+    assert_ne!(opkg, pica);
+  }
+
+  #[test]
+  fn accepts_schema_two_with_the_pica_backend() {
+    let parsed = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica")]))
+      .expect("valid pica repo");
+    assert_eq!(parsed.packages[0].pkgmgr, "pica");
+  }
+
+  #[test]
+  fn rejects_the_retired_none_backend() {
+    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-none.pkg.tar.gz", "none")]))
+      .expect_err("`none` was replaced by `pica`");
+    assert!(err.to_string().contains("unsupported pkgmgr"), "{err}");
+    assert!(err.to_string().contains("pica"), "the error must name the supported set: {err}");
   }
 
   #[test]
