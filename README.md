@@ -1,14 +1,16 @@
 # Pica 喜鹊
 
-The ultimate OpenWrt Pkgmgr solution
+PICA — Pica Is a Compact Archiver
 
-Pica Is a Compact Archiver - Pica 喜鹊是一款紧凑型打包器
+A compact package manager for OpenWrt, built on a self-describing archive format.
+
+Pica 喜鹊是一款紧凑的 OpenWrt 包管理器。
 
 ![rust](https://ziadoua.github.io/m3-Markdown-Badges/badges/Rust/rust1.svg)
 ![shell](https://ziadoua.github.io/m3-Markdown-Badges/badges/Shell/shell1.svg)
 ![licence](https://ziadoua.github.io/m3-Markdown-Badges/badges/LicenceGPLv3/licencegplv31.svg)
 
-Pica 简单紧凑而不落后，运用 Arch 系包管理器类似的滚动更新机制，在 OpenWrt 上体验强大统一且先进的软件包管理器。
+Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制，在不同 OpenWrt 分支上提供一致的包管理体验。
 
 ## 特性
 
