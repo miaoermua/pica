@@ -102,6 +102,8 @@ pub struct Options {
   pub fetch_timeout: u64,
   pub fetch_retry: u32,
   pub fetch_retry_delay: u64,
+  /// Explicit `--pkgmgr` value. Highest-priority backend selection.
+  pub pkgmgr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -132,16 +134,19 @@ pub struct App {
   pub paths: Paths,
   pub options: Options,
   pub package_manager: Option<Box<dyn crate::pkgmgr::PackageManager>>,
+  pub backend: crate::pkgmgr::PackageManagerKind,
   pub json_last_phase: String,
   pub json_has_text: bool,
 }
 
 impl App {
   pub fn new(paths: Paths, options: Options) -> Self {
+    let backend = crate::pkgmgr::detect_kind();
     Self {
       paths,
       options,
-      package_manager: crate::pkgmgr::detect_package_manager(),
+      package_manager: crate::pkgmgr::package_manager_for(backend),
+      backend,
       json_last_phase: String::new(),
       json_has_text: false,
     }
@@ -151,20 +156,43 @@ impl App {
     self.package_manager.as_deref().ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
   }
 
+  /// Backend identity of this invocation, including `none`.
+  #[must_use]
+  pub fn backend(&self) -> crate::pkgmgr::PackageManagerKind {
+    self.backend
+  }
+
+  /// Switches backend explicitly. A native backend whose command is absent is an
+  /// error rather than a silent fallback, so packages never land in the wrong
+  /// package database.
   pub fn select_package_manager(&mut self, value: &str) -> CliResult<()> {
-    if value == "none" {
+    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
+    if kind == crate::pkgmgr::PackageManagerKind::None {
+      self.backend = kind;
       self.package_manager = None;
       return Ok(());
     }
-    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
-      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
-    if self.package_manager.as_ref().is_some_and(|manager| manager.kind() == kind) {
+    if self.backend == kind && self.package_manager.is_some() {
       return Ok(());
     }
     let manager = crate::pkgmgr::package_manager_for(kind).ok_or_else(|| {
       CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
     })?;
+    self.backend = kind;
     self.package_manager = Some(manager);
+    Ok(())
+  }
+
+  /// Applies backend selection in priority order: `--pkgmgr`, then the config
+  /// file, then the auto-detected backend chosen in [`App::new`].
+  pub fn apply_backend_config(&mut self) -> CliResult<()> {
+    if let Some(value) = self.options.pkgmgr.clone() {
+      return self.select_package_manager(&value);
+    }
+    if let Some(value) = conf_get_pkgmgr(&self.paths.conf_file) {
+      return self.select_package_manager(&value);
+    }
     Ok(())
   }
 
@@ -223,6 +251,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut fetch_timeout = 30u64;
   let mut fetch_retry = 2u32;
   let mut fetch_retry_delay = 1u64;
+  let mut pkgmgr = None;
   let mut positional = Vec::new();
 
   let mut index = 0;
@@ -270,6 +299,16 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
         fetch_retry_delay = parse_u64_option("--fetch-retry-delay", value)?;
         index += 2;
       }
+      "--pkgmgr" => {
+        let Some(value) = args.get(index + 1) else {
+          return Err(CliError::new(E_CONFIG_INVALID, "--pkgmgr requires <opkg|apk|none>"));
+        };
+        if crate::pkgmgr::PackageManagerKind::parse(value).is_none() {
+          return Err(CliError::new(E_CONFIG_INVALID, format!("invalid --pkgmgr: {value}")));
+        }
+        pkgmgr = Some(value.clone());
+        index += 2;
+      }
       other => {
         positional.push(other.to_string());
         index += 1;
@@ -285,6 +324,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       fetch_timeout,
       fetch_retry,
       fetch_retry_delay,
+      pkgmgr,
     },
     positional,
   ))
@@ -328,6 +368,7 @@ pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
     let content = json!({
         "repos": [],
         "i18n": "zh-cn",
+        "pkgmgr": Value::Null,
     });
     write_json_atomic_pretty(&paths.conf_file, &content)?;
   }
@@ -394,6 +435,15 @@ pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
   Some(value.to_string())
 }
 
+/// Reads the configured backend. `null`, a missing key and an empty string all
+/// mean "auto-detect"; an unrecognized value is an error so a typo cannot
+/// silently pick the wrong package database.
+pub(crate) fn conf_get_pkgmgr(conf_file: &Path) -> Option<String> {
+  let conf = read_json_file(conf_file).ok()?;
+  let value = conf.get("pkgmgr")?.as_str()?.trim();
+  (!value.is_empty()).then(|| value.to_string())
+}
+
 pub(crate) fn resolve_lang(conf_file: &Path) -> String {
   let conf = read_json_file(conf_file).ok();
   conf
@@ -403,7 +453,9 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{parse_options, FeedPolicy};
+  use super::{conf_get_pkgmgr, parse_options, FeedPolicy};
+  use serde_json::json;
+  use std::fs;
 
   #[test]
   fn parse_options_fetch_settings() {
@@ -444,5 +496,42 @@ mod tests {
     let input = vec!["--fetch-retry-delay".to_string(), "-1".to_string()];
     let err = parse_options(&input).expect_err("must reject invalid retry delay");
     assert!(err.message.contains("--fetch-retry-delay"));
+  }
+
+  #[test]
+  fn parse_options_reads_explicit_pkgmgr() {
+    let input = vec!["--pkgmgr".to_string(), "apk".to_string(), "-S".to_string(), "demo".to_string()];
+    let (options, positional) = parse_options(&input).expect("parse options");
+    assert_eq!(options.pkgmgr.as_deref(), Some("apk"));
+    assert_eq!(positional, vec!["-S".to_string(), "demo".to_string()]);
+  }
+
+  #[test]
+  fn parse_options_rejects_unknown_pkgmgr() {
+    let err = parse_options(&["--pkgmgr".to_string(), "pacman".to_string()]).expect_err("must reject unknown backend");
+    assert!(err.message.contains("--pkgmgr"));
+  }
+
+  #[test]
+  fn config_backend_ignores_null_and_empty_values() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "pkgmgr": null }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    fs::write(&conf, json!({ "pkgmgr": "  " }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    fs::write(&conf, json!({ "repos": [] }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    assert_eq!(conf_get_pkgmgr(&dir.path().join("missing.json")), None);
+  }
+
+  #[test]
+  fn config_backend_is_returned_verbatim_for_validation() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "pkgmgr": " opkg " }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("opkg"));
+    fs::write(&conf, json!({ "pkgmgr": "bogus" }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("bogus"));
   }
 }

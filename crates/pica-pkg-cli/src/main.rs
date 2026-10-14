@@ -9,19 +9,19 @@ mod system;
 
 use crate::app::{
   parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode, Options, Paths,
-  E_ARG_INVALID, E_MISSING_COMMAND,
+  E_ARG_INVALID,
 };
 use crate::commands::{install, query, remove, sync, upgrade};
 use crate::lock::LockGuard;
 use crate::state::cleanup_pkg_cache_with_notice;
-use crate::system::{has_command, need_cmd};
+use crate::system::need_cmd;
 use pica_pkg_core::PICA_VERSION;
 use std::env;
 use std::process;
 
 fn usage() {
   println!(
-        "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install by detected system package manager\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: apk or opkg, tar, and one fetcher (apk is preferred when both exist) (uclient-fetch/wget/curl) for URL install/sync.\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
+        "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install via the selected system package manager\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica --pkgmgr <backend> opkg|apk|none (overrides manifest and config)\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: tar and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Backends: apk, opkg, none. Resolution order is --pkgmgr, then the package\n    manifest, then /etc/pica/pica.json \"pkgmgr\", then auto-detection (apk before opkg).\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
     );
 }
 
@@ -41,6 +41,7 @@ fn main() {
           fetch_timeout: 30,
           fetch_retry: 2,
           fetch_retry_delay: 1,
+          pkgmgr: None,
         },
       );
       app.emit_error(&err);
@@ -49,6 +50,10 @@ fn main() {
   };
 
   let mut app = App::new(paths, options);
+  if let Err(err) = app.apply_backend_config() {
+    app.emit_error(&err);
+    process::exit(1);
+  }
 
   if args.is_empty() {
     usage();
@@ -65,12 +70,6 @@ fn main() {
     println!("{PICA_VERSION}");
     app.emit_success(command, PICA_VERSION);
     return;
-  }
-
-  if app.options.json_mode != JsonMode::None && !has_command("jq") {
-    let err = CliError::new(E_MISSING_COMMAND, "--json/--json-errors requires command: jq");
-    app.emit_error(&err);
-    process::exit(1);
   }
 
   let lock_guard = match LockGuard::acquire(&app.paths.lock_file) {

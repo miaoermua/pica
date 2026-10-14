@@ -20,15 +20,9 @@
 ```text
 .
   crates/
-    pica-pkg-core/
-    pica-pkg-cli/
-    pica-pkg-pack/
-  legacy/pica-pack/
-    pica-pack
-    example/
-      hello/
-  legacy/pica-cli/
-    pica
+    pica-pkg-core/    归档、manifest、repo.json 与基础 IO
+    pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/后端）
+    pica-pkg-pack/    pica-pack 命令（构建与打包）
   docs/
     standard.md
     developer.md
@@ -39,20 +33,38 @@
 
 ### 脚本说明与调用
 
-- 入口：`legacy/pica-pack/pica-pack`
-- 职责：提供一个快速的参考实现（或生产级打包工具），开发者在提交 PR 修改打包规则前，必须通过该脚本测试本地分发行为。
+- 入口：`cargo run -p pica-pkg-pack --`（产物二进制为 `pica-pack`）
+- 职责：把符合 `standard.md` 的 `pkgdir` 打成 `.pkg.tar.gz`，并按后端生成 `repo.json` 与 `SHA256SUMS`。
 
 ### 用法
 
-对本地存在的、符合 `standard.md` 中说明的 `staging_dir` 进行打包构建：
-
 ```bash
-./legacy/pica-pack/pica-pack build <staging_dir> [--outdir DIR]
+cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|none|opkg,apk]
 ```
 
-构建示例：
-```bash
-./legacy/pica-pack/pica-pack build legacy/pica-pack/example/hello --outdir /tmp/pica-test
+`<pkgdir>` 目录结构：
+
+```text
+manifest                           必需，key = value
+scripts/                           可选，生命周期脚本 install/update/remove/.env
+root/                              可选，按路径镜像到目标根文件系统
+pkgs/<backend>/                    可选，该后端的系统包
+pkgs/<backend>/<platform>/<arch>/  可选，变体矩阵写法
+LICENSE                            可选
+```
+
+构建目标来自 manifest 里的 `targets`（可重复或逗号分隔），也可用 `--pkgmgr` 覆盖，默认 `opkg`。
+每个 `<platform>/<arch>` 组合产出一个归档，`pkgs/` 会被拍平成该组合的内容。
+
+产物命名与输出目录：
+
+```text
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-none].pkg.tar.gz
+platform = all 时省略 platform 段
+
+<outdir>/opkg/    opkg
+<outdir>/apk/     apk
+<outdir>/none/    none
 ```
 
 输出日志风格模仿自 Arch Linux 的 `makepkg`。
@@ -64,8 +76,8 @@
 ### 系统层运行要求与依赖
 
 - **基础设施**：`sh` 提供主控与生命周期解析，需保证能够正常调用 BusyBox applet。
-- **环境强制依赖**：`jq`（所有后端机器解析与内部 JSON 驱动）、原生解包工具 `tar`。
-- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，通过调用系统 `opkg` 驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作。
+- **环境强制依赖**：原生解包工具 `tar`（JSON 解析、状态存储与校验均由 Rust 侧实现，不再依赖 `jq`）。
+- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，通过调用系统包管理器（`opkg` 或 `apk`）驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = none` 时不调用任何包管理器，仅部署 `root/` 并执行生命周期脚本。
 - **公网连接支持优先级**：`uclient-fetch` -> `wget` -> `curl`。
 
 ### 状态目录（VFS Layout）
@@ -83,8 +95,8 @@ Pica 的环境与运行时状态持久化设计：
 - **运行期临时文件（缓存）**：
   - 下载目标存储定位 `/var/lib/pica/cache/pkgs/*.pkg.tar.gz`（受保护，成功和失败回滚都会主动清理以释放 Flash）。
 - **静态资源部署桩**：
-  - `/usr/lib/pica/cmd/<pkgname>/` （执行后视环境变量策略定夺清扫还是滞留的生命周期脚本集）
-  - `/usr/lib/pica/src/<pkgname>/` （非 `.ipk` 文件/资源分发目标目录，存放 Compose 文件或纯脚本库）
+  - `/usr/lib/pica/scripts/<pkgname>/` （执行后视环境变量策略定夺清扫还是滞留的生命周期脚本集）
+  - `root/` 内的文件按路径镜像部署到真实根文件系统，卸载时按 `db.json` 记录逐条回滚
 
 ### 运行时并发约束锁设计
 

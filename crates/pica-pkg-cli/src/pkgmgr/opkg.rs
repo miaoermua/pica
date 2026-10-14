@@ -7,6 +7,7 @@ use std::process::Command;
 
 const OPKG_LISTS_DIRS: [&str; 2] = ["/var/opkg-lists", "/tmp/opkg-lists"];
 const OPKG_LOCK_FILES: [&str; 2] = ["/var/lock/opkg.lock", "/tmp/lock/opkg.lock"];
+const OPKG_INFO_DIR: &str = "/usr/lib/opkg/info";
 
 pub struct OpkgBackend;
 
@@ -97,18 +98,37 @@ impl PackageManager for OpkgBackend {
     }
   }
 
-  fn snapshot_installed(&self) -> Vec<String> {
+  fn installed(&self) -> Vec<(String, String)> {
     let Ok(output) = Command::new("opkg").arg("list-installed").output() else {
       return Vec::new();
     };
-    let mut packages: Vec<String> = String::from_utf8_lossy(&output.stdout)
-      .lines()
-      .filter_map(|line| line.split_once(" - ").map(|(name, _)| name.trim().to_string()))
-      .filter(|name| !name.is_empty())
-      .collect();
+    let mut packages = parse_installed_list(&String::from_utf8_lossy(&output.stdout));
     packages.sort();
     packages.dedup();
     packages
+  }
+
+  fn depends(&self, name: &str) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(Path::new(OPKG_INFO_DIR).join(format!("{name}.control")))
+    else {
+      return Vec::new();
+    };
+    parse_depends_field(&text)
+  }
+
+  fn owns_file(&self, path: &str) -> Option<String> {
+    let entries = fs::read_dir(OPKG_INFO_DIR).ok()?;
+    let mut owners: Vec<String> = entries
+      .flatten()
+      .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "list"))
+      .filter_map(|entry| {
+        let name = entry.path().file_stem()?.to_string_lossy().into_owned();
+        let text = fs::read_to_string(entry.path()).ok()?;
+        list_owns_path(&text, path).then_some(name)
+      })
+      .collect();
+    owners.sort();
+    owners.into_iter().next()
   }
 
   fn architectures(&self) -> Vec<String> {
@@ -124,6 +144,54 @@ impl PackageManager for OpkgBackend {
       .map(ToString::to_string)
       .collect()
   }
+}
+
+/// `opkg list-installed` prints `name - version`, one package per line.
+fn parse_installed_list(text: &str) -> Vec<(String, String)> {
+  text
+    .lines()
+    .filter_map(|line| {
+      let (name, version) = line.split_once(" - ")?;
+      let name = name.trim();
+      let version = version.trim();
+      (!name.is_empty() && !version.is_empty()).then(|| (name.to_string(), version.to_string()))
+    })
+    .collect()
+}
+
+/// `Depends: libc (>= 1.0), libubox` -> `["libc", "libubox"]`.
+fn parse_depends_field(control: &str) -> Vec<String> {
+  let mut values: Vec<String> = Vec::new();
+  let mut collecting = false;
+  for line in control.lines() {
+    if collecting && line.starts_with([' ', '\t']) {
+      values.extend(split_dependency_list(line));
+      continue;
+    }
+    collecting = false;
+    if line.starts_with("Depends:") {
+      collecting = true;
+      values.extend(split_dependency_list(line.trim_start_matches("Depends:")));
+    }
+  }
+  values.sort();
+  values.dedup();
+  values
+}
+
+fn split_dependency_list(value: &str) -> Vec<String> {
+  value
+    .split(',')
+    .filter_map(|item| {
+      let name = item.trim().split(['(', ' ']).next()?.trim();
+      (!name.is_empty()).then(|| name.to_string())
+    })
+    .collect()
+}
+
+/// Ownership lists hold one absolute path per line.
+fn list_owns_path(list: &str, path: &str) -> bool {
+  list.lines().any(|line| line.trim() == path)
 }
 
 fn opkg_lists_ready() -> bool {
@@ -169,7 +237,10 @@ fn read_opkg_lock_pid(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-  use super::{clear_opkg_lock_files_if_stale, is_opkg_lock_error, opkg_list_dir_has_files, read_opkg_lock_pid};
+  use super::{
+    clear_opkg_lock_files_if_stale, is_opkg_lock_error, list_owns_path, opkg_list_dir_has_files,
+    parse_depends_field, parse_installed_list, read_opkg_lock_pid,
+  };
   use pretty_assertions::assert_eq;
   use std::fs;
 
@@ -203,5 +274,34 @@ mod tests {
   #[test]
   fn stale_lock_cleanup_skips_missing_default_paths() {
     assert!(!clear_opkg_lock_files_if_stale());
+  }
+
+  #[test]
+  fn parses_list_installed_output() {
+    let text = "busybox - 1.36.1-1\nluci-app-demo - 2:1.0.0-r0\nbroken line\n";
+    assert_eq!(
+      parse_installed_list(text),
+      vec![
+        ("busybox".to_string(), "1.36.1-1".to_string()),
+        ("luci-app-demo".to_string(), "2:1.0.0-r0".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn parses_depends_field_with_versions_and_continuations() {
+    let control = "Package: demo\nDepends: libc (>= 1.0), libubox\n  , luci-base\n";
+    assert_eq!(
+      parse_depends_field(control),
+      vec!["libc".to_string(), "libubox".to_string(), "luci-base".to_string()]
+    );
+    assert!(parse_depends_field("Package: demo\n").is_empty());
+  }
+
+  #[test]
+  fn matches_file_ownership_by_exact_path() {
+    let list = "/usr/bin/demo\n/usr/lib/demo/lib.so\n";
+    assert!(list_owns_path(list, "/usr/bin/demo"));
+    assert!(!list_owns_path(list, "/usr/bin/demo2"));
   }
 }

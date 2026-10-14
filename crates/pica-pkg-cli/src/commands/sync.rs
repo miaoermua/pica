@@ -112,10 +112,7 @@ fn check_index_dependencies(app: &mut App) {
       return;
     };
     package_manager.update_index();
-    let manager_name = match package_manager.kind() {
-      crate::pkgmgr::PackageManagerKind::Opkg => "opkg",
-      crate::pkgmgr::PackageManagerKind::Apk => "apk",
-    };
+    let manager_name = package_manager.kind().as_str();
     let missing = collect_declared_dependencies(&index)
       .into_iter()
       .filter(|dep| !package_manager.package_exists(dep))

@@ -9,7 +9,7 @@ pub(crate) fn should_use_feeds(
   app: &App,
   label: &str,
   pkg_list: &[String],
-  have_ipk_dir: bool,
+  have_pkgs_dir: bool,
 ) -> i8 {
   match app.options.feed_policy {
     FeedPolicy::FeedOnly => {
@@ -21,9 +21,9 @@ pub(crate) fn should_use_feeds(
     }
     FeedPolicy::PackagedOnly => 0,
     FeedPolicy::FeedFirst => i8::from(!pkg_list.is_empty()),
-    FeedPolicy::PackagedFirst => i8::from(!have_ipk_dir),
+    FeedPolicy::PackagedFirst => i8::from(!have_pkgs_dir),
     FeedPolicy::Ask => {
-      if !have_ipk_dir {
+      if !have_pkgs_dir {
         return 1;
       }
       if pkg_list.is_empty() {
@@ -55,7 +55,8 @@ pub(crate) fn should_use_feeds(
 
       i8::from(prompt_yn(
         &format!(
-          "Found {available}/{total} {label} packages in opkg feeds. Use feeds instead of packaged ipks?"
+          "Found {available}/{total} {label} packages in the {} feeds. Use feeds instead of packaged packages?",
+          app.backend().as_str()
         ),
         true,
       ))
@@ -63,18 +64,18 @@ pub(crate) fn should_use_feeds(
   }
 }
 
-pub(crate) fn install_via_feeds_or_ipk(
+pub(crate) fn install_via_feeds_or_pkgs(
   app: &App,
   label: &str,
   pkg_list: &[String],
-  ipk_dir: &Path,
-  have_ipk_dir: bool,
+  pkgs_dir: &Path,
+  have_pkgs_dir: bool,
 ) -> CliResult<()> {
-  if pkg_list.is_empty() && !have_ipk_dir {
+  if pkg_list.is_empty() && !have_pkgs_dir {
     return Ok(());
   }
 
-  let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir);
+  let use_feeds = should_use_feeds(app, label, pkg_list, have_pkgs_dir);
   if use_feeds == -1 {
     return Err(CliError::new(
       E_POLICY_INVALID,
@@ -98,41 +99,42 @@ pub(crate) fn install_via_feeds_or_ipk(
     return Ok(());
   }
 
-  if have_ipk_dir {
-    install_ipk_dir(app, label, ipk_dir)?;
+  if have_pkgs_dir {
+    install_pkgs_dir(app, label, pkgs_dir)?;
     return Ok(());
   }
 
   Err(CliError::new(
     E_RUNTIME,
-    format!("{label} not available in feeds and no packaged ipks provided"),
+    format!("{label} not available in feeds and no packaged packages provided"),
   ))
 }
 
-pub(crate) fn install_ipk_dir(app: &App, label: &str, dir: &Path) -> CliResult<()> {
+/// Installs every native package shipped in the artifact's `pkgs/`. Only the
+/// artifact's own backend packages are present, because the packer filters by
+/// backend, so no extension-based filtering happens here.
+pub(crate) fn install_pkgs_dir(app: &App, label: &str, dir: &Path) -> CliResult<()> {
   if !dir.is_dir() {
     return Ok(());
   }
 
-  let mut installed_any = false;
-  let entries = fs::read_dir(dir)
-    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?;
+  let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)
+    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?
+    .flatten()
+    .map(|entry| entry.path())
+    .filter(|path| path.is_file())
+    .collect();
+  paths.sort();
 
-  for entry in entries.flatten() {
-    let path = entry.path();
-    let extension = path.extension().and_then(|v| v.to_str());
-    if extension != Some("ipk") && extension != Some("apk") {
-      continue;
-    }
-    app.package_manager()?.install(label, &path.display().to_string())?;
-    installed_any = true;
-  }
-
-  if !installed_any {
+  if paths.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("no ipk/apk files found in {label} dir: {}", dir.display()),
+      format!("no packages found in {label} dir: {}", dir.display()),
     ));
+  }
+
+  for path in paths {
+    app.package_manager()?.install(label, &path.display().to_string())?;
   }
 
   Ok(())
@@ -174,7 +176,7 @@ pub(crate) fn pkg_list_diff_added(before: &[String], after: &[String]) -> Vec<St
 
 #[cfg(test)]
 mod tests {
-  use super::{install_via_feeds_or_ipk, pkg_list_diff_added, reorder_app_list, should_use_feeds};
+  use super::{install_via_feeds_or_pkgs, pkg_list_diff_added, reorder_app_list, should_use_feeds};
   use crate::app::{App, FeedPolicy, JsonMode, Options, Paths};
   use pretty_assertions::assert_eq;
   use std::path::Path;
@@ -221,6 +223,7 @@ mod tests {
         fetch_timeout: 30,
         fetch_retry: 2,
         fetch_retry_delay: 1,
+        pkgmgr: None,
       },
     );
 
@@ -247,7 +250,7 @@ mod tests {
   }
 
   #[test]
-  fn install_via_feeds_or_ipk_skips_empty_optional_group() {
+  fn install_via_feeds_or_pkgs_skips_empty_optional_group() {
     let app = App::new(
       Paths::from_env(),
       Options {
@@ -257,10 +260,31 @@ mod tests {
         fetch_timeout: 30,
         fetch_retry: 2,
         fetch_retry_delay: 1,
+        pkgmgr: None,
       },
     );
 
-    let result = install_via_feeds_or_ipk(&app, "base", &[], Path::new("/nonexistent"), false);
+    let result = install_via_feeds_or_pkgs(&app, "base", &[], Path::new("/nonexistent"), false);
     assert!(result.is_ok());
+  }
+
+  #[test]
+  fn install_pkgs_dir_rejects_empty_directory() {
+    let app = App::new(
+      Paths::from_env(),
+      Options {
+        json_mode: JsonMode::None,
+        non_interactive: true,
+        feed_policy: FeedPolicy::PackagedOnly,
+        fetch_timeout: 30,
+        fetch_retry: 2,
+        fetch_retry_delay: 1,
+        pkgmgr: None,
+      },
+    );
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let err = install_via_feeds_or_pkgs(&app, "app", &[], dir.path(), true)
+      .expect_err("empty pkgs dir must fail");
+    assert!(err.message.contains("no packages found"));
   }
 }

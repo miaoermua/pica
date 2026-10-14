@@ -14,7 +14,7 @@ use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
-use pica_pkg_core::version::{pkgver_ge, ver_ge};
+use pica_pkg_core::version::{pkgver_gt, ver_ge};
 use pica_pkg_core::PICA_VERSION;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -40,7 +40,9 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
         app_via_package_manager(app, selector)?;
         return Ok(());
       }
-      "pica" => {
+      // `none` installs live only in Pica's own database, so they take the same
+      // path as regular repo packages.
+      "none" | "pica" => {
         pica_from_repo(app, selector)?;
         return Ok(());
       }
@@ -77,6 +79,16 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let appname = parsed.appname.clone();
 
+  if !app.backend().is_native() {
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!(
+        "{}: backend has no package manager, use selectors from pica repos instead",
+        app.backend().as_str()
+      ),
+    ));
+  }
+
   let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
   let package_manager = app.package_manager()?;
   package_manager.update_index();
@@ -107,6 +119,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
+  let backend = package_manager.kind().as_str();
   let manifest = json!({
       "pkgname": appname,
       "appname": appname,
@@ -115,13 +128,16 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
       "os": detect_os(),
       "platform": detect_platform(),
       "arch": "all",
-      "source": package_manager.kind().as_str(),
-      "pkgmgr": package_manager.kind().as_str(),
-      package_manager.kind().as_str(): to_install,
+      "source": backend,
+      "pkgmgr": backend,
+      // Fixed key: writing the backend name here produced one field per
+      // backend (`apk: [...]`) and leaked it into every downstream consumer.
+      "app": to_install,
   });
 
-  let manager_name = package_manager.kind().as_str();
-  db_set_installed(&app.paths.db_file, &appname, &manifest, manager_name, &to_install)?;
+  // The native package manager owns these files; `files` records the package
+  // names so `-Ql` can still show what this entry brought in.
+  db_set_installed(&app.paths.db_file, &appname, &manifest, backend, &to_install, &[])?;
   app.log_info("Transaction completed");
   Ok(())
 }
@@ -138,12 +154,12 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
+  // Strictly greater, so the first candidate is only a baseline and equal
+  // versions never displace an earlier repo's entry.
   let mut best_index = 0usize;
-  let mut best_ver = String::new();
-  for (index, candidate) in candidates.iter().enumerate() {
-    if pkgver_ge(&candidate.cmpver, &best_ver) {
+  for index in 1..candidates.len() {
+    if pkgver_gt(&candidates[index].cmpver, &candidates[best_index].cmpver) {
       best_index = index;
-      best_ver.clone_from(&candidate.cmpver);
     }
   }
 

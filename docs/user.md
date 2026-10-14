@@ -14,7 +14,7 @@
 
 在传统的 OpenWrt 环境中，哪怕安装一个简单外部提供的带 LuCI 界面的应用，用户也经常要在核心进程 `.ipk`、语言包 `luci-i18n-*` 以及接口插件 `luci-app-*` 中反复奔波，并处理琐碎的碎片化操作。
 
-使用 Pica，这些碎片能被无缝封装在一个 `pica 包 (xxx.pkg.tar.gz)` 或者“应用级命名”中。Pica 会替你接管 opkg 清单与钩子工作流。
+使用 Pica，这些碎片能被无缝封装在一个 `pica 包 (xxx.pkg.tar.gz)` 或者“应用级命名”中。Pica 会替你接管后端清单（`opkg` / `apk`，或 `none` 的纯脚本模式）与钩子工作流。
 
 ## 核心使用方式
 
@@ -80,6 +80,20 @@ pica -R miaoer-app
 ```bash
 pica -Q
 ```
+
+> 若该包由 `root/` 载荷部署，Pica 会按安装时记录的路径逐条回滚，不会调用包管理器。
+
+## 高级：指定安装后端
+
+默认情况下 Pica 按 `--pkgmgr` > 包 manifest > `/etc/pica/pica.json` > 自动探测（`apk` 优先于 `opkg`）的顺序决定后端。需要强制指定时：
+
+```bash
+pica --pkgmgr apk -S miaoer-app
+pica --pkgmgr none -U /tmp/miaoer-app-0.2.8-1-all-none.pkg.tar.gz
+```
+
+- `opkg` / `apk`：把包内 `pkgs/` 交给对应的系统包管理器安装。
+- `none`：不调用任何包管理器，只部署 `root/` 与执行 `scripts/` 生命周期脚本。
 
 ## 高级：非交互模式与机器化返回
 

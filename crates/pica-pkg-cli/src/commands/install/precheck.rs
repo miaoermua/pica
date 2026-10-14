@@ -11,19 +11,28 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-pub(crate) fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
+/// True when `pkgs/` ships a native package for `pkg`.
+///
+/// The packer already filtered `pkgs/` down to one backend, so the only thing
+/// left to match is the package name. Names are matched on a `-`/`_` boundary so
+/// `foo` does not match `foo-extra`.
+pub(crate) fn pkgs_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
   let Ok(entries) = fs::read_dir(dir) else {
     return false;
   };
 
   for entry in entries.flatten() {
     let path = entry.path();
-    if !path.is_file() {
+    if path.is_dir() {
+      if pkgs_dir_has_pkg(&path, pkg) {
+        return true;
+      }
       continue;
     }
-    let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("").to_string();
-    let is_package_file = path.extension().and_then(|value| value.to_str()).is_some_and(|ext| ext == "ipk" || ext == "apk");
-    if is_package_file && (name.starts_with(&format!("{pkg}_")) || name.starts_with(&format!("{pkg}-"))) {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+      continue;
+    };
+    if name.starts_with(&format!("{pkg}_")) || name.starts_with(&format!("{pkg}-")) {
       return true;
     }
   }
@@ -31,14 +40,14 @@ pub(crate) fn ipk_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
   false
 }
 
-pub(crate) fn precheck_dep_source(app: &App, dep: &str, ipk_dir: &Path) -> String {
+pub(crate) fn precheck_dep_source(app: &App, dep: &str, pkgs_dir: &Path) -> String {
   if app.package_manager().is_ok_and(|manager| manager.is_installed(dep)) {
     return "installed".to_string();
   }
   if app.package_manager().is_ok_and(|manager| manager.package_exists(dep)) {
     return "feed".to_string();
   }
-  if ipk_dir_has_pkg(ipk_dir, dep) {
+  if pkgs_dir_has_pkg(pkgs_dir, dep) {
     return "packaged".to_string();
   }
   "missing".to_string()
@@ -47,28 +56,31 @@ pub(crate) fn precheck_dep_source(app: &App, dep: &str, ipk_dir: &Path) -> Strin
 pub(crate) fn build_precheck_report(
   app: &App,
   manifest: &Manifest,
-  depend_dir: &Path,
-  binary_dir: &Path,
+  pkgs_dir: &Path,
   app_list: &[String],
 ) -> Value {
+  let backend = app.backend().as_str();
+
   let kmod = manifest
-    .get_array("kmod")
+    .get_array_for("kmod", backend)
     .into_iter()
     .filter(|dep| !dep.is_empty())
+    // kmods are always resolved through feeds: the OpenWrt kernel module
+    // packages cannot be shipped inside an application artifact.
     .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, Path::new(""))}))
     .collect::<Vec<Value>>();
 
   let base = manifest
-    .get_array("base")
+    .get_array_for("base", backend)
     .into_iter()
     .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, depend_dir)}))
+    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, pkgs_dir)}))
     .collect::<Vec<Value>>();
 
   let app = app_list
     .iter()
     .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, dep, binary_dir)}))
+    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, dep, pkgs_dir)}))
     .collect::<Vec<Value>>();
 
   json!({
@@ -104,6 +116,12 @@ pub(super) fn summarize_missing_precheck(precheck: &Value) -> Vec<String> {
   missing
 }
 
+/// A package is empty when it declares no dependency group either, since then
+/// installing it would change nothing on disk.
+fn has_payload(tmpdir: &Path) -> bool {
+  ["root", "scripts", "pkgs"].iter().any(|name| tmpdir.join(name).is_dir())
+}
+
 pub(super) fn validate_package(
   app: &mut App,
   manifest: &Manifest,
@@ -135,23 +153,25 @@ pub(super) fn validate_package(
     if !host_arches.iter().any(|arch| arch == &pkg.arch) {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
-        format!("unsupported arch: pkg={} (opkg arches: {})", pkg.arch, host_arches.join(" ")),
+        format!("unsupported arch: pkg={} (host arches: {})", pkg.arch, host_arches.join(" ")),
       ));
     }
   }
 
-  if pkg.pkgmgr != "opkg" && pkg.pkgmgr != "apk" && pkg.pkgmgr != "none" {
+  // `pkgmgr` is validated while resolving the backend; re-checking it here would
+  // duplicate the rule in two places and let them drift.
+  if !has_payload(tmpdir) {
     return Err(CliError::new(
-      E_CONFIG_INVALID,
-      format!("invalid pkgmgr value: {} (supported: opkg, apk, none)", pkg.pkgmgr),
+      E_PACKAGE_INVALID,
+      "package would be empty: it ships none of root/, scripts/ or pkgs/",
     ));
   }
 
-  if (pkg.pkgmgr == "opkg" || pkg.pkgmgr == "apk") && !tmpdir.join("binary").is_dir() {
-    return Err(CliError::new(E_PACKAGE_INVALID, "package missing binary/"));
-  }
-
-  if pkg.visibility != "open" && pkg.visibility != "mix" && pkg.visibility != "closed" {
+  if !pkg.visibility.is_empty()
+    && pkg.visibility != "open"
+    && pkg.visibility != "mix"
+    && pkg.visibility != "closed"
+  {
     return Err(CliError::new(
       E_CONFIG_INVALID,
       format!("invalid visibility value: {} (supported: open, mix, closed)", pkg.visibility),

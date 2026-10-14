@@ -2,6 +2,7 @@ use crate::app::{
   ensure_dirs, App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
 };
 use crate::candidate::find_pica_candidates_in_index;
+use crate::pkgmgr::PackageManagerKind;
 use crate::state::read_json_file;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
@@ -177,8 +178,32 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   println!("Installed From  : {}", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
   println!("License         : {}", manifest_get_first(manifest, "license"));
   println!("Visibility      : {}", manifest_get_first(manifest, "visibility"));
+  if let Some(depends) = backend_dependencies(app, manifest) {
+    println!("Depends         : {depends}");
+  }
 
   Ok(())
+}
+
+/// Dependencies the native backend reports for an entry it installed.
+///
+/// Pica-native (`none`) packages have no backend to ask and declare their
+/// dependencies in the manifest instead, so the line is omitted for them. A
+/// missing backend command is not an error here: showing information must not
+/// fail because the host cannot talk to its package manager.
+fn backend_dependencies(app: &mut App, manifest: &Value) -> Option<String> {
+  let pkgname = manifest_get_first(manifest, "pkgname");
+  if pkgname.is_empty() {
+    return None;
+  }
+  let kind = PackageManagerKind::parse(&manifest_get_first(manifest, "pkgmgr"))?;
+  if !kind.is_native() {
+    return None;
+  }
+  app.select_package_manager(kind.as_str()).ok()?;
+
+  let depends = app.package_manager().ok()?.depends(&pkgname);
+  (!depends.is_empty()).then(|| depends.join(" "))
 }
 
 pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {

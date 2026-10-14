@@ -45,10 +45,26 @@ impl PackageManager for ApkBackend {
     if output.status.success() { Ok(()) } else { Err(CliError::new(E_RUNTIME, format!("apk del failed: {target} detail=[{}]", stderr_or_stdout(&output.stdout, &output.stderr)))) }
   }
 
-  fn snapshot_installed(&self) -> Vec<String> {
+  fn installed(&self) -> Vec<(String, String)> {
     let Ok(output) = Command::new("apk").args(["list", "--installed", "-q"]).output() else { return Vec::new(); };
-    let mut packages: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().filter_map(package_name_from_installed_line).collect();
+    let mut packages: Vec<(String, String)> =
+      String::from_utf8_lossy(&output.stdout).lines().filter_map(split_installed_line).collect();
     packages.sort(); packages.dedup(); packages
+  }
+
+  fn depends(&self, name: &str) -> Vec<String> {
+    let Ok(output) = Command::new("apk").args(["info", "--depends", name]).output() else { return Vec::new(); };
+    let mut packages: Vec<String> =
+      String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| split_installed_line(line).map(|(name, _)| name)).collect();
+    packages.sort(); packages.dedup(); packages
+  }
+
+  fn owns_file(&self, path: &str) -> Option<String> {
+    let output = Command::new("apk").args(["info", "--who-owns", path]).output().ok()?;
+    if !output.status.success() { return None; }
+    String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .find_map(|line| split_installed_line(line).map(|(name, _)| name))
   }
 
   fn architectures(&self) -> Vec<String> {
@@ -91,20 +107,22 @@ fn parse_package_version(output: &str, name: &str) -> Option<String> {
   })
 }
 
-fn package_name_from_installed_line(line: &str) -> Option<String> {
+/// `apk list` prints `name-version`. Package names may contain `-`, so the split
+/// is the last `-` that starts a version (a version always starts with a digit).
+fn split_installed_line(line: &str) -> Option<(String, String)> {
   let value = line.trim();
   if value.is_empty() { return None; }
   let value = value.strip_suffix(" [installed]").unwrap_or(value);
   value.rmatch_indices('-').find_map(|(index, _)| {
     let version = &value[index + 1..];
     (version.as_bytes().first().is_some_and(u8::is_ascii_digit) && index > 0)
-      .then(|| value[..index].to_string())
+      .then(|| (value[..index].to_string(), version.to_string()))
   })
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{install_command, is_local_apk_path, package_name_from_installed_line, parse_package_version};
+  use super::{install_command, is_local_apk_path, parse_package_version, split_installed_line};
   #[test]
   fn parses_apk_name_version() {
     assert_eq!(parse_package_version("luci-1.2.3\n", "luci"), Some("1.2.3".into()));
@@ -112,11 +130,18 @@ mod tests {
   }
   #[test]
   fn parses_apk_name_with_hyphens() {
-    assert_eq!(package_name_from_installed_line("luci-app-test-1.2.3"), Some("luci-app-test".into()));
-    assert_eq!(package_name_from_installed_line("luci-app-test-1.2.3-r0 [installed]"), Some("luci-app-test".into()));
+    assert_eq!(split_installed_line("luci-app-test-1.2.3"), Some(("luci-app-test".into(), "1.2.3".into())));
+    assert_eq!(split_installed_line("luci-app-test-1.2.3-r0 [installed]"), Some(("luci-app-test".into(), "1.2.3-r0".into())));
   }
   #[test]
-  fn rejects_empty_apk_name_version() { assert_eq!(parse_package_version("luci-\n", "luci"), None); assert_eq!(package_name_from_installed_line(""), None); }
+  fn rejects_empty_apk_name_version() { assert_eq!(parse_package_version("luci-\n", "luci"), None); assert_eq!(split_installed_line(""), None); }
+
+  #[test]
+  fn splits_installed_lines_with_revision_and_epoch() {
+    assert_eq!(split_installed_line("luci-app-test-1.2.3-r0"), Some(("luci-app-test".into(), "1.2.3-r0".into())));
+    assert_eq!(split_installed_line("luci-2:1.2.3-r0 [installed]"), Some(("luci".into(), "2:1.2.3-r0".into())));
+    assert_eq!(split_installed_line("no-version-here"), None);
+  }
 
   #[test]
   fn only_existing_apk_files_are_local_packages() {

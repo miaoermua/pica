@@ -62,12 +62,18 @@ pub fn report_set_install_result(
   write_json_atomic_pretty(&paths.report_file, &report)
 }
 
+/// Records an installation.
+///
+/// `files` and `dirs` are the payload this install created; removal replays them
+/// in reverse. Installs delegated to a native package manager pass `packages` in
+/// `files` instead, because that backend, not Pica, owns the real file list.
 pub fn db_set_installed(
   db_file: &Path,
   pkgname: &str,
   manifest: &Value,
   pkgfile: &str,
   files: &[String],
+  dirs: &[String],
 ) -> CliResult<()> {
   let mut db = read_json_file(db_file)?;
   ensure_json_object_field(&mut db, "installed")?;
@@ -83,6 +89,7 @@ pub fn db_set_installed(
         "manifest": manifest,
         "pkgfile": pkgfile,
         "files": files,
+        "dirs": dirs,
         "installed_at": now_unix_secs(),
     }),
   );
