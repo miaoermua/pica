@@ -88,7 +88,7 @@ Pica 的环境与运行时状态持久化设计：
   - `/etc/pica/pica.json`
   - `/etc/pica/env.d/` （供隔离的组件环境变量注入）
 - **本地服务状态 / RDBMS 映射（读写）**：
-  - `/var/lib/pica/db.json` （核心登记表，维护机器已安装应用树）
+  - `/var/lib/pica/db.json` （核心登记表，维护机器已安装应用树；条目里的 `source` 记渠道、`pkgmgr` 记实际后端，语义与迁移规则见 `standard.md`）
   - `/var/lib/pica/index.json`（已同步的所有在线 Repo 资源目录）
   - `/var/lib/pica/cache/repos/<name>.json`
   - `/var/lib/pica/db.lck` （并发安全锁源）

@@ -1,4 +1,5 @@
 use crate::app::{ensure_dirs, App, CliError, CliResult, E_ARG_INVALID};
+use crate::installed::entry_backend;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::run_command_capture_output;
@@ -29,12 +30,15 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
 
   let script_remove = manifest_get_scalar(&manifest, "script_remove");
   // How the package was installed is the only correct way to uninstall it, so
-  // the recorded backend wins over any current CLI/config selection.
-  let recorded = manifest_get_scalar(&manifest, "pkgmgr");
-  let pkgmgr = if recorded.is_empty() { app.backend().as_str().to_string() } else { recorded };
-  let kind = PackageManagerKind::parse(&pkgmgr).ok_or_else(|| {
-    CliError::new(E_ARG_INVALID, format!("{pkgname}: unknown pkgmgr in db: {pkgmgr}"))
-  })?;
+  // the recorded backend wins over any current CLI/config selection. Rows from
+  // releases that stored the backend elsewhere resolve through the same ladder
+  // instead of silently falling back to whatever this invocation selected.
+  let backend = entry_backend(&entry);
+  let kind = backend.kind;
+  let pkgmgr = kind.as_str().to_string();
+  if backend.is_inferred() {
+    app.log_warn(format!("{pkgname}: backend {}; using {pkgmgr}", backend.origin.as_str()));
+  }
 
   app.select_package_manager(kind.as_str())?;
   app.log_info(format!("Removing {pkgname}..."));

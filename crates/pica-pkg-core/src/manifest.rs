@@ -151,16 +151,6 @@ impl Manifest {
   }
 
   #[must_use]
-  pub fn with_source_default(mut self, source: &str) -> Self {
-    if self.value.get("source").is_none() {
-      if let Some(obj) = self.value.as_object_mut() {
-        obj.insert("source".to_string(), Value::String(source.to_string()));
-      }
-    }
-    self
-  }
-
-  #[must_use]
   pub fn with_selector_defaults(mut self, fallback_pkgname: &str) -> Self {
     if let Some(obj) = self.value.as_object_mut() {
       let _ = fallback_pkgname;

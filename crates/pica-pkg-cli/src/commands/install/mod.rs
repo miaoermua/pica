@@ -7,11 +7,11 @@ use crate::app::{
   E_REPO_INVALID, E_VERSION_INCOMPATIBLE,
 };
 use crate::candidate::find_pica_candidates_in_index;
+use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
 use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
 use crate::system::{fetch_url, need_cmd};
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_gt, ver_ge};
@@ -26,27 +26,27 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   let installed_pkg = db_find_installed_pkgname_by_selector(&app.paths.db_file, &parsed)?;
   if let Some(pkgname) = installed_pkg {
     let db = read_json_file(&app.paths.db_file)?;
-    let source = db
+    let entry = db
       .get("installed")
       .and_then(Value::as_object)
-      .and_then(|installed| installed.get(&pkgname))
-      .and_then(|entry| entry.get("manifest"))
-      .map(|manifest| manifest_get_first(manifest, "source"))
-      .unwrap_or_default();
+      .and_then(|installed| installed.get(&pkgname));
 
-    match source.as_str() {
-      "opkg" | "apk" => {
-        app.select_package_manager(&source)?;
+    if let Some(entry) = entry {
+      // Reinstalling must reproduce the original install: the backend decides
+      // which `pkgs/<backend>/` payload applies, and the channel decides whether
+      // a Pica artifact exists at all. A recorded backend therefore outranks the
+      // config file and auto-detection, but not an explicit `--pkgmgr`.
+      if app.options.pkgmgr.is_none() {
+        app.select_package_manager(installed::entry_backend(entry).kind.as_str())?;
+      }
+
+      // Feed installs never had an artifact, so there is nothing to re-resolve.
+      if installed::entry_source(entry) == EntrySource::Feed {
         app_via_package_manager(app, selector)?;
-        return Ok(());
-      }
-      // `none` installs live only in Pica's own database, so they take the same
-      // path as regular repo packages.
-      "none" | "pica" => {
+      } else {
         pica_from_repo(app, selector)?;
-        return Ok(());
       }
-      _ => {}
+      return Ok(());
     }
   }
 
@@ -128,7 +128,9 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
       "os": detect_os(),
       "platform": detect_platform(),
       "arch": "all",
-      "source": backend,
+      // Channel and backend are separate fields: this install came from the
+      // system feeds, and `opkg`/`apk` owns the files.
+      "source": EntrySource::Feed.as_str(),
       "pkgmgr": backend,
       // Fixed key: writing the backend name here produced one field per
       // backend (`apk: [...]`) and leaked it into every downstream consumer.
@@ -226,12 +228,12 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
 
-  pipeline::pkgfile(app, &cached, Some(selector.to_string()))
+  pipeline::pkgfile(app, &cached, Some(selector.to_string()), EntrySource::Repo)
 }
 
 pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliResult<()> {
   if Path::new(source).is_file() {
-    return pipeline::pkgfile(app, Path::new(source), selector);
+    return pipeline::pkgfile(app, Path::new(source), selector, EntrySource::Local);
   }
 
   if is_supported_url(source) {
@@ -255,7 +257,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
       app.options.fetch_retry_delay,
     )?;
     pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
-    return pipeline::pkgfile(app, &cached, selector);
+    return pipeline::pkgfile(app, &cached, selector, EntrySource::Url);
   }
 
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))

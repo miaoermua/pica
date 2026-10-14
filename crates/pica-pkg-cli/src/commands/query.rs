@@ -2,7 +2,7 @@ use crate::app::{
   ensure_dirs, App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
 };
 use crate::candidate::find_pica_candidates_in_index;
-use crate::pkgmgr::PackageManagerKind;
+use crate::installed;
 use crate::state::read_json_file;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
@@ -162,8 +162,10 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   println!("Arch            : {}", manifest_get_first(manifest, "arch"));
   println!("Uname           : {}", manifest_get_first(manifest, "uname"));
   println!("Type            : {}", manifest_get_first(manifest, "type"));
-  println!("Source          : {}", manifest_get_first(manifest, "source"));
-  println!("PkgMgr          : {}", manifest_get_first(manifest, "pkgmgr"));
+  // Both fields are shown as resolved rather than raw, so a row written by an
+  // older release reports the same channel and backend a fresh install would.
+  println!("Source          : {}", installed::entry_source(entry).as_str());
+  println!("PkgMgr          : {}", installed::entry_backend(entry).kind.as_str());
   println!("Packager        : {}", manifest_get_first(manifest, "packager"));
   println!("Build Date      : {}", manifest_get_first(manifest, "builddate"));
   println!("Size            : {}", format_size_display(&manifest_get_first(manifest, "size")));
@@ -178,7 +180,7 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   println!("Installed From  : {}", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
   println!("License         : {}", manifest_get_first(manifest, "license"));
   println!("Visibility      : {}", manifest_get_first(manifest, "visibility"));
-  if let Some(depends) = backend_dependencies(app, manifest) {
+  if let Some(depends) = backend_dependencies(app, entry) {
     println!("Depends         : {depends}");
   }
 
@@ -187,16 +189,19 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
 
 /// Dependencies the native backend reports for an entry it installed.
 ///
-/// Pica-native (`none`) packages have no backend to ask and declare their
-/// dependencies in the manifest instead, so the line is omitted for them. A
-/// missing backend command is not an error here: showing information must not
-/// fail because the host cannot talk to its package manager.
-fn backend_dependencies(app: &mut App, manifest: &Value) -> Option<String> {
+/// The backend comes from the entry itself, so rows written before `pkgmgr`
+/// existed still resolve. Pica-native (`none`) packages have no backend to ask
+/// and declare their dependencies in the manifest instead, so the line is
+/// omitted for them. A missing backend command is not an error here: showing
+/// information must not fail because the host cannot talk to its package
+/// manager.
+fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
+  let manifest = entry_manifest(entry);
   let pkgname = manifest_get_first(manifest, "pkgname");
   if pkgname.is_empty() {
     return None;
   }
-  let kind = PackageManagerKind::parse(&manifest_get_first(manifest, "pkgmgr"))?;
+  let kind = installed::entry_backend(entry).kind;
   if !kind.is_native() {
     return None;
   }

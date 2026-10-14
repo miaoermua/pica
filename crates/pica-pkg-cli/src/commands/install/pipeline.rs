@@ -4,6 +4,7 @@ use crate::app::{
   ensure_dirs, resolve_lang, App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID,
   E_PACKAGE_INVALID, E_RUNTIME, E_VERSION_INCOMPATIBLE,
 };
+use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
 use crate::system::{run_hook, run_tar_extract};
@@ -169,7 +170,17 @@ fn canonicalize_display(path: &Path) -> String {
   fs::canonicalize(path).map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
 }
 
-pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -> CliResult<()> {
+/// Installs an artifact file.
+///
+/// `source` is the channel the artifact came from, recorded in the database so
+/// later queries and upgrades can tell a repository install from a one-off file
+/// or URL.
+pub(super) fn pkgfile(
+  app: &mut App,
+  pkgfile: &Path,
+  selector: Option<String>,
+  source: EntrySource,
+) -> CliResult<()> {
   if !pkgfile.is_file() {
     return Err(CliError::new(
       E_PACKAGE_INVALID,
@@ -245,7 +256,18 @@ pub(super) fn pkgfile(app: &mut App, pkgfile: &Path, selector: Option<String>) -
 
   let payload = deploy_payload(&tmpdir, &pkgname)?;
 
-  record_installation(app, &pkgname, &selector, &manifest, pkgfile, &deps, &payload)
+  record_installation(
+    app,
+    &InstallRecord {
+      pkgname: &pkgname,
+      selector: &selector,
+      manifest: &manifest,
+      pkgfile,
+      deps: &deps,
+      payload: &payload,
+      source,
+    },
+  )
 }
 
 fn resolve_dependencies(
@@ -418,15 +440,23 @@ fn deploy_payload(tmpdir: &Path, pkgname: &str) -> CliResult<PayloadInstall> {
   Ok(payload)
 }
 
-fn record_installation(
-  app: &mut App,
-  pkgname: &str,
-  selector: &str,
-  manifest: &Manifest,
-  pkgfile: &Path,
-  deps: &DependencyResult,
-  payload: &PayloadInstall,
-) -> CliResult<()> {
+/// Everything the database has to remember about one artifact install.
+///
+/// Grouping it keeps the growing set of per-install values out of a long
+/// argument list that is easy to transpose at the call site.
+struct InstallRecord<'a> {
+  pkgname: &'a str,
+  selector: &'a str,
+  manifest: &'a Manifest,
+  pkgfile: &'a Path,
+  deps: &'a DependencyResult,
+  payload: &'a PayloadInstall,
+  source: EntrySource,
+}
+
+fn record_installation(app: &mut App, record: &InstallRecord<'_>) -> CliResult<()> {
+  let InstallRecord { pkgname, selector, manifest, pkgfile, deps, payload, source } = *record;
+
   report_set_install_result(
     &app.paths,
     pkgname,
@@ -438,14 +468,20 @@ fn record_installation(
   )?;
 
   let mut manifest_stored = manifest.value.clone();
-  if manifest_stored.get("source").is_none() {
-    manifest_stored["source"] = json!("pica");
-  }
+  // `source` describes how *this* install obtained the package, not where the
+  // artifact was built, so it is overwritten instead of defaulted: a URL
+  // download stays `url` even when the packer stamped `pica` into the manifest.
+  manifest_stored["source"] = json!(source.as_str());
+  // `pkgmgr` is the backend that actually owns the files. Recording the one in
+  // use (rather than the artifact's declared value) keeps `-R` from driving a
+  // package manager that never touched this install, as happens with
+  // `--pkgmgr none` over a native artifact.
+  manifest_stored["pkgmgr"] = json!(app.backend().as_str());
   if manifest_stored.get("url").is_none() {
     let origin = manifest_stored.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
     manifest_stored["url"] = json!(origin);
   }
-  for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "pkgmgr", "visibility"] {
+  for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "visibility"] {
     if manifest_stored.get(key).is_none() {
       manifest_stored[key] = json!("");
     }

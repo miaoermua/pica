@@ -140,6 +140,27 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 - `https://`
 - `file://`
 
+## 安装数据库（db.json）字段语义
+
+`/var/lib/pica/db.json`（可用 `PICA_STATE_DIR` 重定向）记录已安装项。每个条目的字段回答不同的问题，不能互相替代：
+
+- `source`：**这个包是怎么被 Pica 拿到的**，取值 `pica` / `local` / `url` / `feed`。
+- `pkgmgr`：**哪个后端真正拥有这些文件**，取值 `opkg` / `apk` / `none`。
+- `pkgfile`：产物安装时是归档路径；`feed` 安装时是后端名（因为不存在 Pica 归档）。
+
+写入规则：
+
+- `source` 与 `pkgmgr` 在安装时**覆盖写入**，不沿用产物 manifest 里的值：
+  - `--pkgmgr none -U x.pkg.tar.gz` 会记住 `pkgmgr = none`，即使归档声明的是 `apk`，卸载时也就不会去驱动 apk。
+  - URL 下载会记住 `source = url`，即使打包时写的是 `pica`。
+- 因此 `source` 描述渠道，`pkgmgr` 描述后端；二者取值空间不重叠（历史遗留的 `source = opkg` 除外，见下）。
+
+读取规则（旧记录迁移，无需改写数据库）：
+
+- 后端解析阶梯：`pkgmgr` → 旧 `source` 中的后端名 → 旧 `pkgfile` 中的后端名 → `pkgfile` 是归档路径时取 `none` → 兜底 `opkg`。
+- 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
+- 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
+
 ## JSON 输出（显式开启）
 
 `pica` 默认输出面向人工的文本日志，不改变现有使用习惯。
