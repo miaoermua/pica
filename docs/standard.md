@@ -14,8 +14,8 @@
 
 - 当前唯一标准归档类型：`*.pkg.tar.gz`。
 - `pkgs/` 里可以放后端原生包（`.ipk` / `.apk`），它们不是 Pica 归档，只是随包分发给后端安装的载荷。
-- `pkgmgr` 是**包身份**的一部分：`opkg`、`apk`、`none` 三种后端各自独立打包、独立索引、独立安装。
-- 只有 `opkg` / `apk` 会调用系统包管理器；`none` 由 Pica 自己部署 `root/`，不调用任何包管理器。
+- `pkgmgr` 是**包身份**的一部分：`opkg`、`apk`、`pica` 三种后端各自独立打包、独立索引、独立安装。
+- `opkg` / `apk` 把 `pkgs/` 交给系统包管理器安装；`pica` 由 Pica 自己解包 `pkgs/` 并部署 `root/`。
 - Pica 仅负责包分发、校验、生命周期脚本执行，不提供 Docker 管理服务。
 
 ## 包格式（.pkg.tar.gz）
@@ -38,7 +38,7 @@
 | --- | --- |
 | `opkg` | （空） |
 | `apk` | `-apk` |
-| `none` | `-none` |
+| `pica` | `-pica` |
 
 说明：
 
@@ -79,7 +79,7 @@ pkgs/<backend>/<platform>/<arch>/*.<ipk|apk>
 pkgs/<backend>/*.<ipk|apk>          # 无变体时的简化写法
 ```
 
-打包器会把每个 `<platform>/<arch>` 组合单独生成一个 pica 包，并只保留该组合的 `pkgs/<backend>/` 内容；`scripts/` 与 `root/` 会原样打入每个变体包。`none` 后端不读取 `pkgs/`。
+打包器会把每个 `<platform>/<arch>` 组合单独生成一个 pica 包，并只保留该组合的 `pkgs/<backend>/` 内容；`scripts/` 与 `root/` 会原样打入每个变体包。
 
 ## pica-pack 输出目录约定
 
@@ -102,7 +102,7 @@ pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
   - `pkgname`
   - `pkgver`
   - `pkgrel`
-  - `pkgmgr`（`opkg` / `apk` / `none`）
+  - `pkgmgr`（`opkg` / `apk` / `pica`）
   - `os`
   - `platform`
   - `arch`
@@ -121,7 +121,7 @@ pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
 安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与 `repo.json` 的 `sha256` 一致，否则失败。
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，用于覆盖默认下载路径
 
-同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`none` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
+同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 
 任一约束不满足，`pica -S` 会拒绝该 repo。
 
@@ -145,19 +145,20 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 `/var/lib/pica/db.json`（可用 `PICA_STATE_DIR` 重定向）记录已安装项。每个条目的字段回答不同的问题，不能互相替代：
 
 - `source`：**这个包是怎么被 Pica 拿到的**，取值 `pica` / `local` / `url` / `feed`。
-- `pkgmgr`：**哪个后端真正拥有这些文件**，取值 `opkg` / `apk` / `none`。
+- `pkgmgr`：**哪个后端真正拥有这些文件**，取值 `opkg` / `apk` / `pica`。
 - `pkgfile`：产物安装时是归档路径；`feed` 安装时是后端名（因为不存在 Pica 归档）。
 
 写入规则：
 
 - `source` 与 `pkgmgr` 在安装时**覆盖写入**，不沿用产物 manifest 里的值：
-  - `--pkgmgr none -U x.pkg.tar.gz` 会记住 `pkgmgr = none`，即使归档声明的是 `apk`，卸载时也就不会去驱动 apk。
+  - `--pkgmgr pica -U x.pkg.tar.gz` 会记住 `pkgmgr = pica`，即使归档声明的是 `apk`，卸载时也就不会去驱动 apk。
   - URL 下载会记住 `source = url`，即使打包时写的是 `pica`。
 - 因此 `source` 描述渠道，`pkgmgr` 描述后端；二者取值空间不重叠（历史遗留的 `source = opkg` 除外，见下）。
 
 读取规则（旧记录迁移，无需改写数据库）：
 
-- 后端解析阶梯：`pkgmgr` → 旧 `source` 中的后端名 → 旧 `pkgfile` 中的后端名 → `pkgfile` 是归档路径时取 `none` → 兜底 `opkg`。
+- 后端解析阶梯：`pkgmgr` → 旧 `source` 中的后端名 → 旧 `pkgfile` 中的后端名 → `pkgfile` 是归档路径时取 `pica` → 兜底 `opkg`。
+- 历史记录里 `pkgmgr` 写作 `none` 的行仍可读出，会被当作 `pica`；但用户输入的 `--pkgmgr none` 是错误，不再接受。
 - 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
 - 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
 
@@ -258,7 +259,7 @@ os = openwrt
 # Optional build targets (repeatable, default: opkg)
 targets = opkg
 targets = apk
-# targets = none
+# targets = pica
 
 pkgrel = 1
 platform = all
@@ -386,7 +387,7 @@ luci = lua1
 - `luci_url` 用于记录 LuCI 插件来源（可选；仅 LuCI 包建议填写）。
 - `luci_desc` 用于记录 LuCI 插件描述（与 `pkgdesc` 的通用程序描述分离）。
 - `pkgmgr = opkg|apk` 时：按 `app/base/kmod` 安装，按 `app` + `app_i18n`（`i18n=zh-cn`）卸载，`pkgs/` 中的原生包交给系统包管理器。
-- `pkgmgr = none` 时：不调用任何包管理器，不解析依赖，只部署 `root/` 并执行生命周期脚本。
+- `pkgmgr = pica` 时：Pica 自己解包 `pkgs/` 中的 `.ipk` / `.apk` 并部署 `root/`、执行生命周期脚本，不解析依赖。
 - `root/` 按路径镜像部署到真实根文件系统，安装的文件与目录会被记录，卸载时逐条回滚。
 - `script_install/script_update/script_remove` 是生命周期脚本（包内路径，一般在 `scripts/` 下），应按 POSIX `sh` 语法编写。
 - 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不依赖 `bash`。

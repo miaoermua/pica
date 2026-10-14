@@ -3,7 +3,8 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
 };
 use crate::platform::{
-  detect_luci_variant, detect_package_arches, detect_os, detect_platform, normalize_uname,
+  check_arch, detect_luci_variant, detect_package_arches, detect_os, detect_platform,
+  normalize_uname, ArchVerdict,
 };
 use crate::system::run_command_text;
 use pica_pkg_core::manifest::Manifest;
@@ -122,6 +123,45 @@ fn has_payload(tmpdir: &Path) -> bool {
   ["root", "scripts", "pkgs"].iter().any(|name| tmpdir.join(name).is_dir())
 }
 
+/// Gates a package's declared `arch` against what this host can say about
+/// itself.
+///
+/// "Cannot tell" must not read as "incompatible". A host driven through the
+/// `pica` backend has no package manager to ask, and a backend whose command
+/// failed cannot answer either, so an unanswered question — not an empty list —
+/// refuses nothing. A weaker answer is accepted too, but said out loud, because
+/// an unchecked `arch` is a risk the user is taking knowingly.
+fn check_package_arch(app: &mut App, pkg: &PackageFields) -> CliResult<()> {
+  if pkg.arch == "all" {
+    return Ok(());
+  }
+
+  let host_arches = detect_package_arches(app);
+  match check_arch(&pkg.arch, &host_arches) {
+    ArchVerdict::Backend | ArchVerdict::Kernel => Ok(()),
+    ArchVerdict::Related => {
+      app.log_warn(format!(
+        "arch {} was accepted on a family match alone ({})",
+        pkg.arch,
+        host_arches.describe()
+      ));
+      Ok(())
+    }
+    ArchVerdict::Unverified => {
+      app.log_warn(format!(
+        "cannot determine this host's package architecture, so arch={} was not checked ({})",
+        pkg.arch,
+        host_arches.describe()
+      ));
+      Ok(())
+    }
+    ArchVerdict::Mismatch => Err(CliError::new(
+      E_PLATFORM_UNSUPPORTED,
+      format!("unsupported arch: pkg={} ({})", pkg.arch, host_arches.describe()),
+    )),
+  }
+}
+
 pub(super) fn validate_package(
   app: &mut App,
   manifest: &Manifest,
@@ -148,15 +188,7 @@ pub(super) fn validate_package(
     ));
   }
 
-  if pkg.arch != "all" {
-    let host_arches = detect_package_arches(app);
-    if !host_arches.iter().any(|arch| arch == &pkg.arch) {
-      return Err(CliError::new(
-        E_PLATFORM_UNSUPPORTED,
-        format!("unsupported arch: pkg={} (host arches: {})", pkg.arch, host_arches.join(" ")),
-      ));
-    }
-  }
+  check_package_arch(app, pkg)?;
 
   // The `pica` backend owns files but does not resolve dependencies, so a
   // package that declares any would install cleanly while silently skipping

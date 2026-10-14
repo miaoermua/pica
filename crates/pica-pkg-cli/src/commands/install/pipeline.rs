@@ -249,6 +249,13 @@ fn pkgfile_into(
     ));
   }
 
+  // Checked before anything is unpacked: a container handed to `-U` is a
+  // mistake worth naming, and `tar` would otherwise report it as a corrupt
+  // archive — a true statement that says nothing about what went wrong.
+  if let Some(container) = foreign_container(pkgfile) {
+    return Err(CliError::new(E_PACKAGE_INVALID, container));
+  }
+
   ensure_dirs(&app.paths)?;
 
   app.log_info("Loading package files...");
@@ -342,6 +349,28 @@ fn pkgfile_into(
   }
 
   Ok(())
+}
+
+/// The explanation to give when `-U` was handed a package manager's own
+/// container rather than a Pica artifact.
+///
+/// A container is only ever installed from inside an artifact — `pkgs/<backend>/`
+/// — so there is no `-U` flag that installs one on its own, and the file is
+/// really an instruction for the backend the user already has.
+fn foreign_container(pkgfile: &Path) -> Option<String> {
+  let name = pkgfile.file_name().and_then(|value| value.to_str()).unwrap_or("");
+  let extension = pkgfile.extension().and_then(|value| value.to_str())?.to_ascii_lowercase();
+
+  let (backend, hint) = match extension.as_str() {
+    "apk" => ("apk", "apk add --allow-untrusted"),
+    "ipk" => ("opkg", "opkg install"),
+    _ => return None,
+  };
+
+  Some(format!(
+    "{name} is an {backend} package, not a Pica artifact: install it with `{hint} {name}`, \
+     or ship it inside a Pica package under pkgs/{backend}/"
+  ))
 }
 
 /// Whether the selected backend hands its dependency lists to something that
@@ -1290,6 +1319,51 @@ arch = all
        reachable through the paths this step intended to create"
     );
     assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_concrete_arch_is_measured_against_the_kernel_on_the_pica_backend() {
+    let mut fixture = PicaFixture::new();
+
+    // The `pica` backend has no package manager to ask, so the kernel's name is
+    // the only thing left to compare against. Before the fallback existed the
+    // list came back empty and every package naming a concrete arch was refused
+    // as unsupported, so the message is what this test is really watching.
+    let manifest =
+      format!("{}pkgmgr = pica\n", MANIFEST_DEMO.replace("arch = all", "arch = s390x"));
+    let err = fixture.install(&manifest, &[], &[], &[]).expect_err("the arch is foreign");
+
+    assert!(err.message.contains("unsupported arch: pkg=s390x"), "{}", err.message);
+    assert!(
+      err.message.contains("uname -m reports"),
+      "the host has to say where its answer came from, not just that it has none: {}",
+      err.message
+    );
+    assert!(
+      !fixture.path("usr/lib/demo/helper").exists(),
+      "a rejected arch must not deploy the payload first"
+    );
+    assert!(db_record(&fixture.app, "demo").is_none(), "nothing was installed, nothing is recorded");
+  }
+
+  #[test]
+  fn a_container_is_named_as_one_instead_of_as_a_broken_archive() {
+    let work = tempfile::tempdir().expect("temp dir");
+    let apk = work.path().join("demo.apk");
+    fs::write(&apk, "an apk is not a tar every tar can read\n").expect("write apk");
+
+    let mut app = test_app(work.path());
+    let target = TargetRoot::new(work.path().join("target-root"));
+    let err = pkgfile_into(&mut app, &apk, None, EntrySource::Local, &target)
+      .expect_err("-U does not install containers");
+
+    assert!(err.message.contains("is an apk package"), "{}", err.message);
+    assert!(err.message.contains("apk add"), "{}", err.message);
+    assert!(
+      !err.message.contains("invalid magic"),
+      "the reader should not have to decode a tar error: {}",
+      err.message
+    );
   }
 
   #[test]

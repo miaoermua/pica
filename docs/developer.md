@@ -39,7 +39,7 @@
 ### 用法
 
 ```bash
-cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|none|opkg,apk]
+cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|pica|opkg,apk]
 ```
 
 `<pkgdir>` 目录结构：
@@ -59,12 +59,12 @@ LICENSE                            可选
 产物命名与输出目录：
 
 ```text
-<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-none].pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-pica].pkg.tar.gz
 platform = all 时省略 platform 段
 
 <outdir>/opkg/    opkg
 <outdir>/apk/     apk
-<outdir>/none/    none
+<outdir>/pica/    pica
 ```
 
 输出日志风格模仿自 Arch Linux 的 `makepkg`。
@@ -77,7 +77,7 @@ platform = all 时省略 platform 段
 
 - **基础设施**：`sh` 提供主控与生命周期解析，需保证能够正常调用 BusyBox applet。
 - **环境强制依赖**：原生解包工具 `tar`（JSON 解析、状态存储与校验均由 Rust 侧实现，不再依赖 `jq`）。
-- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，通过调用系统包管理器（`opkg` 或 `apk`）驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = none` 时不调用任何包管理器，仅部署 `root/` 并执行生命周期脚本。
+- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，`opkg` / `apk` 后端通过调用系统包管理器驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = pica` 时由 Pica 自行解包 `pkgs/` 并部署 `root/`、执行生命周期脚本。
 - **公网连接支持优先级**：`uclient-fetch` -> `wget` -> `curl`。
 
 ### 状态目录（VFS Layout）

@@ -33,7 +33,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 - `pica -Si <appname>`：显示仓库远端包信息（基于已同步 index）
 - `pica -So <appname>`：强制走系统包管理器安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
 - `pica -Sp <appname>`：强制走 pica 镜像源安装（从 repo.json 解析并下载 pkg.tar.gz）
-- `pica --pkgmgr <opkg|apk|none>`：指定安装后端（优先级：`--pkgmgr` > manifest > `pica.json` > 自动探测）
+- `pica --pkgmgr <opkg|apk|pica>`：指定安装后端（优先级：`--pkgmgr` > manifest > `pica.json` > 自动探测）
 - `pica -U <pkgfile>`：从本地 `.pkg.tar.gz` 安装/更新（类似 pacman -U）
 - `pica -R <pkgname>`：卸载（不处理依赖关系）
 - `pica -Q`：列出已安装的 pica 包
@@ -51,11 +51,11 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 ## Pica 能力
 
 - 当前标准归档类型：`*.pkg.tar.gz`（pica 自有封装格式）。
-- 安装后端：`opkg`、`apk`，以及不调用包管理器的 `none`（生命周期脚本模式）。
-- `pkgmgr` 是包身份的一部分：同一应用可以同时发布 `opkg` / `apk` / `none` 三个包，文件名尾部分别为无后缀 / `-apk` / `-none`。
-- 包内载荷可包含 `scripts/`（生命周期脚本）、`root/`（按路径镜像的真实根文件系统载荷）、`pkgs/`（交给后端安装的 `.ipk`/`.apk`）。
+- 安装后端：`opkg`、`apk`、`pica`。前两者把 `pkgs/` 交给系统包管理器安装，`pica` 由 Pica 自己解包安装。
+- `pkgmgr` 是包身份的一部分：同一应用可以同时发布三个后端的包，文件名尾部分别为无后缀 / `-apk` / `-pica`。
+- 包内载荷可包含 `scripts/`（生命周期脚本）、`root/`（按路径镜像的真实根文件系统载荷）、`pkgs/`（`.ipk`/`.apk` 容器）。
 - `root/` 中的文件按路径直接部署（如 `root/etc/init.d/hello` → `/etc/init.d/hello`），无需生命周期脚本。
-- 未来规划：完善健全 Rust 分支，放弃 Bash 原分支。
+- 安装失败会自动回滚：已装依赖与已铺文件均按安装前状态还原。
 - 非目标：Pica 不提供 Docker 管理服务，不负责容器编排、守护进程管理或 Compose 生命周期托管。
 
 对于开发者来说，只需要将你的固件适配好部分依赖的 kmod 并且支持 Pica，即可以最小化的形式实现应用类似滚动更新特性，Pica 还是受限于 openwrt 包管理器和 openwrt 的轻量化以及内核裁切特性，这是无法避免的。
