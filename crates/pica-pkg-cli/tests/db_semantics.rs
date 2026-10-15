@@ -210,6 +210,39 @@ impl Sandbox {
     out
   }
 
+  /// A `root/`-only artifact, which is the shape a `pica`-backend install takes:
+  /// `pica-pack` expands any container into `root/` at build time, so the device
+  /// never sees a `pkgs/` it would have to unpack itself.
+  ///
+  /// The payload goes under `tmp/` because this sandbox redirects the database
+  /// but not the target root, so a `root/etc/...` would try to write to the
+  /// real `/etc`.
+  fn root_only_artifact(&self, pkgname: &str, declared: &str) -> PathBuf {
+    let src = self.dir.path().join(format!("src-{pkgname}"));
+    let root = src.join("root/tmp");
+    fs::create_dir_all(&root).expect("create pkgdir");
+    fs::write(
+      src.join("manifest"),
+      format!(
+        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = {declared}\nplatform = all\nos = all\narch = all\n"
+      ),
+    )
+    .expect("write manifest");
+    fs::write(root.join(format!("{pkgname}.conf")), b"payload\n").expect("write payload");
+
+    let out = self.dir.path().join(format!("{pkgname}.pkg.tar.gz"));
+    let status = std::process::Command::new("tar")
+      .arg("-czf")
+      .arg(&out)
+      .args(["-C"])
+      .arg(&src)
+      .args(["manifest", "root"])
+      .status()
+      .expect("run tar");
+    assert!(status.success(), "tar failed to build {pkgname}");
+    out
+  }
+
   fn state_dir(&self) -> PathBuf {
     self.dir.path().join("state")
   }
@@ -351,7 +384,7 @@ fn install_records_the_backend_in_use_not_the_declared_one() {
   // package manager. Recording the declared value would make `-R` drive apk
   // against files apk never touched.
   let sandbox = Sandbox::new(EMPTY_DB);
-  let artifact = sandbox.artifact("declared-apk", "apk");
+  let artifact = sandbox.root_only_artifact("declared-apk", "apk");
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
   sandbox.run(&["--pkgmgr", "pica", "-U", artifact]).success();

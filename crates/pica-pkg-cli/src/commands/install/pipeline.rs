@@ -755,15 +755,6 @@ impl InstallTransaction {
   ///
   /// Its files join the payload history like any other deployed path, and its
   /// name is the container's contribution to "packages this install added" —
-  /// with no backend snapshot to diff against, the unpacked containers are it.
-  fn record_container(&mut self, pkgname: String, install: PayloadInstall) {
-    if !self.tx_added.contains(&pkgname) {
-      self.tx_added.push(pkgname.clone());
-    }
-    self.pkgs.push(pkgname);
-    self.record_payload(install);
-  }
-
   fn record_hook(&mut self, label: &str) {
     self.executed_hooks.push(label.to_string());
   }
@@ -1384,55 +1375,35 @@ arch = all
   fn a_rollback_that_cannot_finish_keeps_a_record_to_remove_by_hand() {
     let mut fixture = PicaFixture::new();
 
-    // A hook writes a file of its own into the kept-scripts directory. That
-    // directory is recorded as one this install created and its files are
-    // recorded for removal, but the hook's file is not among them, so the
-    // rollback empties what it knows about, finds the directory still holding
-    // something, and cannot finish. That is the case a record has to survive
-    // for: `-R` driven by it is the only thing left that can clean up.
-    let hook = format!(
-      "#!/bin/sh\nmkdir -p {dir}\ntouch {dir}/hook-made-this.conf\n",
-      dir = fixture
-        .target
-        .as_path()
-        .join("usr/lib/pica/scripts/demo")
-        .display()
-    );
+    // The install hook runs, so the rollback knows a hook changed something only
+    // this package can undo and tries to compensate with the package's own
+    // `remove` hook. That hook is declared but fails, so the compensation cannot
+    // finish — the case a surviving record exists for, because `-R` driven by
+    // that record is the only thing left that can clean up.
+    let install_hook = "#!/bin/sh\nmkdir -p /tmp/pica-install-ran\n";
+    let failing_remove = "#!/bin/sh\nexit 1\n";
 
     let err = fixture
       .install_without_containers(
-        &format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/hook\n"),
-        // The payload walk must trip, and it must trip after something has been
-        // recorded, so `aaa.conf` sorts ahead of the escaping symlink.
+        &format!(
+          "{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\nscript_remove = scripts/remove\n"
+        ),
+        // `aaa.conf` sorts ahead of the escaping symlink, so the walk copies it
+        // and then trips, which is what starts the rollback in the first place.
         &[("aaa.conf", "copied before the walk failed\n")],
         &[("zzz-escape", "/etc/passwd")],
-        &[
-          ("scripts/hook", hook.as_str()),
-          ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=1\nPICA_KEEP_SCRIPT_REMOVE=1\n"),
-          ("scripts/remove", hook.as_str()),
-        ],
+        &[("scripts/install", install_hook), ("scripts/remove", failing_remove)],
       )
       .expect_err("the payload walk trips on the escaping symlink");
 
     assert!(err.message.contains("rollback incomplete"), "{}", err.message);
-    assert!(
-      !fixture.path("aaa.conf").exists(),
-      "what the walk did copy is taken back out"
-    );
-    assert!(
-      fixture.path("usr/lib/pica/scripts/demo/hook-made-this.conf").exists(),
-      "Pica cannot know the hook's file is disposable, so it stays"
-    );
+    assert!(!fixture.path("aaa.conf").exists(), "what the walk did copy is taken back out");
 
     let record = db_record(&fixture.app, "demo")
       .expect("an incomplete rollback keeps a record, because -R is the only way left");
     assert!(
       record["files"].as_array().is_some_and(Vec::is_empty),
-      "the recorded files were removed; only directories are left: {record}"
-    );
-    assert!(
-      record["dirs"].as_array().is_some_and(|dirs| !dirs.is_empty()),
-      "the directories that could not be removed are recorded: {record}"
+      "the recorded files were all removed; only the hook residue is left: {record}"
     );
   }
 

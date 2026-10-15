@@ -164,57 +164,6 @@ pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
   run_tar(&["-xzf"], &[], pkgfile, target_dir)
 }
 
-/// Extracts a container that concatenates several tar members.
-///
-/// An apk-tools 2.x `.apk` is a signature member, a control member and a data
-/// member gzipped one after another. Plain `tar -xzf` stops at the first
-/// end-of-archive marker and would unpack only the signature, so
-/// `--ignore-zeros` is what reads through the padding into the following
-/// members.
-///
-/// That layout is gone in apk-tools 3.x, whose packages are ADB archives that
-/// no tar can open; `pica_pack_core::container` refuses those before reaching here.
-///
-/// The flag goes *after* the archive because `-f` consumes the argument that
-/// follows it: `tar -xzf --ignore-zeros ARCHIVE` asks tar to open a member
-/// called `--ignore-zeros`. Where the flag itself is unknown the plain form is
-/// retried, which still unpacks single-member containers; the caller then
-/// reports the member it could not find.
-pub fn run_tar_extract_members(archive: &Path, target_dir: &Path) -> CliResult<()> {
-  match run_tar(&["-xzf"], &["--ignore-zeros"], archive, target_dir) {
-    Ok(()) => Ok(()),
-    Err(first) => run_tar(&["-xzf"], &[], archive, target_dir).map_err(|_| first),
-  }
-}
-
-/// Extracts a tar member whose compression is implied by its file name.
-///
-/// An `.ipk` keeps its payload in a `data.tar.<compression>` member, and the
-/// compression is whatever the builder chose, so the flags have to follow the
-/// name instead of assuming gzip. The compression is the last extension
-/// (`data.tar.gz` → `gz`), which is also what `.tgz`, `.txz` and `.tbz2` name
-/// with their short spellings, so matching on it covers both forms and reads
-/// the name case-insensitively.
-pub fn run_tar_extract_auto(archive: &Path, target_dir: &Path) -> CliResult<()> {
-  let extension =
-    archive.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-
-  let flags = match extension.as_str() {
-    "gz" | "tgz" => "-xzf",
-    "xz" | "txz" => "-xJf",
-    "bz2" | "tbz2" => "-xjf",
-    "tar" => "-xf",
-    _ => {
-      return Err(CliError::new(
-        E_RUNTIME,
-        format!("unsupported container payload compression: {}", archive.display()),
-      ));
-    }
-  };
-
-  run_tar(&[flags], &[], archive, target_dir)
-}
-
 /// Runs `tar` with the archive in the place an option expects it.
 ///
 /// `flags` come before the archive and `after` — anything else the archive needs

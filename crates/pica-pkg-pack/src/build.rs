@@ -291,7 +291,11 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
   if req.backend.expects_containers() {
     let pkgs_src = req.pkgdir.join(PKGS);
     if req.backend == BuildBackend::Pica {
-      let names = crate::container::unpack_into(&pkgs_src, &tmpdir.join(ROOT))?;
+      // Only this backend's own containers: `pkgs/<backend>/` holds what the
+      // device's package manager would install, and another backend's containers
+      // are none of this artifact's business.
+      let names =
+        crate::container::unpack_into(&pkgs_src.join(req.backend.as_str()), &tmpdir.join(ROOT))?;
       if !names.is_empty() {
         msg2(format!("  -> Expanded {} container(s): {}", names.len(), names.join(" ")));
       }
@@ -527,6 +531,52 @@ mod tests {
     super::main_build(root, Some(root.join("out")), None).map_err(|err| err.to_string())
   }
 
+  /// Builds a real `.ipk` so the unpack path is exercised rather than mocked:
+  /// an outer tar holding a `control.tar.gz` (which carries `Package:`) and a
+  /// `data.tar.gz` (which carries the files).
+  fn make_ipk(root: &Path, pkgname: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let staging = root.join("ipk-staging");
+    let _ = fs::remove_dir_all(&staging);
+
+    let data = staging.join("data");
+    for (relative, contents) in files {
+      let path = data.join(relative);
+      fs::create_dir_all(path.parent().expect("payload parent")).expect("mkdir payload");
+      fs::write(&path, contents).expect("write payload file");
+    }
+    let data_tar = root.join("data.tar.gz");
+    tar(&["-czf", data_tar.to_str().expect("path"), "-C", data.to_str().expect("path"), "."]);
+
+    let control = staging.join("control");
+    fs::create_dir_all(&control).expect("mkdir control");
+    fs::write(control.join("control"), format!("Package: {pkgname}\nVersion: 1.0\n"))
+      .expect("write control");
+    let control_tar = root.join("control.tar.gz");
+    tar(&[
+      "-czf",
+      control_tar.to_str().expect("path"),
+      "-C",
+      control.to_str().expect("path"),
+      "control",
+    ]);
+
+    let ipk = root.join(format!("{pkgname}.ipk"));
+    tar(&[
+      "-czf",
+      ipk.to_str().expect("path"),
+      "-C",
+      root.to_str().expect("path"),
+      "control.tar.gz",
+      "data.tar.gz",
+    ]);
+    ipk
+  }
+
+  fn tar(args: &[&str]) {
+    let status = std::process::Command::new("tar").args(args).status().expect("run tar");
+    assert!(status.success(), "tar {args:?} failed");
+  }
+
   /// Names of the entries inside a built artifact, as `tar -tzf` prints them.
   fn artifact_entries(artifact: &Path) -> String {
     let output =
@@ -750,36 +800,48 @@ mod tests {
   }
 
   #[test]
-  fn builds_a_pkgs_only_package_for_pica() {
+  fn a_pica_target_expands_its_containers_into_root() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();
+    let staging = root.join("payload/etc/demo");
+    fs::create_dir_all(&staging).expect("mkdir payload");
+    fs::write(staging.join("from-container"), "container\n").expect("write payload");
+    let container = make_ipk(&root, "demo-lib", &[("etc/demo/from-container", "container\n")]);
     fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
-    fs::write(root.join("pkgs/pica/demo.ipk"), b"ipk").expect("write container");
-
-    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
-
-    let built = artifact(&root, "pica");
-    assert!(built.is_file(), "{}", built.display());
-    assert!(
-      artifact_entries(&built).contains("pkgs/demo.ipk"),
-      "pkgs/<backend>/ counts as payload and must be flattened into the artifact"
-    );
-  }
-
-  #[test]
-  fn builds_a_pkgs_and_root_package() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
-    fs::write(root.join("pkgs/pica/demo.ipk"), b"ipk").expect("write container");
-    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
-    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+    fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
 
     build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
 
     let entries = artifact_entries(&artifact(&root, "pica"));
-    assert!(entries.contains("pkgs/demo.ipk"), "{entries}");
-    assert!(entries.contains("root/etc/demo.conf"), "{entries}");
+    assert!(
+      entries.contains("root/etc/demo/from-container"),
+      "the container's payload belongs in root/ so the device only copies files: {entries}"
+    );
+    assert!(
+      !entries.lines().any(|entry| entry.starts_with("pkgs/")),
+      "a pica artifact must not ship containers: {entries}"
+    );
+  }
+
+  #[test]
+  fn a_pica_target_merges_containers_with_the_overlay() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    let container = make_ipk(&root, "demo-lib", &[("etc/demo/shared", "container\n")]);
+    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
+    fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
+    fs::create_dir_all(root.join("root/etc/demo")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo/shared"), "overlay\n").expect("write config");
+    fs::write(root.join("root/etc/demo/only-root"), "root\n").expect("write config");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
+
+    let entries = artifact_entries(&artifact(&root, "pica"));
+    assert!(entries.contains("root/etc/demo/only-root"), "{entries}");
+    assert!(
+      entries.contains("root/etc/demo/shared"),
+      "root/ wins a path the container also provides, so the merge is not a conflict: {entries}"
+    );
   }
 
   #[test]

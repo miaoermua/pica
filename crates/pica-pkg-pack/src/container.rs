@@ -61,7 +61,10 @@ fn run_tar(flags: &[&str], extra: &[&str], archive: &Path, target: &Path) -> Pic
   let mut last = None;
   for suffix in [extra, &[]] {
     let mut command = Command::new("tar");
-    command.args(flags).args(suffix).arg(archive).arg("-C").arg(target);
+    // The order matters: `-f` consumes the argument that follows it, so
+    // `tar -xzf --ignore-zeros ARCHIVE` would ask tar to open a member called
+    // `--ignore-zeros`. The extra flags therefore follow the archive.
+    command.args(flags).arg(archive).args(suffix).arg("-C").arg(target);
     match command.output() {
       Ok(output) if output.status.success() => return Ok(()),
       Ok(output) => {
@@ -98,11 +101,8 @@ pub struct UnpackedContainer {
 /// Returns an error for an unknown container format, an ADB (apk-tools 3.x)
 /// container, a container whose payload cannot be found, and a failed extract.
 pub fn unpack_container(container: &Path) -> PicaResult<UnpackedContainer> {
-  let extension = container
-    .extension()
-    .and_then(|value| value.to_str())
-    .unwrap_or("")
-    .to_ascii_lowercase();
+  let extension =
+    container.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
   if extension != "ipk" && extension != "apk" {
     return Err(PicaError::msg(format!(
       "unsupported container format: {} (expected .ipk or .apk)",
@@ -131,16 +131,60 @@ pub fn unpack_container(container: &Path) -> PicaResult<UnpackedContainer> {
     })?;
     // An ipk's data member names its own compression, which the builder chose.
     run_tar(&compression_flags(&member), &[], &member, data.path())?;
-    (data.path().to_path_buf(), read_text(&outer.path().join("control")))
+    // `control` lives inside `control.tar.gz`, not loose in the outer archive.
+    (data.path().to_path_buf(), read_ipk_control(outer.path()))
   } else {
     strip_apk_control(outer.path())?;
     (outer.path().to_path_buf(), read_text(&outer.path().join(".PKGINFO")))
   };
 
-  Ok(UnpackedContainer {
-    pkgname: package_name(&control, container),
-    payload_root,
-  })
+  // The payload is copied out before this returns: `data` is a `Scratch`, so its
+  // directory is removed when this function returns and a path handed back from
+  // it would already be gone by the time the caller looked.
+  let owned = make_temp_dir("pica-container-out")?;
+  copy_tree(&payload_root, &owned)?;
+  std::mem::forget(data);
+
+  Ok(UnpackedContainer { pkgname: package_name(&control, container), payload_root: owned })
+}
+
+/// The `control` text of an `.ipk`: the outer archive holds `control.tar.gz`, and
+/// the `control` file is a member of that.
+/// The `control` text of an `.ipk`: the outer archive holds `control.tar.gz`, and
+/// the `control` file is a member of that.
+///
+/// It is unpacked into a directory of its own rather than beside the payload:
+/// a `control.tar.gz` also carries the maintainer scripts (`preinst`,
+/// `postinst`, `prerm`, `postrm`, `control`), and those are not payload. Sharing
+/// the payload's directory would hand them to the device's root.
+fn read_ipk_control(outer: &Path) -> String {
+  let Some(member) = find_control_member(outer) else {
+    // Some builders put a plain `control` file loose in the outer archive.
+    return read_text(&outer.join("control"));
+  };
+  let control_dir = Scratch::new("pica-container-control");
+  let Ok(scratch) = control_dir else { return read_text(&outer.join("control")) };
+  if run_tar(&["-xzf"], &[], &member, scratch.path()).is_err() {
+    return read_text(&outer.join("control"));
+  }
+  read_text(&scratch.path().join("control"))
+}
+
+/// The `control.tar.*` member of an `.ipk`, if it has one.
+fn find_control_member(outer: &Path) -> Option<PathBuf> {
+  let entries = fs::read_dir(outer).ok()?;
+  let mut candidates: Vec<PathBuf> = entries
+    .flatten()
+    .map(|entry| entry.path())
+    .filter(|path| {
+      path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.starts_with("control.tar"))
+    })
+    .collect();
+  candidates.sort();
+  candidates.into_iter().next()
 }
 
 /// Whether `path` starts with the apk-tools 3.x signature block.
@@ -170,7 +214,6 @@ pub fn unpack_into(pkgs_dir: &Path, payload: &Path) -> PicaResult<Vec<String>> {
   let mut containers: Vec<PathBuf> = Vec::new();
   collect_files(pkgs_dir, &mut containers)?;
   containers.sort();
-
   let mut names = Vec::new();
   for container in &containers {
     let unpacked = unpack_container(container)?;
@@ -237,11 +280,7 @@ fn find_data_member(outer: &Path) -> Option<PathBuf> {
 
 /// The tar flags implied by an `data.tar.<compression>` member's name.
 fn compression_flags(member: &Path) -> Vec<&'static str> {
-  let name = member
-    .file_name()
-    .and_then(|value| value.to_str())
-    .unwrap_or("")
-    .to_ascii_lowercase();
+  let name = member.file_name().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
   if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
     vec!["-xzf"]
   } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
@@ -265,10 +304,7 @@ fn strip_apk_control(outer: &Path) -> PicaResult<()> {
   for entry in entries.flatten() {
     let path = entry.path();
     if path.is_file()
-      && path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|name| name.starts_with('.'))
+      && path.file_name().and_then(|value| value.to_str()).is_some_and(|name| name.starts_with('.'))
     {
       let _ = fs::remove_file(&path);
     }
@@ -300,20 +336,17 @@ fn package_name(control: &str, container: &Path) -> String {
       }
     }
   }
-  container
-    .file_stem()
-    .and_then(|value| value.to_str())
-    .unwrap_or("unknown")
-    .to_string()
+  container.file_stem().and_then(|value| value.to_str()).unwrap_or("unknown").to_string()
 }
 
 #[cfg(test)]
 mod tests {
   use super::{compression_flags, is_adb_container, package_name, unpack_container, unpack_into};
+  use pica_pkg_core::io::make_temp_dir;
+  use pretty_assertions::assert_eq;
   use std::fs;
   use std::io::Write;
   use std::path::Path;
-  use pretty_assertions::assert_eq;
 
   #[test]
   fn reads_the_ipk_package_field() {
@@ -367,6 +400,78 @@ mod tests {
     let message = err.to_string();
     assert!(message.contains("apk-tools 3.x"), "the error must name the format: {message}");
     assert!(message.contains("targets = apk"), "the error must offer a way forward: {message}");
+  }
+
+  #[test]
+  fn an_ipk_maintainer_scripts_are_not_payload() {
+    // `control.tar.gz` carries `preinst`, `postinst`, `prerm`, `postrm` and
+    // `control`. They belong to the package manager, not to the rootfs, and
+    // unpacking them beside the payload would hand the device a `/postinst`.
+    let dir = make_temp_dir("pica-ipk-scripts").expect("temp dir");
+    let container = build_ipk_with_scripts(&dir, "demo-lib");
+
+    let unpacked = unpack_container(&container).expect("unpack");
+    let leaked: Vec<String> = ["control", "preinst", "postinst", "prerm", "postrm"]
+      .into_iter()
+      .filter(|name| unpacked.payload_root.join(name).exists())
+      .map(ToString::to_string)
+      .collect();
+    assert!(leaked.is_empty(), "maintainer scripts must not be payload: {leaked:?}");
+
+    assert_eq!(unpacked.pkgname, "demo-lib");
+    assert!(unpacked.payload_root.join("etc/demo").is_dir(), "the payload is still there");
+  }
+
+  /// An `.ipk` whose `control.tar.gz` also holds the maintainer scripts a real
+  /// package carries, which is what must not be mistaken for payload.
+  fn build_ipk_with_scripts(dir: &Path, pkgname: &str) -> std::path::PathBuf {
+    let data = dir.join("data/etc/demo");
+    fs::create_dir_all(&data).expect("mkdir data");
+    fs::write(data.join("config"), "payload\n").expect("write payload");
+    let data_tar = dir.join("data.tar.gz");
+    run(&[
+      "-czf",
+      data_tar.to_str().expect("path"),
+      "-C",
+      dir.join("data").to_str().expect("path"),
+      ".",
+    ]);
+
+    let control = dir.join("ctl");
+    fs::create_dir_all(&control).expect("mkdir control");
+    fs::write(control.join("control"), format!("Package: {pkgname}\nVersion: 1.0\n"))
+      .expect("write control");
+    for script in ["preinst", "postinst", "prerm", "postrm"] {
+      fs::write(control.join(script), "#!/bin/sh\nexit 0\n").expect("write script");
+    }
+    let control_tar = dir.join("control.tar.gz");
+    run(&[
+      "-czf",
+      control_tar.to_str().expect("path"),
+      "-C",
+      control.to_str().expect("path"),
+      "control",
+      "preinst",
+      "postinst",
+      "prerm",
+      "postrm",
+    ]);
+
+    let ipk = dir.join("demo_1.0_all.ipk");
+    run(&[
+      "-czf",
+      ipk.to_str().expect("path"),
+      "-C",
+      dir.to_str().expect("path"),
+      "control.tar.gz",
+      "data.tar.gz",
+    ]);
+    ipk
+  }
+
+  fn run(args: &[&str]) {
+    let status = std::process::Command::new("tar").args(args).status().expect("run tar");
+    assert!(status.success(), "tar {args:?} failed");
   }
 
   #[test]
