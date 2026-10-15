@@ -1,5 +1,6 @@
 use crate::archive::{compute_sha256, run_tar_create, unpacked_size, write_sha256sum_entry};
 use crate::backend::{BuildBackend, parse_targets};
+use crate::container::PayloadRoot;
 use crate::matrix::{collect_archs, collect_platforms, has_platform_arch_matrix};
 use crate::rewrite::{BuiltFields, rewrite_manifest_for_build};
 use crate::{msg, msg2};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// Directory names inside a pkgdir. See docs/standard.md.
 const MANIFEST: &str = "manifest";
 const SCRIPTS: &str = "scripts";
-const ROOT: &str = "root";
+pub(crate) const ROOT: &str = "root";
 const PKGS: &str = "pkgs";
 const LICENSE: &str = "LICENSE";
 
@@ -31,7 +32,6 @@ pub(crate) struct BuildRequest<'a> {
   pub pica: &'a str,
   pub has_matrix: bool,
   pub backend: BuildBackend,
-  pub install_size: u64,
 }
 
 pub(crate) fn main_build(
@@ -87,8 +87,6 @@ pub(crate) fn main_build(
     )));
   }
 
-  let install_size = unpacked_size(&pkgdir.join(ROOT));
-
   if pica.is_empty() {
     msg2("Pica requires: (not specified)");
   } else {
@@ -123,7 +121,6 @@ pub(crate) fn main_build(
             pica: &pica,
             has_matrix,
             backend,
-            install_size,
           })?;
         }
       }
@@ -139,7 +136,6 @@ pub(crate) fn main_build(
         pica: &pica,
         has_matrix,
         backend,
-        install_size,
       })?;
     }
   }
@@ -231,13 +227,11 @@ pub(crate) fn build_one(req: &BuildRequest<'_>) -> PicaResult<()> {
   ));
   msg2(format!("Platform: {}", req.build_platform));
   msg2(format!("Arch: {}", req.build_arch));
-  msg2(format!("Install size: {} bytes", req.install_size));
   if req.pica.is_empty() {
     msg2("Pica requires: (not specified)");
   } else {
     msg2(format!("Pica requires >= {}", req.pica));
   }
-  msg2("Creating archive...");
 
   let tmpdir = make_temp_dir("pica-pack")?;
   let result = stage_and_pack(req, &tmpdir, &pkgfile);
@@ -260,28 +254,17 @@ fn resolve_version(pkgver: String, pkgrel: String) -> (String, String) {
 }
 
 fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaResult<()> {
-  rewrite_manifest_for_build(
-    &req.pkgdir.join(MANIFEST),
-    &tmpdir.join(MANIFEST),
-    &BuiltFields {
-      pkgver: req.pkgver,
-      pkgrel: req.pkgrel,
-      platform: req.build_platform,
-      arch: req.build_arch,
-      pkgmgr: req.backend.as_str(),
-      size: req.install_size,
-    },
-  )?;
-
   let scripts_src = req.pkgdir.join(SCRIPTS);
   if scripts_src.is_dir() {
     copy_dir_recursive(&scripts_src, &tmpdir.join(SCRIPTS))?;
   }
 
+  // `root/` is assembled before the manifest is written, because the size the
+  // manifest records is the size of what a device will deploy — and for a `pica`
+  // artifact part of that comes out of the containers, so it is not known until
+  // they have been expanded.
   let root_src = req.pkgdir.join(ROOT);
-  if root_src.is_dir() {
-    copy_dir_recursive(&root_src, &tmpdir.join(ROOT))?;
-  }
+  let mut payload = PayloadRoot::new(tmpdir.join(ROOT));
 
   // A `pica`-backend artifact has to be self-contained: the device only ever
   // copies files, so any container it ships is expanded here at build time and
@@ -294,8 +277,7 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
       // Only this backend's own containers: `pkgs/<backend>/` holds what the
       // device's package manager would install, and another backend's containers
       // are none of this artifact's business.
-      let names =
-        crate::container::unpack_into(&pkgs_src.join(req.backend.as_str()), &tmpdir.join(ROOT))?;
+      let names = payload.merge_containers(&pkgs_src.join(req.backend.as_str()))?;
       if !names.is_empty() {
         msg2(format!("  -> Expanded {} container(s): {}", names.len(), names.join(" ")));
       }
@@ -303,6 +285,33 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
       stage_packages(req, &tmpdir.join(PKGS))?;
     }
   }
+
+  // Last, so that the maintainer's own file is what ends up in the artifact when
+  // a container carries the same path: `root/` is where a package says what it
+  // meant, and a container's copy is the thing being corrected. Two containers
+  // disputing one path is a different matter, and the merge refuses it.
+  payload.merge_overlay(&root_src)?;
+  if root_src.is_dir() {
+    // An empty `root/` is still a directory the package asked to ship.
+    ensure_dir(payload.root())?;
+  }
+
+  let install_size = unpacked_size(payload.root());
+  msg2(format!("Install size: {install_size} bytes"));
+  msg2("Creating archive...");
+
+  rewrite_manifest_for_build(
+    &req.pkgdir.join(MANIFEST),
+    &tmpdir.join(MANIFEST),
+    &BuiltFields {
+      pkgver: req.pkgver,
+      pkgrel: req.pkgrel,
+      platform: req.build_platform,
+      arch: req.build_arch,
+      pkgmgr: req.backend.as_str(),
+      size: install_size,
+    },
+  )?;
 
   let license_src = req.pkgdir.join(LICENSE);
   if license_src.is_file() {
@@ -329,7 +338,7 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
   write_sha256sum_entry(&req.output_dir.join("SHA256SUMS"), pkgfile, &sha256)?;
 
   let built_manifest = Manifest::from_file(tmpdir.join(MANIFEST))?;
-  write_repo_index(req, &built_manifest, pkgfile, &sha256, csize)?;
+  write_repo_index(req, &built_manifest, pkgfile, &sha256, csize, install_size)?;
 
   msg(format!("Finished: {}", final_pkg.display()));
   println!("{}", final_pkg.display());
@@ -454,12 +463,17 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
 /// Writes the per-backend repo index. Top-level fields are filled from the
 /// built manifest so the index is queryable without unpacking the artifact,
 /// and the embedded manifest keeps full array semantics for repeated keys.
+///
+/// `install_size` is passed rather than read back from `manifest`: the index
+/// advertises what an install will cost, and the manifest's own value is written
+/// from the same number so the two cannot disagree.
 fn write_repo_index(
   req: &BuildRequest<'_>,
   manifest: &Manifest,
   filename: &str,
   sha256: &str,
   csize: u64,
+  install_size: u64,
 ) -> PicaResult<()> {
   let index_path = req.output_dir.join("repo.json");
   let mut index = if index_path.is_file() {
@@ -498,7 +512,7 @@ fn write_repo_index(
     visibility: text("visibility"),
     pica: text("pica").or_else(|| (!req.pica.is_empty()).then(|| req.pica.to_string())),
     download_url: None,
-    size: Some(req.install_size),
+    size: Some(install_size),
     csize: Some(csize),
     manifest: Some(manifest.value.clone()),
     extra: serde_json::Map::default(),
@@ -582,6 +596,18 @@ mod tests {
     let output =
       std::process::Command::new("tar").arg("-tzf").arg(artifact).output().expect("run tar");
     assert!(output.status.success(), "tar -tzf failed for {}", artifact.display());
+    String::from_utf8_lossy(&output.stdout).to_string()
+  }
+
+  /// The contents of one file inside a built artifact.
+  fn artifact_file(artifact: &Path, relative: &str) -> String {
+    let output = std::process::Command::new("tar")
+      .args(["-xzOf"])
+      .arg(artifact)
+      .arg(relative)
+      .output()
+      .expect("run tar");
+    assert!(output.status.success(), "tar -xzOf {relative} failed for {}", artifact.display());
     String::from_utf8_lossy(&output.stdout).to_string()
   }
 
@@ -689,7 +715,6 @@ mod tests {
       pica: "",
       has_matrix: false,
       backend: BuildBackend::Apk,
-      install_size: 4096,
     };
     write_repo_index(
       &req,
@@ -697,6 +722,7 @@ mod tests {
       "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz",
       &"1".repeat(64),
       2048,
+      4096,
     )
     .expect("write index");
 
@@ -724,6 +750,7 @@ mod tests {
       &manifest,
       "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz",
       &"2".repeat(64),
+      4096,
       4096,
     )
     .expect("rewrite index");
@@ -836,12 +863,67 @@ mod tests {
 
     build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
 
-    let entries = artifact_entries(&artifact(&root, "pica"));
+    let built = artifact(&root, "pica");
+    let entries = artifact_entries(&built);
     assert!(entries.contains("root/etc/demo/only-root"), "{entries}");
     assert!(
       entries.contains("root/etc/demo/shared"),
       "root/ wins a path the container also provides, so the merge is not a conflict: {entries}"
     );
+    assert_eq!(
+      artifact_file(&built, "root/etc/demo/shared"),
+      "overlay\n",
+      "root/ winning has to mean its contents, not just a file with that name"
+    );
+  }
+
+  #[test]
+  fn two_containers_providing_one_file_fail_the_build() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    let a = make_ipk(&root, "demo-a", &[("etc/demo.conf", "from-a\n")]);
+    let b = make_ipk(&root, "demo-b", &[("etc/demo.conf", "from-b\n")]);
+    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
+    fs::copy(&a, root.join("pkgs/pica/demo-a.ipk")).expect("stage a");
+    fs::copy(&b, root.join("pkgs/pica/demo-b.ipk")).expect("stage b");
+
+    let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n"))
+      .expect_err("two containers may not claim one path");
+    assert!(err.contains("demo-a") && err.contains("demo-b"), "{err}");
+    assert!(err.contains("etc/demo.conf"), "{err}");
+
+    // The refusal happens while the payload is assembled, so nothing is written.
+    let written: Vec<String> = fs::read_dir(root.join("out/pica"))
+      .map(|entries| {
+        entries.flatten().map(|entry| entry.file_name().to_string_lossy().into()).collect()
+      })
+      .unwrap_or_default();
+    assert!(written.is_empty(), "a refused build must leave no artifact: {written:?}");
+  }
+
+  #[test]
+  fn the_reported_size_is_what_the_containers_brought() {
+    // The package ships only `pkgs/pica/`: everything it installs comes out of
+    // the container, so a size taken before the merge would report zero.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    let container = make_ipk(&root, "demo-lib", &[("usr/lib/libdemo.so", "0123456789")]);
+    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
+    fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
+
+    let built = artifact(&root, "pica");
+    assert_eq!(artifact_file(&built, "root/usr/lib/libdemo.so"), "0123456789");
+    assert!(
+      artifact_file(&built, "manifest").contains("size = 10"),
+      "the artifact manifest must describe the payload the device will deploy:\n{}",
+      artifact_file(&built, "manifest")
+    );
+
+    let index = fs::read_to_string(root.join("out/pica/repo.json")).expect("read index");
+    let parsed = parse_repo_json(&index).expect("valid index");
+    assert_eq!(parsed.packages[0].size, Some(10), "the index advertises the same number");
   }
 
   #[test]

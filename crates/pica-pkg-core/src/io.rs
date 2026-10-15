@@ -122,8 +122,15 @@ pub fn copy_dir_recursive(source: &Path, target: &Path) -> PicaResult<()> {
   Ok(())
 }
 
+/// Recreates `source` at `target` as a link to the same place, rather than
+/// copying what it points at.
+///
+/// # Errors
+/// Returns an error if the link cannot be read or created. Where the platform
+/// has no symlinks the file is copied instead, which is the closest thing to
+/// the same meaning.
 #[cfg(unix)]
-fn copy_symlink(source: &Path, target: &Path) -> PicaResult<()> {
+pub fn copy_symlink(source: &Path, target: &Path) -> PicaResult<()> {
   use std::os::unix::fs::symlink;
 
   let link_target = fs::read_link(source)?;
@@ -131,8 +138,15 @@ fn copy_symlink(source: &Path, target: &Path) -> PicaResult<()> {
   Ok(())
 }
 
+/// Recreates `source` at `target` as a link to the same place, rather than
+/// copying what it points at.
+///
+/// # Errors
+/// Returns an error if the link cannot be read or created. Where the platform
+/// has no symlinks the file is copied instead, which is the closest thing to
+/// the same meaning.
 #[cfg(not(unix))]
-fn copy_symlink(source: &Path, target: &Path) -> PicaResult<()> {
+pub fn copy_symlink(source: &Path, target: &Path) -> PicaResult<()> {
   let _ = target;
   fs::copy(source, target)?;
   Ok(())
@@ -226,7 +240,7 @@ fn walk_payload(
     } else if metadata.is_symlink() {
       let link = fs::read_link(&from)?;
       let parent = to.parent().unwrap_or(target_root).to_path_buf();
-      if symlink_escapes(&link, &parent, target_root) {
+      if symlink_escapes_root(&link, &parent, target_root) {
         return Err(PicaError::msg(format!(
           "payload symlink escapes the target root: {} -> {}",
           relative.display(),
@@ -292,13 +306,23 @@ fn resolve_under(target_root: &Path, relative: &Path) -> PicaResult<PathBuf> {
   Ok(out)
 }
 
-fn symlink_escapes(link: &Path, link_parent: &Path, target_root: &Path) -> bool {
+/// Whether `link` would resolve outside `root`, the directory whose contents it
+/// is allowed to name.
+///
+/// Both stages of a package's life have to answer this the same way: the build
+/// merges a container's files into an artifact, and the device lays that
+/// artifact's `root/` down. A link the build accepts but the device refuses
+/// builds a package that only fails where it is used, and a link the device
+/// accepts but the build follows leads out of the payload and into whatever
+/// machine is building it. The rule lives here so the two cannot drift.
+#[must_use]
+pub fn symlink_escapes_root(link: &Path, link_parent: &Path, root: &Path) -> bool {
   let resolved = if link.is_absolute() {
     lexical_normalize(link)
   } else {
     lexical_normalize(&link_parent.join(link))
   };
-  !resolved.starts_with(target_root)
+  !resolved.starts_with(root)
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
