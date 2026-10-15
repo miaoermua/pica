@@ -1,6 +1,6 @@
 use crate::archive::{compute_sha256, run_tar_create, unpacked_size, write_sha256sum_entry};
 use crate::backend::{BuildBackend, parse_targets};
-use crate::container::PayloadRoot;
+use crate::container::{PayloadRoot, is_adb_container, unpack_container};
 use crate::matrix::{collect_archs, collect_platforms, has_platform_arch_matrix};
 use crate::rewrite::{BuiltFields, rewrite_manifest_for_build};
 use crate::{msg, msg2};
@@ -85,12 +85,6 @@ pub(crate) fn main_build(
     return Err(PicaError::msg(format!(
       "package would be empty: provide at least one of {SCRIPTS}/, {ROOT}/ or {PKGS}/<backend>/"
     )));
-  }
-
-  if pica.is_empty() {
-    msg2("Pica requires: (not specified)");
-  } else {
-    msg2(format!("Pica requires >= {pica}"));
   }
 
   let base_output = match outdir {
@@ -279,7 +273,7 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
       // are none of this artifact's business.
       let names = payload.merge_containers(&pkgs_src.join(req.backend.as_str()))?;
       if !names.is_empty() {
-        msg2(format!("  -> Expanded {} container(s): {}", names.len(), names.join(" ")));
+        msg2(format!("Expanded {} container(s): {}", names.len(), names.join(" ")));
       }
     } else {
       stage_packages(req, &tmpdir.join(PKGS))?;
@@ -296,8 +290,34 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
     ensure_dir(payload.root())?;
   }
 
-  let install_size = unpacked_size(payload.root());
+  // The containers an `opkg`/`apk` artifact ships are installed by the system
+  // package manager, so they are part of what the package costs on a device —
+  // and, as for a `pica` artifact's own containers, they only say how much once
+  // they have been unpacked. A `pica` artifact expanded its containers into
+  // `root/` above, so its `root/` is the whole payload already.
+  let containers = match req.backend {
+    BuildBackend::Pica => ContainerPayload::default(),
+    _ => measure_containers(&tmpdir.join(PKGS))?,
+  };
+
+  let install_size = unpacked_size(payload.root()) + containers.bytes;
   msg2(format!("Install size: {install_size} bytes"));
+  if !containers.counted.is_empty() {
+    msg2(format!(
+      "{} of those bytes are in {} container(s): {}",
+      containers.bytes,
+      containers.counted.len(),
+      containers.counted.join(" ")
+    ));
+  }
+  // A container pica cannot unpack is named instead of counted as nothing: a
+  // package that installs files must not be advertised as installing no bytes.
+  if !containers.unmeasured.is_empty() {
+    msg2(format!(
+      "WARNING: not counted, pica cannot unpack them: {}",
+      containers.unmeasured.join(", ")
+    ));
+  }
   msg2("Creating archive...");
 
   rewrite_manifest_for_build(
@@ -402,6 +422,57 @@ fn copy_packages_flat(source: &Path, dst: &Path, extensions: &[&str]) -> PicaRes
     fs::copy(from, dst.join(name))?;
   }
   Ok(files.len())
+}
+
+/// What the containers an `opkg`/`apk` artifact ships will install, and the
+/// ones whose payload could not be read.
+#[derive(Default)]
+struct ContainerPayload {
+  /// Bytes the counted containers put on a device, their payloads unpacked.
+  bytes: u64,
+  /// Names of the containers those bytes come from.
+  counted: Vec<String>,
+  /// Names of the containers that could not be unpacked, with the reason.
+  unmeasured: Vec<String>,
+}
+
+/// Measures the payload of every container in `pkgs_dir`, which is the staged
+/// copy of what the artifact ships.
+///
+/// A payload has to be expanded before it can be measured — an `.ipk` only says
+/// what it installs inside its `data` member — which is why this cannot happen
+/// before the artifact's contents are assembled. A container pica cannot unpack
+/// is reported to the caller rather than counted as nothing, and rather than
+/// failing the build: shipping a container is the maintainer's decision, and
+/// accepting it is the device's package manager's business, not this one's.
+fn measure_containers(pkgs_dir: &Path) -> PicaResult<ContainerPayload> {
+  let mut measured = ContainerPayload::default();
+  if !pkgs_dir.is_dir() {
+    return Ok(measured);
+  }
+
+  let mut containers: Vec<PathBuf> = Vec::new();
+  for entry in fs::read_dir(pkgs_dir)? {
+    containers.push(entry?.path());
+  }
+  containers.sort();
+
+  for container in containers {
+    let name = container.file_name().unwrap_or_default().to_string_lossy().to_string();
+    if is_adb_container(&container) {
+      measured.unmeasured.push(format!("{name} (apk-tools 3.x ADB)"));
+      continue;
+    }
+    match unpack_container(&container) {
+      Ok(unpacked) => {
+        measured.bytes += unpacked_size(unpacked.payload_root());
+        measured.counted.push(name);
+      }
+      Err(err) => measured.unmeasured.push(format!("{name} ({err})")),
+    }
+  }
+
+  Ok(measured)
 }
 
 fn collect_packages(
@@ -924,6 +995,98 @@ mod tests {
     let index = fs::read_to_string(root.join("out/pica/repo.json")).expect("read index");
     let parsed = parse_repo_json(&index).expect("valid index");
     assert_eq!(parsed.packages[0].size, Some(10), "the index advertises the same number");
+  }
+
+  #[test]
+  fn an_opkg_artifact_counts_what_its_containers_install() {
+    // The package ships only `pkgs/opkg/`, and opkg installs it on the device:
+    // a size taken over `root/` alone would advertise a package that lays ten
+    // bytes down as one that installs nothing.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    let container = make_ipk(&root, "demo-lib", &[("usr/lib/libdemo.so", "0123456789")]);
+    fs::create_dir_all(root.join("pkgs/opkg")).expect("mkdir pkgs");
+    fs::copy(&container, root.join("pkgs/opkg/demo-lib.ipk")).expect("stage container");
+    // `root/` is deployed too, so the number is the two of them together: the
+    // count is of files a device ends up with, whichever side brought them.
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "abc\n").expect("write config");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = opkg\n")).expect("build");
+
+    let built = artifact(&root, "opkg");
+    let manifest = artifact_file(&built, "manifest");
+    assert!(
+      manifest.contains("size = 14"),
+      "10 bytes of container plus a 4 byte root/ file:\n{manifest}"
+    );
+
+    let index = fs::read_to_string(root.join("out/opkg/repo.json")).expect("read index");
+    let parsed = parse_repo_json(&index).expect("valid index");
+    assert_eq!(parsed.packages[0].size, Some(14), "the index advertises the same number");
+  }
+
+  #[test]
+  fn a_container_payload_is_measured_after_unpacking_it() {
+    // The bytes only exist once the container has been expanded — an `.ipk` is
+    // an archive of an archive — so this is what says the count is not taken
+    // from the size of the file that carries it.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    let pkgs = root.join("pkgs");
+    fs::create_dir_all(&pkgs).expect("mkdir pkgs");
+    let container = make_ipk(&root, "demo-lib", &[("usr/lib/libdemo.so", "0123456789")]);
+    fs::copy(&container, pkgs.join("demo-lib.ipk")).expect("stage container");
+    // A file that is not a container is reported as well, and does not stop the
+    // container beside it from being measured.
+    fs::write(pkgs.join("junk.ipk"), "not a container").expect("write junk");
+
+    let measured = super::measure_containers(&pkgs).expect("measuring may not fail a build");
+
+    assert_eq!(measured.bytes, 10, "the payload, not the 4 kB container around it");
+    assert_eq!(measured.counted, ["demo-lib.ipk"]);
+    assert_eq!(measured.unmeasured.len(), 1, "{:?}", measured.unmeasured);
+    assert!(measured.unmeasured[0].contains("junk.ipk"), "{:?}", measured.unmeasured);
+  }
+
+  #[test]
+  fn an_adb_container_is_reported_rather_than_counted_as_zero() {
+    // apk-tools 3.x' ADB format is what an `apk` target normally ships, and tar
+    // cannot open it: the build has to finish, and the number it prints has to
+    // be known to be short of the truth rather than passed off as the size.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let pkgs = tmp.path().join("pkgs");
+    fs::create_dir_all(&pkgs).expect("mkdir pkgs");
+    fs::write(pkgs.join("demo.apk"), b"ADBd\0\0\0\0payload").expect("write adb container");
+
+    let measured = super::measure_containers(&pkgs).expect("an ADB container is not a build error");
+
+    assert_eq!(measured.bytes, 0);
+    assert!(measured.counted.is_empty(), "{:?}", measured.counted);
+    assert_eq!(measured.unmeasured.len(), 1, "{:?}", measured.unmeasured);
+    assert!(measured.unmeasured[0].contains("demo.apk"), "{:?}", measured.unmeasured);
+    assert!(measured.unmeasured[0].contains("ADB"), "{:?}", measured.unmeasured);
+  }
+
+  #[test]
+  fn an_apk_artifact_ships_a_container_it_cannot_read() {
+    // The refusal to unpack has to stay out of the artifact's way: the device's
+    // apk is the one that installs an ADB container, and it is the one that can
+    // say what it holds.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("pkgs/apk")).expect("mkdir pkgs");
+    fs::write(root.join("pkgs/apk/demo.apk"), b"ADBd\0\0\0\0payload").expect("write container");
+
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = apk\n"))
+      .expect("an ADB container is not a build error");
+
+    let built = artifact(&root, "apk");
+    assert!(
+      artifact_entries(&built).contains("pkgs/demo.apk"),
+      "the container is what the artifact is for:\n{}",
+      artifact_entries(&built)
+    );
   }
 
   #[test]

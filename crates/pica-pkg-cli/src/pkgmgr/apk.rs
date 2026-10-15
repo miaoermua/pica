@@ -101,18 +101,13 @@ impl IndexSource for ApkIndex {
 
     // Without a cache directory no fetched index can be there at all, which is
     // one reason for all of them rather than the same one per feed.
-    let fetched = configuration
-      .repositories
-      .iter()
-      .filter(|repository| repository.index.fetched())
-      .count();
+    let fetched =
+      configuration.repositories.iter().filter(|repository| repository.index.fetched()).count();
     if dir.is_none() && fetched > 0 {
       let dirs: Vec<String> =
         self.cache_dirs.iter().map(|path| path.display().to_string()).collect();
-      missing.push(format!(
-        "no index cache directory ({}) for {fetched} repositories",
-        dirs.join(", ")
-      ));
+      missing
+        .push(format!("no index cache directory ({}) for {fetched} repositories", dirs.join(", ")));
     }
 
     // apk names the index of a remote repository after a digest of its index
@@ -123,14 +118,9 @@ impl IndexSource for ApkIndex {
       let (path, complaint) = match &repository.index {
         // A local repository carries its index itself: apk reads it where it
         // lies, so that file is the one that has to be there.
-        IndexFile::Local(path) => {
-          (path.clone(), format!("no index file at {}", path.display()))
-        }
+        IndexFile::Local(path) => (path.clone(), format!("no index file at {}", path.display())),
         IndexFile::Fetched(name) => match dir {
-          Some(dir) => (
-            dir.join(name),
-            format!("no cached index for {}", repository.printable),
-          ),
+          Some(dir) => (dir.join(name), format!("no cached index for {}", repository.printable)),
           // said once above, for every repository that wants a cached index
           None => continue,
         },
@@ -651,7 +641,8 @@ mod tests {
 
     assert_eq!(missing.len(), 1);
     assert!(
-      missing[0].contains("no cached index for https://example.test/releases/25.12.0/base/packages.adb"),
+      missing[0]
+        .contains("no cached index for https://example.test/releases/25.12.0/base/packages.adb"),
       "{}",
       missing[0]
     );

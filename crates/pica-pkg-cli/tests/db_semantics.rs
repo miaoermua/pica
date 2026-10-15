@@ -110,6 +110,44 @@ const APK_FEED_ROW: &str = r#"{
   }
 }"#;
 
+/// A row carrying every field `-Qi` can report, so a test can tell a field that
+/// says nothing from one that is simply old. It is `pica`-native, so showing it
+/// never reaches for a backend command.
+const FULL_ROW: &str = r#"{
+  "installed": {
+    "full-app": {
+      "manifest": {
+        "pkgname": "full-app",
+        "appname": "full-app",
+        "pkgver": "1.2.3",
+        "pkgrel": "4",
+        "url": "https://example.test/app",
+        "pkgdesc": "A demo app",
+        "luci_url": "admin/services/full-app",
+        "protocol": "https",
+        "branch": "main",
+        "luci_desc": "Demo app",
+        "os": "linux",
+        "platform": "x86_64",
+        "arch": "x86_64",
+        "uname": "x86_64",
+        "type": "app",
+        "source": "pica",
+        "pkgmgr": "pica",
+        "packager": "Someone <someone@example.test>",
+        "builddate": "2026-10-01",
+        "size": "2048",
+        "license": "MIT",
+        "visibility": "public"
+      },
+      "pkgfile": "/tmp/full-app.pkg.tar.gz",
+      "files": [],
+      "dirs": [],
+      "installed_at": 17
+    }
+  }
+}"#;
+
 /// Rows no repository index can resolve: a local file, a URL download, and a
 /// feed install.
 const UNRESOLVABLE_ROWS: &str = r#"{
@@ -364,6 +402,79 @@ fn field(stdout: &str, label: &str) -> String {
     .find_map(|line| line.strip_prefix(label))
     .and_then(|rest| rest.split_once(':'))
     .map_or_else(String::new, |(_, value)| value.trim().to_string())
+}
+
+/// The labels a `-Qi` listing printed, in order. The CLI's own `::` status
+/// lines have an empty label and are not fields.
+fn labels_of(stdout: &str) -> Vec<&str> {
+  stdout
+    .lines()
+    .filter_map(|line| line.split_once(':'))
+    .map(|(label, _)| label.trim())
+    .filter(|label| !label.is_empty())
+    .collect()
+}
+
+#[test]
+fn qi_omits_the_fields_a_row_has_no_value_for() {
+  // A label with nothing after it tells a reader no more than an absent label,
+  // and reads as a value that was expected and lost. This row predates most of
+  // the fields, and the listing says so by leaving them out.
+  let sandbox = Sandbox::new(LEGACY_FEED_ROW);
+
+  let assert = sandbox.run(&["-Qi", "legacy-opkg"]).success();
+  let stdout = stdout_of(&assert);
+
+  assert_eq!(
+    labels_of(&stdout),
+    ["Name", "AppName", "Source", "PkgMgr", "Installed At", "Installed From"],
+    "{stdout}"
+  );
+}
+
+#[test]
+fn qi_prints_the_fields_a_row_does_carry() {
+  // The omission is a default, not a shortened listing: a package that carries
+  // all of it is still shown in full, field for field.
+  let sandbox = Sandbox::new(FULL_ROW);
+
+  let assert = sandbox.run(&["-Qi", "full-app"]).success();
+  let stdout = stdout_of(&assert);
+
+  assert_eq!(
+    labels_of(&stdout),
+    [
+      "Name",
+      "Version",
+      "Pkgver",
+      "Pkgrel",
+      "AppName",
+      "Program URL",
+      "PkgDesc",
+      "LuCI URL",
+      "Protocol",
+      "Branch",
+      "LuCI Desc",
+      "OS",
+      "Platform",
+      "Arch",
+      "Uname",
+      "Type",
+      "Source",
+      "PkgMgr",
+      "Packager",
+      "Build Date",
+      "Size",
+      "Installed At",
+      "Installed From",
+      "License",
+      "Visibility"
+    ],
+    "{stdout}"
+  );
+  assert_eq!(field(&stdout, "Version"), "1.2.3-4");
+  assert_eq!(field(&stdout, "License"), "MIT");
+  assert_eq!(field(&stdout, "Size"), "2048 (2.00 KiB)");
 }
 
 #[test]

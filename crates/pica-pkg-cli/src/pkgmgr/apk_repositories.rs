@@ -142,10 +142,7 @@ pub(crate) fn read(
       Ok(text) => text,
       Err(err) if err.kind() == ErrorKind::NotFound => continue,
       Err(err) => {
-        return Err(CliError::new(
-          E_IO,
-          format!("read {} failed: {err}", path.display()),
-        ));
+        return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
       }
     };
     parser.parse_file(&path, &text)?;
@@ -172,18 +169,12 @@ fn configuration_files(files: &[PathBuf], dirs: &[PathBuf]) -> CliResult<Vec<Pat
       Ok(entries) => entries,
       Err(err) if err.kind() == ErrorKind::NotFound => continue,
       Err(err) => {
-        return Err(CliError::new(
-          E_IO,
-          format!("read directory {} failed: {err}", dir.display()),
-        ))
+        return Err(CliError::new(E_IO, format!("read directory {} failed: {err}", dir.display())));
       }
     };
     for entry in entries {
       let entry = entry.map_err(|err| {
-        CliError::new(
-          E_IO,
-          format!("read directory {} failed: {err}", dir.display()),
-        )
+        CliError::new(E_IO, format!("read directory {} failed: {err}", dir.display()))
       })?;
       let name = entry.file_name();
       let Some(name) = name.to_str() else { continue };
@@ -203,18 +194,9 @@ fn configuration_files(files: &[PathBuf], dirs: &[PathBuf]) -> CliResult<Vec<Pat
 /// change.
 fn machine_type(path: &Path) -> CliResult<Option<String>> {
   match fs::read_to_string(path) {
-    Ok(text) => Ok(
-      text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string),
-    ),
+    Ok(text) => Ok(text.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_string)),
     Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-    Err(err) => Err(CliError::new(
-      E_IO,
-      format!("read {} failed: {err}", path.display()),
-    )),
+    Err(err) => Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display()))),
   }
 }
 
@@ -292,11 +274,7 @@ impl Parser {
     // `@tag URL` tags the repository. The tag groups repositories for
     // installation, it does not change which index apk fetches, so it does not
     // reach the index check.
-    let url = if url.starts_with('@') {
-      words.next()
-    } else {
-      Some(url)
-    };
+    let url = if url.starts_with('@') { words.next() } else { Some(url) };
     let Some(url) = url else {
       return Err(self.invalid("no URL"));
     };
@@ -366,11 +344,7 @@ impl Parser {
             self.arch_file.display()
           )));
         };
-        let index = if layout == Layout::V2 {
-          "APKINDEX.tar.gz"
-        } else {
-          "Packages.adb"
-        };
+        let index = if layout == Layout::V2 { "APKINDEX.tar.gz" } else { "Packages.adb" };
         format!("{url}/{arch}/{index}")
       }
     };
@@ -431,10 +405,7 @@ impl Parser {
   }
 
   fn invalid(&self, message: impl Display) -> CliError {
-    CliError::new(
-      E_CONFIG_INVALID,
-      format!("{}:{}: {message}", self.file.display(), self.line),
-    )
+    CliError::new(E_CONFIG_INVALID, format!("{}:{}: {message}", self.file.display(), self.line))
   }
 }
 
@@ -610,9 +581,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
 
   impl Host {
     fn new() -> Self {
-      Self {
-        root: tempfile::tempdir().expect("create temp dir"),
-      }
+      Self { root: tempfile::tempdir().expect("create temp dir") }
     }
 
     /// The `OpenWrt` 25.12 layout: the feeds in the configuration directory and
@@ -638,20 +607,13 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
 
     fn read(&self) -> CliResult<Configuration> {
       let files = vec![self.path(APK_REPOSITORIES)];
-      let dirs = APK_REPOSITORIES_DIRS
-        .iter()
-        .map(|dir| self.path(dir))
-        .collect::<Vec<_>>();
+      let dirs = APK_REPOSITORIES_DIRS.iter().map(|dir| self.path(dir)).collect::<Vec<_>>();
       read(&files, &dirs, &self.path("/etc/apk/arch"))
     }
   }
 
   fn indexes(configuration: &Configuration) -> Vec<&str> {
-    configuration
-      .repositories
-      .iter()
-      .map(|repository| repository.url_index.as_str())
-      .collect()
+    configuration.repositories.iter().map(|repository| repository.url_index.as_str()).collect()
   }
 
   /// Where the index apk needs for this repository is: the name apk caches a
@@ -677,10 +639,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
     // which is what lets pica tell which feed is the one without an index. The
     // digest here is what `shasum -a 256` says about that URL, so the cache file
     // apk looks for on an OpenWrt 25.12 host is spelled out.
-    assert_eq!(
-      index_of(&configuration.repositories[0]),
-      "APKINDEX.d96da355.tar.gz"
-    );
+    assert_eq!(index_of(&configuration.repositories[0]), "APKINDEX.d96da355.tar.gz");
     assert_eq!(configuration.files.len(), 2);
   }
 
@@ -698,10 +657,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
   fn the_legacy_repository_file_is_still_read() {
     let host = Host::new();
     host.write("etc/apk/arch", "x86_64\n");
-    host.write(
-      APK_REPOSITORIES,
-      "# alpine\nhttps://dl-cdn.alpinelinux.org/alpine/v3.20/main\n",
-    );
+    host.write(APK_REPOSITORIES, "# alpine\nhttps://dl-cdn.alpinelinux.org/alpine/v3.20/main\n");
 
     let configuration = host.read().expect("read the configuration");
 
@@ -735,20 +691,14 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
 
     let configuration = host.read().expect("read the configuration");
 
-    assert_eq!(
-      indexes(&configuration),
-      ["https://example.test/main/x86_64/APKINDEX.tar.gz"]
-    );
+    assert_eq!(indexes(&configuration), ["https://example.test/main/x86_64/APKINDEX.tar.gz"]);
   }
 
   #[test]
   fn local_repositories_are_read_where_they_lie() {
     let host = Host::new();
     host.write("etc/apk/arch", "x86_64\n");
-    host.write(
-      APK_REPOSITORIES,
-      "/srv/packages\nfile:///srv/more\nhttps://example.test/main\n",
-    );
+    host.write(APK_REPOSITORIES, "/srv/packages\nfile:///srv/more\nhttps://example.test/main\n");
 
     let configuration = host.read().expect("read the configuration");
 
@@ -773,21 +723,15 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
         "APKINDEX.3521cdee.tar.gz",
       ]
     );
-    let fetched: Vec<bool> = configuration
-      .repositories
-      .iter()
-      .map(|repository| repository.index.fetched())
-      .collect();
+    let fetched: Vec<bool> =
+      configuration.repositories.iter().map(|repository| repository.index.fetched()).collect();
     assert_eq!(fetched, [false, false, true]);
   }
 
   #[test]
   fn credentials_are_not_printed() {
     let host = Host::new();
-    host.write(
-      APK_REPOSITORIES,
-      "https://user:secret@example.test/packages.adb\n",
-    );
+    host.write(APK_REPOSITORIES, "https://user:secret@example.test/packages.adb\n");
 
     let configuration = host.read().expect("read the configuration");
 
@@ -795,10 +739,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
       configuration.repositories[0].printable,
       "https://user:***@example.test/packages.adb"
     );
-    assert_eq!(
-      indexes(&configuration),
-      ["https://user:secret@example.test/packages.adb"]
-    );
+    assert_eq!(indexes(&configuration), ["https://user:secret@example.test/packages.adb"]);
   }
 
   #[test]
@@ -871,10 +812,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
 
     let configuration = host.read().expect("read the configuration");
 
-    assert_eq!(
-      indexes(&configuration),
-      ["https://example.test/main/x86_64/APKINDEX.tar.gz"]
-    );
+    assert_eq!(indexes(&configuration), ["https://example.test/main/x86_64/APKINDEX.tar.gz"]);
   }
 
   #[test]
@@ -925,11 +863,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
     let err = host.read().expect_err("a reserved name");
 
     assert_eq!(err.code, E_CONFIG_INVALID);
-    assert!(
-      err.message.contains("invalid variable definition: APK_ARCH=x86"),
-      "{}",
-      err.message
-    );
+    assert!(err.message.contains("invalid variable definition: APK_ARCH=x86"), "{}", err.message);
   }
 
   #[test]

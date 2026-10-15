@@ -125,58 +125,74 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
   Ok(())
 }
 
+/// Prints one field of the `-Qi` listing, and nothing at all when the row has
+/// no value for it.
+///
+/// A label with nothing after it tells a reader no more than an absent label,
+/// and reads as a value that was expected and lost. `Depends` has always been
+/// reported this way, because most rows have none; the same holds for the
+/// manifest's optional fields, which a row written by any release may or may
+/// not carry. The label is padded rather than the line spelled out per field,
+/// so a field that is left out does not shift the alignment of the ones below.
+fn field(label: &str, value: &str) {
+  if !value.is_empty() {
+    println!("{label:<16}: {value}");
+  }
+}
+
 pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
   let entry = installed_entry(&db, pkgname)?;
   let manifest = entry_manifest(entry);
 
+  // What the row is, as opposed to what it says about itself: always there.
   println!("Name            : {pkgname}");
-  println!(
-    "Version         : {}",
-    pkgver_cmp_key(
+  field(
+    "Version",
+    &pkgver_cmp_key(
       &manifest_get_first(manifest, "pkgver"),
-      &manifest_get_first(manifest, "pkgrel")
-    )
+      &manifest_get_first(manifest, "pkgrel"),
+    ),
   );
-  println!("Pkgver          : {}", manifest_get_first(manifest, "pkgver"));
-  println!("Pkgrel          : {}", manifest_get_first(manifest, "pkgrel"));
-  println!("AppName         : {}", manifest_get_first(manifest, "appname"));
+  field("Pkgver", &manifest_get_first(manifest, "pkgver"));
+  field("Pkgrel", &manifest_get_first(manifest, "pkgrel"));
+  field("AppName", &manifest_get_first(manifest, "appname"));
   let program_url = {
     let value = manifest_get_first(manifest, "url");
     if value.is_empty() { manifest_get_first(manifest, "origin") } else { value }
   };
-  println!("Program URL     : {program_url}");
-  println!("PkgDesc         : {}", manifest_get_first(manifest, "pkgdesc"));
-  println!("LuCI URL        : {}", manifest_get_first(manifest, "luci_url"));
-  println!("Protocol        : {}", manifest_get_first(manifest, "protocol"));
-  println!("Branch          : {}", manifest_get_first(manifest, "branch"));
-  println!("LuCI Desc       : {}", manifest_get_first(manifest, "luci_desc"));
-  println!("OS              : {}", manifest_get_first(manifest, "os"));
-  println!("Platform        : {}", manifest_get_first(manifest, "platform"));
-  println!("Arch            : {}", manifest_get_first(manifest, "arch"));
-  println!("Uname           : {}", manifest_get_first(manifest, "uname"));
-  println!("Type            : {}", manifest_get_first(manifest, "type"));
+  field("Program URL", &program_url);
+  field("PkgDesc", &manifest_get_first(manifest, "pkgdesc"));
+  field("LuCI URL", &manifest_get_first(manifest, "luci_url"));
+  field("Protocol", &manifest_get_first(manifest, "protocol"));
+  field("Branch", &manifest_get_first(manifest, "branch"));
+  field("LuCI Desc", &manifest_get_first(manifest, "luci_desc"));
+  field("OS", &manifest_get_first(manifest, "os"));
+  field("Platform", &manifest_get_first(manifest, "platform"));
+  field("Arch", &manifest_get_first(manifest, "arch"));
+  field("Uname", &manifest_get_first(manifest, "uname"));
+  field("Type", &manifest_get_first(manifest, "type"));
   // Both fields are shown as resolved rather than raw, so a row written by an
   // older release reports the same channel and backend a fresh install would.
-  println!("Source          : {}", installed::entry_source(entry).as_str());
-  println!("PkgMgr          : {}", installed::entry_backend(entry).kind.as_str());
-  println!("Packager        : {}", manifest_get_first(manifest, "packager"));
-  println!("Build Date      : {}", manifest_get_first(manifest, "builddate"));
-  println!("Size            : {}", format_size_display(&manifest_get_first(manifest, "size")));
-  println!(
-    "Installed At    : {}",
-    entry
+  field("Source", installed::entry_source(entry).as_str());
+  field("PkgMgr", installed::entry_backend(entry).kind.as_str());
+  field("Packager", &manifest_get_first(manifest, "packager"));
+  field("Build Date", &manifest_get_first(manifest, "builddate"));
+  field("Size", &format_size_display(&manifest_get_first(manifest, "size")));
+  field(
+    "Installed At",
+    &entry
       .get("installed_at")
       .and_then(Value::as_u64)
       .map(|value| value.to_string())
-      .unwrap_or_default()
+      .unwrap_or_default(),
   );
-  println!("Installed From  : {}", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
-  println!("License         : {}", manifest_get_first(manifest, "license"));
-  println!("Visibility      : {}", manifest_get_first(manifest, "visibility"));
+  field("Installed From", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
+  field("License", &manifest_get_first(manifest, "license"));
+  field("Visibility", &manifest_get_first(manifest, "visibility"));
   if let Some(depends) = backend_dependencies(app, entry) {
-    println!("Depends         : {depends}");
+    field("Depends", &depends);
   }
 
   Ok(())
