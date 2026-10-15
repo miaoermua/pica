@@ -3,20 +3,20 @@ mod pipeline;
 mod precheck;
 
 use crate::app::{
-  conf_get_i18n, ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID,
-  E_REPO_INVALID, E_VERSION_INCOMPATIBLE,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID, E_REPO_INVALID,
+  E_VERSION_INCOMPATIBLE, conf_get_i18n, ensure_dirs,
 };
 use crate::candidate::find_pica_candidates_in_index;
 use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
 use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
 use crate::system::{fetch_url, need_cmd};
+use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_gt, ver_ge};
-use pica_pkg_core::PICA_VERSION;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
@@ -26,10 +26,8 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   let installed_pkg = db_find_installed_pkgname_by_selector(&app.paths.db_file, &parsed)?;
   if let Some(pkgname) = installed_pkg {
     let db = read_json_file(&app.paths.db_file)?;
-    let entry = db
-      .get("installed")
-      .and_then(Value::as_object)
-      .and_then(|installed| installed.get(&pkgname));
+    let entry =
+      db.get("installed").and_then(Value::as_object).and_then(|installed| installed.get(&pkgname));
 
     if let Some(entry) = entry {
       // Reinstalling must reproduce the original install: the backend decides
@@ -106,7 +104,10 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   }
 
   if to_install.is_empty() {
-    return Err(CliError::new(E_CONFIG_INVALID, format!("{}: package not found: {appname}", package_manager.kind().as_str())));
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!("{}: package not found: {appname}", package_manager.kind().as_str()),
+    ));
   }
 
   for pkg in &to_install {

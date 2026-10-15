@@ -1,14 +1,14 @@
-use super::pipeline::{installs_declared_dependencies, PackageFields};
+use super::pipeline::{PackageFields, installs_declared_dependencies};
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
 };
 use crate::platform::{
-  check_arch, detect_luci_variant, detect_package_arches, detect_os, detect_platform,
-  normalize_uname, ArchVerdict,
+  ArchVerdict, check_arch, detect_luci_variant, detect_os, detect_package_arches, detect_platform,
+  normalize_uname,
 };
 use crate::system::run_command_text;
 use pica_pkg_core::manifest::Manifest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 

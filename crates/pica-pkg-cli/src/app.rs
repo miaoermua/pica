@@ -1,6 +1,6 @@
 use crate::state::{read_json_file, write_json_atomic_pretty};
 use pica_pkg_core::error::PicaError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -153,7 +153,10 @@ impl App {
   }
 
   pub fn package_manager(&self) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
-    self.package_manager.as_deref().ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
+    self
+      .package_manager
+      .as_deref()
+      .ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
   }
 
   /// Backend identity of this invocation, including the Pica-native `pica`.
@@ -453,7 +456,7 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{conf_get_pkgmgr, parse_options, FeedPolicy};
+  use super::{FeedPolicy, conf_get_pkgmgr, parse_options};
   use serde_json::json;
   use std::fs;
 
@@ -500,7 +503,8 @@ mod tests {
 
   #[test]
   fn parse_options_reads_explicit_pkgmgr() {
-    let input = vec!["--pkgmgr".to_string(), "apk".to_string(), "-S".to_string(), "demo".to_string()];
+    let input =
+      vec!["--pkgmgr".to_string(), "apk".to_string(), "-S".to_string(), "demo".to_string()];
     let (options, positional) = parse_options(&input).expect("parse options");
     assert_eq!(options.pkgmgr.as_deref(), Some("apk"));
     assert_eq!(positional, vec!["-S".to_string(), "demo".to_string()]);
@@ -508,7 +512,8 @@ mod tests {
 
   #[test]
   fn parse_options_rejects_unknown_pkgmgr() {
-    let err = parse_options(&["--pkgmgr".to_string(), "pacman".to_string()]).expect_err("must reject unknown backend");
+    let err = parse_options(&["--pkgmgr".to_string(), "pacman".to_string()])
+      .expect_err("must reject unknown backend");
     assert!(err.message.contains("--pkgmgr"));
   }
 

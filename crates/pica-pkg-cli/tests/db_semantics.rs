@@ -10,8 +10,8 @@
 
 #![cfg(unix)]
 
-use assert_cmd::assert::Assert;
 use assert_cmd::Command;
+use assert_cmd::assert::Assert;
 use predicates::str::contains;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

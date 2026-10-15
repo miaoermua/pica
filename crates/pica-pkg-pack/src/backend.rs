@@ -63,7 +63,10 @@ impl BuildBackend {
   }
 }
 
-pub(crate) fn parse_targets(flag: Option<&str>, manifest_targets: &[String]) -> PicaResult<Vec<BuildBackend>> {
+pub(crate) fn parse_targets(
+  flag: Option<&str>,
+  manifest_targets: &[String],
+) -> PicaResult<Vec<BuildBackend>> {
   let declared = match flag {
     Some(value) => split_targets(&[value.to_string()]),
     None => split_targets(manifest_targets),
@@ -83,7 +86,7 @@ pub(crate) fn parse_targets(flag: Option<&str>, manifest_targets: &[String]) -> 
 
 #[cfg(test)]
 mod tests {
-  use super::{parse_targets, BuildBackend};
+  use super::{BuildBackend, parse_targets};
 
   #[test]
   fn parses_deduplicated_targets() {

@@ -189,11 +189,7 @@ impl Manifest {
         }
       }
     }
-    if lines.is_empty() {
-      String::new()
-    } else {
-      format!("{}\n", lines.join("\n"))
-    }
+    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
   }
 
   /// # Errors

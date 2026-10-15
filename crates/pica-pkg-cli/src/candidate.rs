@@ -1,6 +1,6 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID};
-use crate::platform::detect_os;
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
 use crate::pkgmgr::PackageManagerKind;
+use crate::platform::detect_os;
 use crate::state::read_json_file;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::pkgver_cmp_key;

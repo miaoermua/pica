@@ -7,9 +7,8 @@ use std::path::Path;
 /// Fields the packer owns: they are recomputed per artifact, so any author
 /// value is dropped rather than trusted. `targets` is a build-time-only field
 /// and must not leak into an installed manifest.
-const OWNED_KEYS: [&str; 9] = [
-  "builddate", "size", "csize", "platform", "arch", "pkgver", "pkgrel", "pkgmgr", "targets",
-];
+const OWNED_KEYS: [&str; 9] =
+  ["builddate", "size", "csize", "platform", "arch", "pkgver", "pkgrel", "pkgmgr", "targets"];
 
 /// Fields the packer recomputes for one build target. Grouping them keeps the
 /// per-target values together instead of as a long argument list that is easy to
@@ -66,7 +65,7 @@ pub(crate) fn rewrite_manifest_for_build(
 
 #[cfg(test)]
 mod tests {
-  use super::{rewrite_manifest_for_build, BuiltFields};
+  use super::{BuiltFields, rewrite_manifest_for_build};
   use std::fs;
 
   fn rewrite(source_text: &str, pkgmgr: &str) -> String {
@@ -77,7 +76,14 @@ mod tests {
     rewrite_manifest_for_build(
       &source,
       &target,
-      &BuiltFields { pkgver: "1.2.3", pkgrel: "4", platform: "all", arch: "arm64", pkgmgr, size: 4096 },
+      &BuiltFields {
+        pkgver: "1.2.3",
+        pkgrel: "4",
+        platform: "all",
+        arch: "arm64",
+        pkgmgr,
+        size: 4096,
+      },
     )
     .expect("rewrite manifest");
     fs::read_to_string(&target).expect("read target manifest")

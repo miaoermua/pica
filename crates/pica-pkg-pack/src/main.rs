@@ -5,8 +5,8 @@ mod matrix;
 mod rewrite;
 
 use build::main_build;
-use pica_pkg_core::error::{PicaError, PicaResult};
 use pica_pkg_core::PICA_VERSION;
+use pica_pkg_core::error::{PicaError, PicaResult};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -90,7 +90,9 @@ fn run() -> PicaResult<()> {
           }
           "--pkgmgr" => {
             let Some(value) = rest.get(index + 1) else {
-              return Err(PicaError::msg("--pkgmgr requires opkg, apk, pica, or a comma-separated list"));
+              return Err(PicaError::msg(
+                "--pkgmgr requires opkg, apk, pica, or a comma-separated list",
+              ));
             };
             pkgmgr = Some(value.clone());
             index += 2;

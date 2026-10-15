@@ -1,5 +1,5 @@
 use crate::app::{
-  ensure_dirs, App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID,
+  App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, ensure_dirs,
 };
 use crate::candidate::find_pica_candidates_in_index;
 use crate::installed;
@@ -9,8 +9,7 @@ use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
 fn installed_entry<'a>(db: &'a Value, pkgname: &str) -> CliResult<&'a Value> {
-  db
-    .get("installed")
+  db.get("installed")
     .and_then(Value::as_object)
     .and_then(|installed| installed.get(pkgname))
     .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))
@@ -145,11 +144,7 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   println!("AppName         : {}", manifest_get_first(manifest, "appname"));
   let program_url = {
     let value = manifest_get_first(manifest, "url");
-    if value.is_empty() {
-      manifest_get_first(manifest, "origin")
-    } else {
-      value
-    }
+    if value.is_empty() { manifest_get_first(manifest, "origin") } else { value }
   };
   println!("Program URL     : {program_url}");
   println!("PkgDesc         : {}", manifest_get_first(manifest, "pkgdesc"));

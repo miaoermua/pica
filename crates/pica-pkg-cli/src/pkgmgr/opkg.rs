@@ -79,9 +79,15 @@ impl PackageManager for OpkgBackend {
     }
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if detail.to_ascii_lowercase().contains("no space left on device") {
-      return Err(CliError::new(E_NO_SPACE, format!("{label} install failed: {target} (storage-full). detail=[{detail}]")));
+      return Err(CliError::new(
+        E_NO_SPACE,
+        format!("{label} install failed: {target} (storage-full). detail=[{detail}]"),
+      ));
     }
-    Err(CliError::new(E_OPKG_INSTALL, format!("{label} install failed: {target} detail=[{detail}]")))
+    Err(CliError::new(
+      E_OPKG_INSTALL,
+      format!("{label} install failed: {target} detail=[{detail}]"),
+    ))
   }
 
   fn remove(&self, target: &str) -> CliResult<()> {
@@ -199,16 +205,22 @@ fn opkg_lists_ready() -> bool {
 }
 
 fn opkg_list_dir_has_files(dir: &Path) -> bool {
-  let Ok(entries) = fs::read_dir(dir) else { return false; };
+  let Ok(entries) = fs::read_dir(dir) else {
+    return false;
+  };
   entries.flatten().any(|entry| entry.path().is_file())
 }
 
 fn is_opkg_lock_error(detail: &str) -> bool {
   let text = detail.to_ascii_lowercase();
-  if text.contains("opkg.lock") { return true; }
+  if text.contains("opkg.lock") {
+    return true;
+  }
   let mentions_lock = text.contains(" lock") || text.starts_with("lock") || text.contains("locked");
-  let lock_failure = ["resource temporarily unavailable", "could not lock", "failed to lock", "cannot lock"]
-    .iter().any(|pattern| text.contains(pattern));
+  let lock_failure =
+    ["resource temporarily unavailable", "could not lock", "failed to lock", "cannot lock"]
+      .iter()
+      .any(|pattern| text.contains(pattern));
   mentions_lock && lock_failure
 }
 
@@ -216,11 +228,15 @@ fn clear_opkg_lock_files_if_stale() -> bool {
   let mut cleared_any = false;
   for lock_path in OPKG_LOCK_FILES {
     let path = Path::new(lock_path);
-    if !path.exists() { continue; }
+    if !path.exists() {
+      continue;
+    }
     match read_opkg_lock_pid(path) {
       Some(pid) if Path::new("/proc").join(pid.to_string()).exists() => return false,
       Some(_) | None => {
-        if fs::remove_file(path).is_ok() { cleared_any = true; }
+        if fs::remove_file(path).is_ok() {
+          cleared_any = true;
+        }
       }
     }
   }
@@ -229,7 +245,8 @@ fn clear_opkg_lock_files_if_stale() -> bool {
 
 fn read_opkg_lock_pid(path: &Path) -> Option<u32> {
   let text = fs::read_to_string(path).ok()?;
-  text.split(|ch: char| !ch.is_ascii_digit())
+  text
+    .split(|ch: char| !ch.is_ascii_digit())
     .filter(|token| !token.is_empty())
     .filter_map(|token| token.parse::<u32>().ok())
     .find(|pid| *pid > 0)

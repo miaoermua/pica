@@ -1,8 +1,8 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, Paths, E_DB_INVALID, E_RUNTIME};
+use crate::app::{App, CliError, CliResult, E_DB_INVALID, E_RUNTIME, Paths, ensure_dirs};
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::selector::Selector;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::Path;
 
@@ -31,11 +31,7 @@ pub fn report_set_install_result(
 
   let program_url = {
     let value = manifest_get_first(manifest, "url");
-    if value.is_empty() {
-      manifest_get_first(manifest, "origin")
-    } else {
-      value
-    }
+    if value.is_empty() { manifest_get_first(manifest, "origin") } else { value }
   };
 
   report["reports"][pkgname] = json!({
@@ -209,7 +205,7 @@ mod tests {
   use crate::app::E_RUNTIME;
   use pica_pkg_core::selector::Selector;
   use pretty_assertions::assert_eq;
-  use serde_json::{json, Value};
+  use serde_json::{Value, json};
 
   #[test]
   fn ensure_json_object_field_creates_and_validates() {

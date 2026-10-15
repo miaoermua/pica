@@ -1,25 +1,24 @@
 use crate::app::{
-  ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID, ensure_dirs,
 };
 use crate::platform::detect_platform;
 use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
 use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::{is_supported_url, parse_repo_json};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   app.log_info("Synchronizing package databases...");
 
   let conf = read_json_file(&app.paths.conf_file)?;
-  let repos =
-    conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
-      CliError::new(
-        E_CONFIG_INVALID,
-        format!("no repos configured in {}", app.paths.conf_file.display()),
-      )
-    })?;
+  let repos = conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
+    CliError::new(
+      E_CONFIG_INVALID,
+      format!("no repos configured in {}", app.paths.conf_file.display()),
+    )
+  })?;
 
   if repos.is_empty() {
     return Err(CliError::new(

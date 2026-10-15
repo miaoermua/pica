@@ -1,6 +1,4 @@
-use crate::app::{
-  App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MISSING_COMMAND, E_RUNTIME,
-};
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MISSING_COMMAND, E_RUNTIME};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -168,10 +166,14 @@ pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
 
 /// Extracts a container that concatenates several tar members.
 ///
-/// A `.apk` is a signature member, a control member and a data member gzipped
-/// one after another. Plain `tar -xzf` stops at the first end-of-archive marker
-/// and would unpack only the signature, so `--ignore-zeros` is what reads
-/// through the padding into the following members.
+/// An apk-tools 2.x `.apk` is a signature member, a control member and a data
+/// member gzipped one after another. Plain `tar -xzf` stops at the first
+/// end-of-archive marker and would unpack only the signature, so
+/// `--ignore-zeros` is what reads through the padding into the following
+/// members.
+///
+/// That layout is gone in apk-tools 3.x, whose packages are ADB archives that
+/// no tar can open; [`crate::container`] refuses those before reaching here.
 ///
 /// The flag goes *after* the archive because `-f` consumes the argument that
 /// follows it: `tar -xzf --ignore-zeros ARCHIVE` asks tar to open a member
@@ -194,11 +196,8 @@ pub fn run_tar_extract_members(archive: &Path, target_dir: &Path) -> CliResult<(
 /// with their short spellings, so matching on it covers both forms and reads
 /// the name case-insensitively.
 pub fn run_tar_extract_auto(archive: &Path, target_dir: &Path) -> CliResult<()> {
-  let extension = archive
-    .extension()
-    .and_then(|value| value.to_str())
-    .unwrap_or("")
-    .to_ascii_lowercase();
+  let extension =
+    archive.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
 
   let flags = match extension.as_str() {
     "gz" | "tgz" => "-xzf",
@@ -221,12 +220,7 @@ pub fn run_tar_extract_auto(archive: &Path, target_dir: &Path) -> CliResult<()> 
 /// `flags` come before the archive and `after` — anything else the archive needs
 /// to be read, such as `--ignore-zeros` — comes after it, because the argument
 /// of `-f` is whatever directly follows it.
-fn run_tar(
-  flags: &[&str],
-  after: &[&str],
-  archive: &Path,
-  target_dir: &Path,
-) -> CliResult<()> {
+fn run_tar(flags: &[&str], after: &[&str], archive: &Path, target_dir: &Path) -> CliResult<()> {
   let output = Command::new("tar")
     .args(flags)
     .arg(archive)
@@ -240,10 +234,7 @@ fn run_tar(
     Ok(())
   } else {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    Err(CliError::new(
-      E_RUNTIME,
-      format!("tar extract failed: {}: {detail}", archive.display()),
-    ))
+    Err(CliError::new(E_RUNTIME, format!("tar extract failed: {}: {detail}", archive.display())))
   }
 }
 
@@ -282,11 +273,5 @@ pub(crate) fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
   }
 
   let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
-  if stdout_text.is_empty() {
-    "unknown error".to_string()
-  } else {
-    stdout_text
-  }
+  if stdout_text.is_empty() { "unknown error".to_string() } else { stdout_text }
 }
-
-

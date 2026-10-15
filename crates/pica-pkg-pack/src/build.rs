@@ -1,12 +1,14 @@
 use crate::archive::{compute_sha256, run_tar_create, unpacked_size, write_sha256sum_entry};
-use crate::backend::{parse_targets, BuildBackend};
+use crate::backend::{BuildBackend, parse_targets};
 use crate::matrix::{collect_archs, collect_platforms, has_platform_arch_matrix};
-use crate::rewrite::{rewrite_manifest_for_build, BuiltFields};
+use crate::rewrite::{BuiltFields, rewrite_manifest_for_build};
 use crate::{msg, msg2};
 use pica_pkg_core::error::{PicaError, PicaResult};
-use pica_pkg_core::io::{copy_dir_recursive, ensure_dir, make_temp_dir, resolve_script_dir_from_exe, write_atomic};
+use pica_pkg_core::io::{
+  copy_dir_recursive, ensure_dir, make_temp_dir, resolve_script_dir_from_exe, write_atomic,
+};
 use pica_pkg_core::manifest::Manifest;
-use pica_pkg_core::repo::{package_filename, parse_repo_json, Package, PackageIndex, REPO_SCHEMA};
+use pica_pkg_core::repo::{Package, PackageIndex, REPO_SCHEMA, package_filename, parse_repo_json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +34,11 @@ pub(crate) struct BuildRequest<'a> {
   pub install_size: u64,
 }
 
-pub(crate) fn main_build(pkgdir: &Path, outdir: Option<PathBuf>, pkgmgr: Option<&str>) -> PicaResult<()> {
+pub(crate) fn main_build(
+  pkgdir: &Path,
+  outdir: Option<PathBuf>,
+  pkgmgr: Option<&str>,
+) -> PicaResult<()> {
   if !pkgdir.is_dir() {
     return Err(PicaError::msg(format!("not a directory: {}", pkgdir.display())));
   }
@@ -216,7 +222,13 @@ pub(crate) fn build_one(req: &BuildRequest<'_>) -> PicaResult<()> {
     req.backend.as_str(),
   );
 
-  msg(format!("Making package: {} {}-{} [{}]", req.pkgname, req.pkgver, req.pkgrel, req.backend.as_str()));
+  msg(format!(
+    "Making package: {} {}-{} [{}]",
+    req.pkgname,
+    req.pkgver,
+    req.pkgrel,
+    req.backend.as_str()
+  ));
   msg2(format!("Platform: {}", req.build_platform));
   msg2(format!("Arch: {}", req.build_arch));
   msg2(format!("Install size: {} bytes", req.install_size));
@@ -482,7 +494,9 @@ fn write_repo_index(
 
 #[cfg(test)]
 mod tests {
-  use super::{copy_packages_flat, list_extensions, main_build, unpacked_size, write_repo_index, BuildRequest};
+  use super::{
+    BuildRequest, copy_packages_flat, list_extensions, main_build, unpacked_size, write_repo_index,
+  };
   use crate::backend::BuildBackend;
   use pica_pkg_core::repo::parse_repo_json;
   use std::fs;
@@ -502,11 +516,8 @@ mod tests {
 
   /// Names of the entries inside a built artifact, as `tar -tzf` prints them.
   fn artifact_entries(artifact: &Path) -> String {
-    let output = std::process::Command::new("tar")
-      .arg("-tzf")
-      .arg(artifact)
-      .output()
-      .expect("run tar");
+    let output =
+      std::process::Command::new("tar").arg("-tzf").arg(artifact).output().expect("run tar");
     assert!(output.status.success(), "tar -tzf failed for {}", artifact.display());
     String::from_utf8_lossy(&output.stdout).to_string()
   }
@@ -524,7 +535,8 @@ mod tests {
     found.remove(0)
   }
 
-  const BASE_MANIFEST: &str = "pkgname = hello\nappname = hello\npkgver = 1.0.0\npkgrel = 1\nos = linux\n";
+  const BASE_MANIFEST: &str =
+    "pkgname = hello\nappname = hello\npkgver = 1.0.0\npkgrel = 1\nos = linux\n";
 
   #[test]
   fn copies_only_matching_extension_and_flattens() {
@@ -535,7 +547,8 @@ mod tests {
     fs::write(source.join("one.ipk"), b"ipk").expect("write ipk");
 
     let dst = tmp.path().join("out");
-    let copied = copy_packages_flat(tmp.path().join("apk").as_path(), &dst, &[".apk"]).expect("copy");
+    let copied =
+      copy_packages_flat(tmp.path().join("apk").as_path(), &dst, &[".apk"]).expect("copy");
     assert_eq!(copied, 1);
     assert!(dst.join("one.apk").is_file());
     assert!(!dst.join("one.ipk").exists());
@@ -552,7 +565,8 @@ mod tests {
     fs::write(source.join("notes.txt"), b"text").expect("write stray file");
 
     let dst = tmp.path().join("out");
-    let copied = copy_packages_flat(&source, &dst, BuildBackend::Pica.package_extensions()).expect("copy");
+    let copied =
+      copy_packages_flat(&source, &dst, BuildBackend::Pica.package_extensions()).expect("copy");
     assert_eq!(copied, 2, "pica unpacks both formats itself");
     assert!(dst.join("one.apk").is_file());
     assert!(dst.join("two.ipk").is_file());
@@ -569,7 +583,8 @@ mod tests {
     fs::write(a.join("same.apk"), b"x").expect("write a");
     fs::write(b.join("same.apk"), b"y").expect("write b");
 
-    let err = copy_packages_flat(tmp.path(), &tmp.path().join("out"), &[".apk"]).expect_err("must fail");
+    let err =
+      copy_packages_flat(tmp.path(), &tmp.path().join("out"), &[".apk"]).expect_err("must fail");
     assert!(err.to_string().contains("duplicate package file name"));
   }
 
@@ -598,7 +613,8 @@ mod tests {
     )
     .expect("write manifest");
 
-    let manifest = pica_pkg_core::manifest::Manifest::from_file(pkgdir.join("manifest")).expect("parse");
+    let manifest =
+      pica_pkg_core::manifest::Manifest::from_file(pkgdir.join("manifest")).expect("parse");
     let req = BuildRequest {
       pkgdir: &pkgdir,
       output_dir: &output,
@@ -612,8 +628,14 @@ mod tests {
       backend: BuildBackend::Apk,
       install_size: 4096,
     };
-    write_repo_index(&req, &manifest, "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz", &"1".repeat(64), 2048)
-      .expect("write index");
+    write_repo_index(
+      &req,
+      &manifest,
+      "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz",
+      &"1".repeat(64),
+      2048,
+    )
+    .expect("write index");
 
     let text = fs::read_to_string(output.join("repo.json")).expect("read index");
     let parsed = parse_repo_json(&text).expect("index must satisfy schema 2");
@@ -634,9 +656,16 @@ mod tests {
     );
 
     // Re-writing the same filename replaces rather than duplicates.
-    write_repo_index(&req, &manifest, "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz", &"2".repeat(64), 4096)
-      .expect("rewrite index");
-    let replaced = parse_repo_json(&fs::read_to_string(output.join("repo.json")).expect("read")).expect("valid");
+    write_repo_index(
+      &req,
+      &manifest,
+      "luci-app-demo-1.0.0-1-all-apk.pkg.tar.gz",
+      &"2".repeat(64),
+      4096,
+    )
+    .expect("rewrite index");
+    let replaced =
+      parse_repo_json(&fs::read_to_string(output.join("repo.json")).expect("read")).expect("valid");
     assert_eq!(replaced.packages.len(), 1);
     assert_eq!(replaced.packages[0].sha256, "2".repeat(64));
   }
@@ -647,7 +676,10 @@ mod tests {
     let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("scripts")).expect("mkdir scripts");
     fs::write(root.join("scripts/install"), "#!/bin/sh\nexit 0\n").expect("write script");
-    write_pkgdir(&root, "pkgname = hello\nappname = hello\npkgver = 1.0.0\npkgrel = 1\nplatform = amd64\narch = x86_64\n");
+    write_pkgdir(
+      &root,
+      "pkgname = hello\nappname = hello\npkgver = 1.0.0\npkgrel = 1\nplatform = amd64\narch = x86_64\n",
+    );
 
     let err = main_build(&root, Some(root.join("out")), None).expect_err("missing os must fail");
     assert!(err.to_string().contains("manifest missing os"));
@@ -744,8 +776,9 @@ mod tests {
     fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
     fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
 
-    let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase = luci-base\n"))
-      .expect_err("pica cannot resolve dependencies");
+    let err =
+      build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase = luci-base\n"))
+        .expect_err("pica cannot resolve dependencies");
     assert!(err.contains("cannot resolve dependencies"), "{err}");
     assert!(err.contains("targets = opkg"), "the message must suggest opkg/apk: {err}");
     assert!(err.contains("base.opkg"), "the message must offer the scoped form: {err}");

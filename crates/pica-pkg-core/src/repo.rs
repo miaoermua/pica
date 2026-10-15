@@ -152,14 +152,8 @@ fn validate_filename(pkg: &Package) -> PicaResult<()> {
     return Err(PicaError::msg(format!("package {}: invalid filename {}", pkg.pkgname, filename)));
   }
 
-  let expected = package_filename(
-    &pkg.pkgname,
-    &pkg.pkgver,
-    &pkg.pkgrel,
-    &pkg.platform,
-    &pkg.arch,
-    &pkg.pkgmgr,
-  );
+  let expected =
+    package_filename(&pkg.pkgname, &pkg.pkgver, &pkg.pkgrel, &pkg.platform, &pkg.arch, &pkg.pkgmgr);
   if expected != *filename {
     return Err(PicaError::msg(format!(
       "package {}: filename mismatch, expected {}, got {}",
@@ -205,8 +199,8 @@ pub fn is_supported_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{package_filename, parse_repo_json, Package, REPO_SCHEMA};
-  use serde_json::{json, Value};
+  use super::{Package, REPO_SCHEMA, package_filename, parse_repo_json};
+  use serde_json::{Value, json};
 
   fn entry(filename: &str, pkgmgr: &str) -> Value {
     json!({
@@ -227,9 +221,18 @@ mod tests {
 
   #[test]
   fn filename_carries_backend_suffix() {
-    assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "opkg"), "hello-1.0.0-1-all.pkg.tar.gz");
-    assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "apk"), "hello-1.0.0-1-all-apk.pkg.tar.gz");
-    assert_eq!(package_filename("hello", "1.0.0", "1", "all", "all", "pica"), "hello-1.0.0-1-all-pica.pkg.tar.gz");
+    assert_eq!(
+      package_filename("hello", "1.0.0", "1", "all", "all", "opkg"),
+      "hello-1.0.0-1-all.pkg.tar.gz"
+    );
+    assert_eq!(
+      package_filename("hello", "1.0.0", "1", "all", "all", "apk"),
+      "hello-1.0.0-1-all-apk.pkg.tar.gz"
+    );
+    assert_eq!(
+      package_filename("hello", "1.0.0", "1", "all", "all", "pica"),
+      "hello-1.0.0-1-all-pica.pkg.tar.gz"
+    );
     assert_eq!(
       package_filename("hello", "1.0.0", "1", "arm64", "aarch64_cortex-a53", "apk"),
       "hello-1.0.0-1-arm64-aarch64_cortex-a53-apk.pkg.tar.gz"
@@ -305,8 +308,8 @@ mod tests {
 
   #[test]
   fn app_key_falls_back_to_pkgname() {
-    let pkg: Package = serde_json::from_value(entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg"))
-      .expect("deserialize");
+    let pkg: Package =
+      serde_json::from_value(entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")).expect("deserialize");
     assert_eq!(pkg.app_key(), "hello");
     assert_eq!(pkg.os_key(), "all");
   }

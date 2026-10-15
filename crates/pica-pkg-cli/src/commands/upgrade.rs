@@ -1,5 +1,5 @@
 use super::install;
-use crate::app::{ensure_dirs, App, CliResult};
+use crate::app::{App, CliResult, ensure_dirs};
 use crate::candidate::find_pica_candidates_in_index;
 use crate::installed;
 use crate::state::read_json_file;
@@ -37,11 +37,7 @@ pub fn all(app: &mut App) -> CliResult<()> {
       let value = manifest_get_first(manifest, "appname");
       if value.is_empty() {
         let fallback = manifest_get_first(manifest, "pkgname");
-        if fallback.is_empty() {
-          pkgname.clone()
-        } else {
-          fallback
-        }
+        if fallback.is_empty() { pkgname.clone() } else { fallback }
       } else {
         value
       }

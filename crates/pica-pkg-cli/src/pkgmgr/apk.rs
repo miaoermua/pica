@@ -7,69 +7,119 @@ use std::process::Command;
 pub struct ApkBackend;
 
 impl PackageManager for ApkBackend {
-  fn kind(&self) -> PackageManagerKind { PackageManagerKind::Apk }
+  fn kind(&self) -> PackageManagerKind {
+    PackageManagerKind::Apk
+  }
 
   fn update_index(&self) {
-    if !has_command("apk") { return; }
+    if !has_command("apk") {
+      return;
+    }
     let _ = Command::new("apk").arg("update").output();
   }
 
   fn package_exists(&self, name: &str) -> bool {
-    let Ok(output) = Command::new("apk").args(["search", "--exact", name]).output() else { return false; };
-    output.status.success() && String::from_utf8_lossy(&output.stdout).lines().any(|line| !line.trim().is_empty())
+    let Ok(output) = Command::new("apk").args(["search", "--exact", name]).output() else {
+      return false;
+    };
+    output.status.success()
+      && String::from_utf8_lossy(&output.stdout).lines().any(|line| !line.trim().is_empty())
   }
 
   fn is_installed(&self, name: &str) -> bool {
-    let Ok(output) = Command::new("apk").args(["info", "--installed", name]).output() else { return false; };
+    let Ok(output) = Command::new("apk").args(["info", "--installed", name]).output() else {
+      return false;
+    };
     output.status.success()
   }
 
   fn installed_version(&self, name: &str) -> Option<String> {
     let output = Command::new("apk").args(["list", "--installed", "--", name]).output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+      return None;
+    }
     parse_package_version(&String::from_utf8_lossy(&output.stdout), name)
   }
 
   fn install(&self, label: &str, target: &str) -> CliResult<()> {
-    let output = install_command(target)?.output().map_err(|err| CliError::new("E_APK_INSTALL", format!("apk add failed: {err}")))?;
-    if output.status.success() { return Ok(()); }
+    let output = install_command(target)?
+      .output()
+      .map_err(|err| CliError::new("E_APK_INSTALL", format!("apk add failed: {err}")))?;
+    if output.status.success() {
+      return Ok(());
+    }
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if detail.to_ascii_lowercase().contains("no space left on device") {
-      return Err(CliError::new(E_NO_SPACE, format!("{label} install failed: {target} (storage-full). detail=[{detail}]")));
+      return Err(CliError::new(
+        E_NO_SPACE,
+        format!("{label} install failed: {target} (storage-full). detail=[{detail}]"),
+      ));
     }
     Err(CliError::new(E_RUNTIME, format!("{label} install failed: {target} detail=[{detail}]")))
   }
 
   fn remove(&self, target: &str) -> CliResult<()> {
-    let output = Command::new("apk").args(["del", target]).output().map_err(|err| CliError::new(E_RUNTIME, format!("apk del failed: {err}")))?;
-    if output.status.success() { Ok(()) } else { Err(CliError::new(E_RUNTIME, format!("apk del failed: {target} detail=[{}]", stderr_or_stdout(&output.stdout, &output.stderr)))) }
+    let output = Command::new("apk")
+      .args(["del", target])
+      .output()
+      .map_err(|err| CliError::new(E_RUNTIME, format!("apk del failed: {err}")))?;
+    if output.status.success() {
+      Ok(())
+    } else {
+      Err(CliError::new(
+        E_RUNTIME,
+        format!(
+          "apk del failed: {target} detail=[{}]",
+          stderr_or_stdout(&output.stdout, &output.stderr)
+        ),
+      ))
+    }
   }
 
   fn installed(&self) -> Vec<(String, String)> {
-    let Ok(output) = Command::new("apk").args(["list", "--installed", "-q"]).output() else { return Vec::new(); };
+    let Ok(output) = Command::new("apk").args(["list", "--installed", "-q"]).output() else {
+      return Vec::new();
+    };
     let mut packages: Vec<(String, String)> =
       String::from_utf8_lossy(&output.stdout).lines().filter_map(split_installed_line).collect();
-    packages.sort(); packages.dedup(); packages
+    packages.sort();
+    packages.dedup();
+    packages
   }
 
   fn depends(&self, name: &str) -> Vec<String> {
-    let Ok(output) = Command::new("apk").args(["info", "--depends", name]).output() else { return Vec::new(); };
-    let mut packages: Vec<String> =
-      String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| split_installed_line(line).map(|(name, _)| name)).collect();
-    packages.sort(); packages.dedup(); packages
+    let Ok(output) = Command::new("apk").args(["info", "--depends", name]).output() else {
+      return Vec::new();
+    };
+    let mut packages: Vec<String> = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .filter_map(|line| split_installed_line(line).map(|(name, _)| name))
+      .collect();
+    packages.sort();
+    packages.dedup();
+    packages
   }
 
   fn owns_file(&self, path: &str) -> Option<String> {
     let output = Command::new("apk").args(["info", "--who-owns", path]).output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+      return None;
+    }
     String::from_utf8_lossy(&output.stdout)
       .lines()
       .find_map(|line| split_installed_line(line).map(|(name, _)| name))
   }
 
   fn architectures(&self) -> Vec<String> {
-    let Ok(output) = Command::new("apk").arg("--print-arch").output() else { return Vec::new(); };
-    String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|line| !line.is_empty()).map(ToString::to_string).collect()
+    let Ok(output) = Command::new("apk").arg("--print-arch").output() else {
+      return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .map(str::trim)
+      .filter(|line| !line.is_empty())
+      .map(ToString::to_string)
+      .collect()
   }
 }
 
@@ -77,12 +127,18 @@ fn install_command(target: &str) -> CliResult<Command> {
   let mut command = Command::new("apk");
   command.arg("add");
   if is_local_apk_path(target) {
-    let path = Path::new(target).canonicalize()
+    let path = Path::new(target)
+      .canonicalize()
       .map_err(|err| CliError::new("E_PACKAGE_INVALID", format!("invalid local apk: {err}")))?;
     command.args(["--allow-untrusted", "--"]).arg(path);
   } else {
-    if !valid_package_name(target) || Path::new(target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk")) {
-      return Err(CliError::new("E_PACKAGE_INVALID", "expected a package name or an existing local apk file"));
+    if !valid_package_name(target)
+      || Path::new(target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
+    {
+      return Err(CliError::new(
+        "E_PACKAGE_INVALID",
+        "expected a package name or an existing local apk file",
+      ));
     }
     command.arg("--").arg(target);
   }
@@ -96,8 +152,7 @@ fn valid_package_name(name: &str) -> bool {
 
 fn is_local_apk_path(target: &str) -> bool {
   let path = Path::new(target);
-  path.is_file()
-    && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
+  path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
 }
 
 fn parse_package_version(output: &str, name: &str) -> Option<String> {
@@ -111,7 +166,9 @@ fn parse_package_version(output: &str, name: &str) -> Option<String> {
 /// is the last `-` that starts a version (a version always starts with a digit).
 fn split_installed_line(line: &str) -> Option<(String, String)> {
   let value = line.trim();
-  if value.is_empty() { return None; }
+  if value.is_empty() {
+    return None;
+  }
   let value = value.strip_suffix(" [installed]").unwrap_or(value);
   value.rmatch_indices('-').find_map(|(index, _)| {
     let version = &value[index + 1..];
@@ -130,16 +187,31 @@ mod tests {
   }
   #[test]
   fn parses_apk_name_with_hyphens() {
-    assert_eq!(split_installed_line("luci-app-test-1.2.3"), Some(("luci-app-test".into(), "1.2.3".into())));
-    assert_eq!(split_installed_line("luci-app-test-1.2.3-r0 [installed]"), Some(("luci-app-test".into(), "1.2.3-r0".into())));
+    assert_eq!(
+      split_installed_line("luci-app-test-1.2.3"),
+      Some(("luci-app-test".into(), "1.2.3".into()))
+    );
+    assert_eq!(
+      split_installed_line("luci-app-test-1.2.3-r0 [installed]"),
+      Some(("luci-app-test".into(), "1.2.3-r0".into()))
+    );
   }
   #[test]
-  fn rejects_empty_apk_name_version() { assert_eq!(parse_package_version("luci-\n", "luci"), None); assert_eq!(split_installed_line(""), None); }
+  fn rejects_empty_apk_name_version() {
+    assert_eq!(parse_package_version("luci-\n", "luci"), None);
+    assert_eq!(split_installed_line(""), None);
+  }
 
   #[test]
   fn splits_installed_lines_with_revision_and_epoch() {
-    assert_eq!(split_installed_line("luci-app-test-1.2.3-r0"), Some(("luci-app-test".into(), "1.2.3-r0".into())));
-    assert_eq!(split_installed_line("luci-2:1.2.3-r0 [installed]"), Some(("luci".into(), "2:1.2.3-r0".into())));
+    assert_eq!(
+      split_installed_line("luci-app-test-1.2.3-r0"),
+      Some(("luci-app-test".into(), "1.2.3-r0".into()))
+    );
+    assert_eq!(
+      split_installed_line("luci-2:1.2.3-r0 [installed]"),
+      Some(("luci".into(), "2:1.2.3-r0".into()))
+    );
     assert_eq!(split_installed_line("no-version-here"), None);
   }
 
@@ -158,10 +230,21 @@ mod tests {
     let dir = tempfile::tempdir().expect("create temp dir");
     let apk = dir.path().join("demo.apk");
     std::fs::write(&apk, b"apk").expect("write apk");
-    let local = install_command(&apk.to_string_lossy()).expect("local command").get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let local = install_command(&apk.to_string_lossy())
+      .expect("local command")
+      .get_args()
+      .map(|arg| arg.to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
     let canonical_apk = apk.canonicalize().expect("canonical apk").to_string_lossy().into_owned();
-    assert_eq!(local, vec!["add".to_string(), "--allow-untrusted".to_string(), "--".to_string(), canonical_apk]);
-    let remote = install_command("luci-app-demo").expect("package command").get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    assert_eq!(
+      local,
+      vec!["add".to_string(), "--allow-untrusted".to_string(), "--".to_string(), canonical_apk]
+    );
+    let remote = install_command("luci-app-demo")
+      .expect("package command")
+      .get_args()
+      .map(|arg| arg.to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
     assert_eq!(remote, vec!["add", "--", "luci-app-demo"]);
     assert!(install_command("missing.apk").is_err());
   }

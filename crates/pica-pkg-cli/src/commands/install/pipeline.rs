@@ -1,20 +1,20 @@
 use super::feed::{install_via_feeds_or_pkgs, pkg_list_diff_added, reorder_app_list};
 use super::precheck::{build_precheck_report, summarize_missing_precheck, validate_package};
 use crate::app::{
-  ensure_dirs, resolve_lang, App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID,
-  E_PACKAGE_INVALID, E_RUNTIME, E_VERSION_INCOMPATIBLE,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
+  E_RUNTIME, E_VERSION_INCOMPATIBLE, ensure_dirs, resolve_lang,
 };
 use crate::container::unpack_container;
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
-use crate::system::{run_hook, run_tar_extract, TargetRoot};
+use crate::system::{TargetRoot, run_hook, run_tar_extract};
+use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::io::make_temp_dir;
-use pica_pkg_core::io::{install_payload, remove_payload, PayloadInstall};
+use pica_pkg_core::io::{PayloadInstall, install_payload, remove_payload};
 use pica_pkg_core::manifest::Manifest;
 use pica_pkg_core::version::{pkgver_cmp_key, ver_ge};
-use pica_pkg_core::PICA_VERSION;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -181,8 +181,9 @@ fn required_manifest_field(manifest: &Manifest, key: &str) -> CliResult<String> 
 /// means "unpack this ourselves".
 fn select_backend_for_package(app: &mut App, manifest: &Manifest) -> CliResult<String> {
   let declared = required_manifest_field(manifest, "pkgmgr")?;
-  let declared_kind = PackageManagerKind::parse(&declared)
-    .ok_or_else(|| CliError::new(E_MANIFEST_INVALID, format!("invalid manifest pkgmgr: {declared}")))?;
+  let declared_kind = PackageManagerKind::parse(&declared).ok_or_else(|| {
+    CliError::new(E_MANIFEST_INVALID, format!("invalid manifest pkgmgr: {declared}"))
+  })?;
 
   let kind = match app.options.pkgmgr.clone() {
     Some(value) => {
@@ -495,11 +496,8 @@ fn install_prebuilt_pkgs(
 
   let entries = fs::read_dir(pkgs_dir)
     .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", pkgs_dir.display())))?;
-  let mut containers: Vec<PathBuf> = entries
-    .flatten()
-    .map(|entry| entry.path())
-    .filter(|path| path.is_file())
-    .collect();
+  let mut containers: Vec<PathBuf> =
+    entries.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect();
   containers.sort();
 
   if containers.is_empty() {
@@ -908,7 +906,10 @@ fn abandon(
   ));
 
   if let Err(record_err) = record_installation(app, ctx, precheck, tx) {
-    app.log_warn(format!("{}: could not record the partial install: {}", ctx.pkgname, record_err.message));
+    app.log_warn(format!(
+      "{}: could not record the partial install: {}",
+      ctx.pkgname, record_err.message
+    ));
   }
 
   CliError::new(err.code, format!("{}; rollback incomplete, see the warnings above", err.message))
@@ -1016,9 +1017,7 @@ arch = all
     };
 
     let mut app = App::new(paths, options);
-    app
-      .select_package_manager(PackageManagerKind::Pica.as_str())
-      .expect("force the pica backend");
+    app.select_package_manager(PackageManagerKind::Pica.as_str()).expect("force the pica backend");
     app
   }
 
@@ -1172,16 +1171,16 @@ arch = all
     fixture
       .install(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
-        &[
-          ("etc/demo.conf", "overlay\n"),
-          ("etc/demo.extra", "extra\n"),
-        ],
+        &[("etc/demo.conf", "overlay\n"), ("etc/demo.extra", "extra\n")],
         &[],
         &[],
       )
       .expect("install");
 
-    assert_eq!(fs::read_to_string(fixture.path("usr/lib/demo/helper")).expect("helper"), "payload\n");
+    assert_eq!(
+      fs::read_to_string(fixture.path("usr/lib/demo/helper")).expect("helper"),
+      "payload\n"
+    );
     assert_eq!(fs::read_to_string(fixture.path("etc/demo.extra")).expect("extra"), "extra\n");
     assert_eq!(
       fs::read_to_string(fixture.path("etc/demo.conf")).expect("overlay"),
@@ -1197,12 +1196,8 @@ arch = all
       "the unpacks are recorded by name so -Qi and -R can see them"
     );
 
-    let files: Vec<&str> = record["files"]
-      .as_array()
-      .expect("files")
-      .iter()
-      .filter_map(Value::as_str)
-      .collect();
+    let files: Vec<&str> =
+      record["files"].as_array().expect("files").iter().filter_map(Value::as_str).collect();
     assert!(
       files.iter().any(|file| file.ends_with("usr/lib/demo/helper")),
       "the container's files must be recorded or -R cannot remove them: {files:?}"
@@ -1233,10 +1228,7 @@ arch = all
       err.message
     );
     assert_eq!(err.code, E_PACKAGE_INVALID);
-    assert!(
-      !fixture.path("etc/demo.conf").exists(),
-      "validation runs before anything is written"
-    );
+    assert!(!fixture.path("etc/demo.conf").exists(), "validation runs before anything is written");
     assert!(db_record(&fixture.app, "demo").is_none());
   }
 
@@ -1343,7 +1335,10 @@ arch = all
       !fixture.path("usr/lib/demo/helper").exists(),
       "a rejected arch must not deploy the payload first"
     );
-    assert!(db_record(&fixture.app, "demo").is_none(), "nothing was installed, nothing is recorded");
+    assert!(
+      db_record(&fixture.app, "demo").is_none(),
+      "nothing was installed, nothing is recorded"
+    );
   }
 
   #[test]
@@ -1403,10 +1398,8 @@ arch = all
 
     // The hook drops a file of its own next to the container's, so the rollback
     // cannot remove the container's directory and cannot finish cleanly.
-    let hook = format!(
-      "#!/bin/sh\ntouch {}/usr/lib/demo/local.conf\n",
-      fixture.target.as_path().display()
-    );
+    let hook =
+      format!("#!/bin/sh\ntouch {}/usr/lib/demo/local.conf\n", fixture.target.as_path().display());
 
     let err = fixture
       .install(

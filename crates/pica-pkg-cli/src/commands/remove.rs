@@ -1,9 +1,9 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, E_ARG_INVALID};
+use crate::app::{App, CliError, CliResult, E_ARG_INVALID, ensure_dirs};
 use crate::installed::entry_backend;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::run_command_capture_output;
-use pica_pkg_core::io::{remove_payload, PayloadInstall};
+use pica_pkg_core::io::{PayloadInstall, remove_payload};
 use pica_pkg_core::manifest::{
   get_array_for as manifest_get_array_for, get_scalar as manifest_get_scalar,
 };
@@ -112,7 +112,11 @@ fn json_string_list(entry: &Value, key: &str) -> Vec<String> {
 /// read-only filesystem makes this rare, but a user can install into a writable
 /// overlay). Deleting it would leave that package inconsistent, and Pica cannot
 /// restore the original, so the file is left in place and reported.
-fn exclude_system_owned(app: &mut App, kind: PackageManagerKind, files: Vec<String>) -> Vec<String> {
+fn exclude_system_owned(
+  app: &mut App,
+  kind: PackageManagerKind,
+  files: Vec<String>,
+) -> Vec<String> {
   if !kind.requires_system_binary() {
     return files;
   }

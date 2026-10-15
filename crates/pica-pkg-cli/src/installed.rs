@@ -178,7 +178,7 @@ pub fn entry_source(entry: &Value) -> EntrySource {
 
 #[cfg(test)]
 mod tests {
-  use super::{entry_backend, entry_source, EntrySource, PkgmgrOrigin};
+  use super::{EntrySource, PkgmgrOrigin, entry_backend, entry_source};
   use crate::pkgmgr::PackageManagerKind;
   use pretty_assertions::assert_eq;
   use serde_json::json;
@@ -255,11 +255,9 @@ mod tests {
     // fallback at the end of the ladder would claim it. Both that rule and the
     // fallback report `Default`, so the backend — not the origin — is what says
     // which one applied.
-    for (channel, source) in [
-      ("url", EntrySource::Url),
-      ("local", EntrySource::Local),
-      ("feed", EntrySource::Feed),
-    ] {
+    for (channel, source) in
+      [("url", EntrySource::Url), ("local", EntrySource::Local), ("feed", EntrySource::Feed)]
+    {
       let record = entry(&json!({ "source": channel }), "/tmp/demo.pkg.tar.gz");
       let resolved = entry_backend(&record);
       assert_eq!(resolved.kind, PackageManagerKind::Pica, "source={channel}");

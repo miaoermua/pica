@@ -7,11 +7,7 @@ pub fn ver_ge(a: &str, b: &str) -> bool {
 
 #[must_use]
 pub fn pkgver_cmp_key(pkgver: &str, pkgrel: &str) -> String {
-  if pkgrel.is_empty() {
-    pkgver.to_string()
-  } else {
-    format!("{pkgver}-{pkgrel}")
-  }
+  if pkgrel.is_empty() { pkgver.to_string() } else { format!("{pkgver}-{pkgrel}") }
 }
 
 /// Total order over `pkgver-pkgrel` keys. Both sides must be non-empty; callers

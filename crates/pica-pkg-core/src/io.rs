@@ -211,9 +211,9 @@ fn walk_payload(
 
   for entry in entries {
     let from = entry.path();
-    let relative = from
-      .strip_prefix(base)
-      .map_err(|_| PicaError::msg(format!("payload path outside {}: {}", base.display(), from.display())))?;
+    let relative = from.strip_prefix(base).map_err(|_| {
+      PicaError::msg(format!("payload path outside {}: {}", base.display(), from.display()))
+    })?;
     let to = resolve_under(target_root, relative)?;
     let metadata = fs::symlink_metadata(&from)?;
 
@@ -317,12 +317,9 @@ fn lexical_normalize(path: &Path) -> PathBuf {
   out
 }
 
-
 #[cfg(test)]
 mod tests {
-  use super::{
-    install_payload, lexical_normalize, make_temp_dir, remove_payload, PayloadInstall,
-  };
+  use super::{PayloadInstall, install_payload, lexical_normalize, make_temp_dir, remove_payload};
   use std::fs;
   use std::path::{Path, PathBuf};
 

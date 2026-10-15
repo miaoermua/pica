@@ -1,6 +1,6 @@
 use crate::app::{
-  prompt_yn, App, CliError, CliResult, FeedPolicy, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID,
-  E_RUNTIME,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID, E_RUNTIME, FeedPolicy,
+  prompt_yn,
 };
 use std::fs;
 use std::path::Path;

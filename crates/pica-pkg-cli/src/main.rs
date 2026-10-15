@@ -4,14 +4,14 @@ mod commands;
 mod container;
 mod installed;
 mod lock;
-mod platform;
 mod pkgmgr;
+mod platform;
 mod state;
 mod system;
 
 use crate::app::{
-  parse_options, require_arg, App, CliError, CliResult, FeedPolicy, JsonMode, Options, Paths,
-  E_ARG_INVALID,
+  App, CliError, CliResult, E_ARG_INVALID, FeedPolicy, JsonMode, Options, Paths, parse_options,
+  require_arg,
 };
 use crate::commands::{install, query, remove, sync, upgrade};
 use crate::lock::LockGuard;
@@ -23,8 +23,8 @@ use std::process;
 
 fn usage() {
   println!(
-        "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install via the selected system package manager\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica --pkgmgr <backend> opkg|apk|pica (overrides manifest and config)\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: tar and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Backends: apk, opkg, pica. Resolution order is --pkgmgr, then the package\n    manifest, then /etc/pica/pica.json \"pkgmgr\", then auto-detection (apk before opkg, else pica).\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
-    );
+    "Usage:\n  pica -S [selector]      Sync repos (no selector) or install by selector (auto)\n  pica -Su                Upgrade all installed pica packages\n  pica -Syu               Sync, then upgrade all installed pica packages\n  pica -Si <selector>     Show remote package info from synced index\n  pica -So <selector>     Install via the selected system package manager\n  pica -Sp <selector>     Install by selector (force pica repo)\n  pica -U <pkgfile|url>   Install/Update from local file or URL\n  pica -R <pkgname>       Remove package (no dependency handling)\n  pica -Q                 List installed pica packages\n  pica -Qi <pkgname>      Show installed package info\n  pica -Ql <pkgname>      List installed package files\n  pica --json ...         Emit JSON on success and error (explicit only)\n  pica --json-errors ...  Emit JSON only on error\n  pica --non-interactive ...\n                            Disable prompts (for backend/automation)\n  pica --feed-policy <mode>\n                            ask|feed-first|packaged-first|feed-only|packaged-only\n  pica --pkgmgr <backend> opkg|apk|pica (overrides manifest and config)\n  pica -V\n  pica --version\n\nNotes:\n  - Requires: tar and one fetcher (uclient-fetch/wget/curl) for URL install/sync.\n  - Backends: apk, opkg, pica. Resolution order is --pkgmgr, then the package\n    manifest, then /etc/pica/pica.json \"pkgmgr\", then auto-detection (apk before opkg, else pica).\n  - Config: /etc/pica/pica.json\n  - State:  /var/lib/pica/db.json, /var/lib/pica/index.json\n  - Lock:   /var/lib/pica/db.lck\n  - Selector example: app(branch)"
+  );
 }
 
 fn main() {
@@ -101,7 +101,7 @@ fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, Strin
     "-S" => {
       if let Some(selector) = args.get(1) {
         app.set_phase("install");
-          install::app_auto(app, selector)?;
+        install::app_auto(app, selector)?;
         Ok(("-S", selector.clone()))
       } else {
         app.set_phase("sync");
