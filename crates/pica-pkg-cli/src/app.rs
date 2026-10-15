@@ -1,6 +1,6 @@
 use crate::state::{read_json_file, write_json_atomic_pretty};
 use pica_pkg_core::error::PicaError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,7 @@ pub const E_IO: &str = "E_IO";
 pub const E_JSON_INVALID: &str = "E_JSON_INVALID";
 pub const E_DB_INVALID: &str = "E_DB_INVALID";
 pub const E_INDEX_INVALID: &str = "E_INDEX_INVALID";
+pub const E_INDEX_UNAVAILABLE: &str = "E_INDEX_UNAVAILABLE";
 pub const E_CONFIG_INVALID: &str = "E_CONFIG_INVALID";
 pub const E_POLICY_INVALID: &str = "E_POLICY_INVALID";
 pub const E_REPO_INVALID: &str = "E_REPO_INVALID";
@@ -102,6 +103,8 @@ pub struct Options {
   pub fetch_timeout: u64,
   pub fetch_retry: u32,
   pub fetch_retry_delay: u64,
+  /// Explicit `--pkgmgr` value. Highest-priority backend selection.
+  pub pkgmgr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -131,13 +134,87 @@ impl From<PicaError> for CliError {
 pub struct App {
   pub paths: Paths,
   pub options: Options,
+  pub package_manager: Option<Box<dyn crate::pkgmgr::PackageManager>>,
+  pub backend: crate::pkgmgr::PackageManagerKind,
+  /// The `apk_force_non_repository` setting, read by
+  /// [`App::apply_backend_config`]. Until then the default stands, which is what
+  /// the tests and the probing paths see.
+  pub apk_force_non_repository: bool,
   pub json_last_phase: String,
   pub json_has_text: bool,
 }
 
 impl App {
   pub fn new(paths: Paths, options: Options) -> Self {
-    Self { paths, options, json_last_phase: String::new(), json_has_text: false }
+    let backend = crate::pkgmgr::detect_kind();
+    let apk_force_non_repository = true;
+    Self {
+      paths,
+      options,
+      package_manager: crate::pkgmgr::package_manager_for(backend),
+      backend,
+      apk_force_non_repository,
+      json_last_phase: String::new(),
+      json_has_text: false,
+    }
+  }
+
+  pub fn package_manager(&self) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
+    self
+      .package_manager
+      .as_deref()
+      .ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
+  }
+
+  /// Backend identity of this invocation, including the Pica-native `pica`.
+  #[must_use]
+  pub fn backend(&self) -> crate::pkgmgr::PackageManagerKind {
+    self.backend
+  }
+
+  /// Switches backend explicitly. A backend that needs a system binary which is
+  /// absent is an error rather than a silent fallback, so packages never land in
+  /// the wrong package database; `pica` needs no command and always succeeds.
+  pub fn select_package_manager(&mut self, value: &str) -> CliResult<()> {
+    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
+    if !kind.requires_system_binary() {
+      self.backend = kind;
+      self.package_manager = None;
+      return Ok(());
+    }
+    if self.backend == kind && self.package_manager.is_some() {
+      return Ok(());
+    }
+    let manager = crate::pkgmgr::package_manager_with(kind, self.apk_force_non_repository)
+      .ok_or_else(|| {
+        CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
+      })?;
+    self.backend = kind;
+    self.package_manager = Some(manager);
+    Ok(())
+  }
+
+  /// Applies backend selection in priority order: `--pkgmgr`, then the config
+  /// file, then the auto-detected backend chosen in [`App::new`].
+  ///
+  /// The apk setting is read first and the auto-detected backend rebuilt with
+  /// it, so the policy applies whether or not the config names a backend:
+  /// `apk` is what most routers end up with, and it is the backend that has a
+  /// setting to carry.
+  pub fn apply_backend_config(&mut self) -> CliResult<()> {
+    self.apk_force_non_repository = conf_get_apk_force_non_repository(&self.paths.conf_file)?;
+    if self.backend.requires_system_binary() {
+      self.package_manager =
+        crate::pkgmgr::package_manager_with(self.backend, self.apk_force_non_repository);
+    }
+    if let Some(value) = self.options.pkgmgr.clone() {
+      return self.select_package_manager(&value);
+    }
+    if let Some(value) = conf_get_pkgmgr(&self.paths.conf_file) {
+      return self.select_package_manager(&value);
+    }
+    Ok(())
   }
 
   pub fn set_phase(&mut self, phase: &str) {
@@ -195,6 +272,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut fetch_timeout = 30u64;
   let mut fetch_retry = 2u32;
   let mut fetch_retry_delay = 1u64;
+  let mut pkgmgr = None;
   let mut positional = Vec::new();
 
   let mut index = 0;
@@ -242,6 +320,16 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
         fetch_retry_delay = parse_u64_option("--fetch-retry-delay", value)?;
         index += 2;
       }
+      "--pkgmgr" => {
+        let Some(value) = args.get(index + 1) else {
+          return Err(CliError::new(E_CONFIG_INVALID, "--pkgmgr requires <opkg|apk|pica>"));
+        };
+        if crate::pkgmgr::PackageManagerKind::parse(value).is_none() {
+          return Err(CliError::new(E_CONFIG_INVALID, format!("invalid --pkgmgr: {value}")));
+        }
+        pkgmgr = Some(value.clone());
+        index += 2;
+      }
       other => {
         positional.push(other.to_string());
         index += 1;
@@ -257,6 +345,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       fetch_timeout,
       fetch_retry,
       fetch_retry_delay,
+      pkgmgr,
     },
     positional,
   ))
@@ -300,6 +389,7 @@ pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
     let content = json!({
         "repos": [],
         "i18n": "zh-cn",
+        "pkgmgr": Value::Null,
     });
     write_json_atomic_pretty(&paths.conf_file, &content)?;
   }
@@ -366,6 +456,41 @@ pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
   Some(value.to_string())
 }
 
+/// Reads the configured backend. `null`, a missing key and an empty string all
+/// mean "auto-detect"; an unrecognized value is an error so a typo cannot
+/// silently pick the wrong package database.
+pub(crate) fn conf_get_pkgmgr(conf_file: &Path) -> Option<String> {
+  let conf = read_json_file(conf_file).ok()?;
+  let value = conf.get("pkgmgr")?.as_str()?.trim();
+  (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Whether a local `.apk` is installed with `--force-non-repository`.
+///
+/// apk-tools 3.x, which `OpenWrt` 25.12 and later ship, refuses to install a
+/// package that no configured repository provides unless that flag is given.
+/// Pica unpacks its own `pkgs/apk/*.apk` and hands the files to `apk add`, so
+/// the default is `true`; `false` keeps the call to what apk 2.x accepted, for a
+/// router whose apk build does not know the option.
+///
+/// A missing key or `null` means the default. Anything other than `true`/`false`
+/// is an error: this decides whether a check is waived, so a typo must not fall
+/// back to a value the operator did not choose.
+pub(crate) fn conf_get_apk_force_non_repository(conf_file: &Path) -> CliResult<bool> {
+  let Ok(conf) = read_json_file(conf_file) else { return Ok(true) };
+  match conf.get("apk_force_non_repository") {
+    None | Some(Value::Null) => Ok(true),
+    Some(Value::Bool(value)) => Ok(*value),
+    Some(other) => Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!(
+        "invalid \"apk_force_non_repository\" in {}: expected true or false, found {other}",
+        conf_file.display()
+      ),
+    )),
+  }
+}
+
 pub(crate) fn resolve_lang(conf_file: &Path) -> String {
   let conf = read_json_file(conf_file).ok();
   conf
@@ -375,7 +500,9 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{parse_options, FeedPolicy};
+  use super::{FeedPolicy, conf_get_apk_force_non_repository, conf_get_pkgmgr, parse_options};
+  use serde_json::json;
+  use std::fs;
 
   #[test]
   fn parse_options_fetch_settings() {
@@ -416,5 +543,76 @@ mod tests {
     let input = vec!["--fetch-retry-delay".to_string(), "-1".to_string()];
     let err = parse_options(&input).expect_err("must reject invalid retry delay");
     assert!(err.message.contains("--fetch-retry-delay"));
+  }
+
+  #[test]
+  fn parse_options_reads_explicit_pkgmgr() {
+    let input =
+      vec!["--pkgmgr".to_string(), "apk".to_string(), "-S".to_string(), "demo".to_string()];
+    let (options, positional) = parse_options(&input).expect("parse options");
+    assert_eq!(options.pkgmgr.as_deref(), Some("apk"));
+    assert_eq!(positional, vec!["-S".to_string(), "demo".to_string()]);
+  }
+
+  #[test]
+  fn parse_options_rejects_unknown_pkgmgr() {
+    let err = parse_options(&["--pkgmgr".to_string(), "pacman".to_string()])
+      .expect_err("must reject unknown backend");
+    assert!(err.message.contains("--pkgmgr"));
+  }
+
+  #[test]
+  fn config_backend_ignores_null_and_empty_values() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "pkgmgr": null }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    fs::write(&conf, json!({ "pkgmgr": "  " }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    fs::write(&conf, json!({ "repos": [] }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf), None);
+    assert_eq!(conf_get_pkgmgr(&dir.path().join("missing.json")), None);
+  }
+
+  #[test]
+  fn config_backend_is_returned_verbatim_for_validation() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "pkgmgr": " opkg " }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("opkg"));
+    fs::write(&conf, json!({ "pkgmgr": "bogus" }).to_string()).expect("write config");
+    assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("bogus"));
+  }
+
+  #[test]
+  fn the_apk_local_install_setting_defaults_to_on() {
+    // apk-tools 3.x refuses a local file that no repository provides, which is
+    // every file Pica installs from its own `pkgs/`, so an unset key means the
+    // flag is passed rather than the install failing on a current router.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+
+    assert!(conf_get_apk_force_non_repository(&dir.path().join("missing.json")).expect("default"));
+    fs::write(&conf, json!({ "repos": [] }).to_string()).expect("write config");
+    assert!(conf_get_apk_force_non_repository(&conf).expect("default"));
+    fs::write(&conf, json!({ "apk_force_non_repository": null }).to_string())
+      .expect("write config");
+    assert!(conf_get_apk_force_non_repository(&conf).expect("null means the default"));
+    fs::write(&conf, json!({ "apk_force_non_repository": false }).to_string())
+      .expect("write config");
+    assert!(!conf_get_apk_force_non_repository(&conf).expect("off"));
+  }
+
+  #[test]
+  fn a_non_boolean_apk_local_install_setting_is_rejected() {
+    // The setting decides whether a signature check is waived, so a value that
+    // is neither true nor false fails the command instead of picking one.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "apk_force_non_repository": "yes" }).to_string()).expect("config");
+
+    let err = conf_get_apk_force_non_repository(&conf).expect_err("must reject the value");
+    assert!(err.message.contains("apk_force_non_repository"), "{}", err.message);
+    assert!(err.message.contains("expected true or false"), "{}", err.message);
   }
 }

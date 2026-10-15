@@ -1,6 +1,7 @@
 use super::install;
-use crate::app::{ensure_dirs, App, CliResult};
+use crate::app::{App, CliResult, ensure_dirs};
 use crate::candidate::find_pica_candidates_in_index;
+use crate::installed;
 use crate::state::read_json_file;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
@@ -17,20 +18,26 @@ pub fn all(app: &mut App) -> CliResult<()> {
 
   let mut candidates = Vec::new();
   for (pkgname, entry) in installed {
-    let manifest = entry.get("manifest").unwrap_or(&Value::Null);
-    if manifest_get_first(manifest, "source") != "pica" {
+    // Only repository installs can be re-resolved: a local file or URL has no
+    // index entry to compare against.
+    if !installed::entry_source(entry).is_repo_resolvable() {
       continue;
     }
+
+    // The recorded backend decides which variant of the artifact this entry
+    // actually is, and candidates are filtered by it, so it must be selected
+    // before the lookup. An explicit `--pkgmgr` still wins.
+    if app.options.pkgmgr.is_none() {
+      app.select_package_manager(installed::entry_backend(entry).kind.as_str())?;
+    }
+
+    let manifest = entry.get("manifest").unwrap_or(&Value::Null);
 
     let appname = {
       let value = manifest_get_first(manifest, "appname");
       if value.is_empty() {
         let fallback = manifest_get_first(manifest, "pkgname");
-        if fallback.is_empty() {
-          pkgname.clone()
-        } else {
-          fallback
-        }
+        if fallback.is_empty() { pkgname.clone() } else { fallback }
       } else {
         value
       }

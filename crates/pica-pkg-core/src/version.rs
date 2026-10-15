@@ -7,11 +7,24 @@ pub fn ver_ge(a: &str, b: &str) -> bool {
 
 #[must_use]
 pub fn pkgver_cmp_key(pkgver: &str, pkgrel: &str) -> String {
-  if pkgrel.is_empty() {
-    pkgver.to_string()
+  if pkgrel.is_empty() { pkgver.to_string() } else { format!("{pkgver}-{pkgrel}") }
+}
+
+/// Total order over `pkgver-pkgrel` keys. Both sides must be non-empty; callers
+/// that need the "unset upper bound means no constraint" convention use
+/// [`pkgver_ge`] / [`pkgver_gt`] instead.
+#[must_use]
+pub fn pkgver_cmp(a: &str, b: &str) -> Ordering {
+  let (a_ver, a_rel) = split_pkgver_rel(a);
+  let (b_ver, b_rel) = split_pkgver_rel(b);
+
+  let order = if is_dot_numeric(&a_ver) && is_dot_numeric(&b_ver) {
+    compare_dot_numeric(&a_ver, &b_ver).unwrap_or(Ordering::Equal)
   } else {
-    format!("{pkgver}-{pkgrel}")
-  }
+    compare_mixed_version(&a_ver, &b_ver)
+  };
+
+  if order == Ordering::Equal { compare_numeric_rel(&a_rel, &b_rel) } else { order }
 }
 
 #[must_use]
@@ -23,25 +36,18 @@ pub fn pkgver_ge(a: &str, b: &str) -> bool {
     return false;
   }
 
-  let (a_ver, a_rel) = split_pkgver_rel(a);
-  let (b_ver, b_rel) = split_pkgver_rel(b);
+  pkgver_cmp(a, b) != Ordering::Less
+}
 
-  let is_numeric_a = is_dot_numeric(&a_ver);
-  let is_numeric_b = is_dot_numeric(&b_ver);
-
-  if is_numeric_a && is_numeric_b {
-    match compare_dot_numeric(&a_ver, &b_ver) {
-      Some(Ordering::Greater) => true,
-      Some(Ordering::Equal) => compare_numeric_rel(&a_rel, &b_rel) != Ordering::Less,
-      Some(Ordering::Less) | None => false,
-    }
-  } else {
-    match compare_mixed_version(&a_ver, &b_ver) {
-      Ordering::Greater => true,
-      Ordering::Equal => compare_numeric_rel(&a_rel, &b_rel) != Ordering::Less,
-      Ordering::Less => false,
-    }
+/// Strictly newer than `b`. Unlike [`pkgver_ge`], an empty `b` is not treated as
+/// "no constraint": selecting a candidate must prove it is an upgrade.
+#[must_use]
+pub fn pkgver_gt(a: &str, b: &str) -> bool {
+  if a.is_empty() || b.is_empty() {
+    return false;
   }
+
+  pkgver_cmp(a, b) == Ordering::Greater
 }
 
 fn compare_mixed_version(a: &str, b: &str) -> Ordering {
@@ -154,7 +160,7 @@ fn compare_dot_numeric(a: &str, b: &str) -> Option<Ordering> {
 
 #[cfg(test)]
 mod tests {
-  use super::{pkgver_cmp_key, pkgver_ge, ver_ge};
+  use super::{pkgver_cmp_key, pkgver_ge, pkgver_gt, ver_ge};
 
   #[test]
   fn compare_dot_versions() {
@@ -176,6 +182,16 @@ mod tests {
     assert!(!pkgver_ge("9.0-1", "10.0-1"));
     assert!(pkgver_ge("1.0.0-rc10", "1.0.0-rc2"));
     assert!(pkgver_ge("1.0.0", "1.0.0-rc1"));
+  }
+
+  #[test]
+  fn strict_greater_rejects_equal_and_unset_bounds() {
+    assert!(pkgver_gt("1.2.3-2", "1.2.3-1"));
+    assert!(pkgver_gt("1.2.3", "1.2.2"));
+    assert!(!pkgver_gt("1.2.3-1", "1.2.3-1"));
+    assert!(!pkgver_gt("1.2.2", "1.2.3"));
+    assert!(!pkgver_gt("1.2.3", ""));
+    assert!(!pkgver_gt("", "1.2.3"));
   }
 
   #[test]

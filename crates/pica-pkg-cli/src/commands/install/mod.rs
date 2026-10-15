@@ -3,23 +3,20 @@ mod pipeline;
 mod precheck;
 
 use crate::app::{
-  conf_get_i18n, ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID,
-  E_REPO_INVALID, E_VERSION_INCOMPATIBLE,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID, E_REPO_INVALID,
+  E_VERSION_INCOMPATIBLE, conf_get_i18n, ensure_dirs,
 };
 use crate::candidate::find_pica_candidates_in_index;
+use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
 use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
-use crate::system::{
-  fetch_url, need_cmd, opkg_has_package, opkg_install_pkg, opkg_installed_version,
-  opkg_update_ignore,
-};
+use crate::system::{fetch_url, need_cmd};
+use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
-use pica_pkg_core::version::{pkgver_ge, ver_ge};
-use pica_pkg_core::PICA_VERSION;
-use serde_json::{json, Value};
+use pica_pkg_core::version::{pkgver_gt, ver_ge};
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
@@ -29,43 +26,51 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   let installed_pkg = db_find_installed_pkgname_by_selector(&app.paths.db_file, &parsed)?;
   if let Some(pkgname) = installed_pkg {
     let db = read_json_file(&app.paths.db_file)?;
-    let source = db
-      .get("installed")
-      .and_then(Value::as_object)
-      .and_then(|installed| installed.get(&pkgname))
-      .and_then(|entry| entry.get("manifest"))
-      .map(|manifest| manifest_get_first(manifest, "source"))
-      .unwrap_or_default();
+    let entry =
+      db.get("installed").and_then(Value::as_object).and_then(|installed| installed.get(&pkgname));
 
-    match source.as_str() {
-      "opkg" => {
-        app_via_opkg(app, selector)?;
-        return Ok(());
+    if let Some(entry) = entry {
+      // Reinstalling must reproduce the original install: the backend decides
+      // which `pkgs/<backend>/` payload applies, and the channel decides whether
+      // a Pica artifact exists at all. A recorded backend therefore outranks the
+      // config file and auto-detection, but not an explicit `--pkgmgr`.
+      if app.options.pkgmgr.is_none() {
+        app.select_package_manager(installed::entry_backend(entry).kind.as_str())?;
       }
-      "pica" => {
+
+      // Feed installs never had an artifact, so there is nothing to re-resolve.
+      if installed::entry_source(entry) == EntrySource::Feed {
+        app_via_package_manager(app, selector)?;
+      } else {
         pica_from_repo(app, selector)?;
-        return Ok(());
       }
-      _ => {}
+      return Ok(());
     }
   }
 
-  opkg_update_ignore();
+  let package_manager = app.package_manager()?;
 
-  if !Selector::is_structured(selector) && opkg_has_package(&parsed.appname) {
-    let should_install_opkg = if app.options.non_interactive {
-      matches!(
-        app.options.feed_policy,
-        crate::app::FeedPolicy::Ask
-          | crate::app::FeedPolicy::FeedFirst
-          | crate::app::FeedPolicy::FeedOnly
-      )
-    } else {
-      !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
-    };
+  // Whether the feeds decide this request at all. Under a policy that will not
+  // install from them, the answer is not consulted — and asking anyway would
+  // make a pica-repo install depend on an index whose answer nothing uses.
+  let feeds_decide = if app.options.non_interactive {
+    matches!(
+      app.options.feed_policy,
+      crate::app::FeedPolicy::Ask
+        | crate::app::FeedPolicy::FeedFirst
+        | crate::app::FeedPolicy::FeedOnly
+    )
+  } else {
+    !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
+  };
 
-    if should_install_opkg {
-      app_via_opkg(app, selector)?;
+  if feeds_decide && !Selector::is_structured(selector) {
+    // The feeds decide whether this install goes to the package manager, so the
+    // answer has to be one: an index nobody could fetch would send a package the
+    // feeds do carry to the pica repository instead.
+    package_manager.update_index()?;
+    if package_manager.package_exists(&parsed.appname)? {
+      app_via_package_manager(app, selector)?;
       return Ok(());
     }
   }
@@ -73,15 +78,27 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   pica_from_repo(app, selector)
 }
 
-pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
+pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  need_cmd("opkg")?;
-
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let appname = parsed.appname.clone();
 
-  opkg_update_ignore();
+  if !app.backend().requires_system_binary() {
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!(
+        "{}: backend has no package manager, use selectors from pica repos instead",
+        app.backend().as_str()
+      ),
+    ));
+  }
+
   let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
+  let package_manager = app.package_manager()?;
+  // This function installs from the feeds, so a feed whose index could not be
+  // read is reported as itself: "package not found" would name a fact about a
+  // feed that was never fetched.
+  package_manager.update_index()?;
 
   let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
   if lang == "zh-cn" {
@@ -90,28 +107,29 @@ pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
 
   let mut to_install = Vec::new();
   for pkg in candidates {
-    if opkg_has_package(&pkg) {
+    if package_manager.package_exists(&pkg)? {
       to_install.push(pkg);
     }
   }
 
   if to_install.is_empty() {
-    return Err(CliError::new(E_CONFIG_INVALID, format!("opkg: package not found: {appname}")));
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!("{}: package not found: {appname}", package_manager.kind().as_str()),
+    ));
   }
 
-  app.log_info(format!("Installing (opkg): {}", to_install.join(" ")));
-
-  for pkg in &to_install {
-    opkg_install_pkg("opkg", pkg)?;
-  }
-
-  let mut base_ver = opkg_installed_version(&appname).unwrap_or_default();
+  // The candidates that were found are one request: an app and its i18n pack
+  // are installed together, so the backend resolves them in one transaction.
+  package_manager.install(package_manager.kind().as_str(), &to_install)?;
+  let mut base_ver = package_manager.installed_version(&appname).unwrap_or_default();
   if base_ver.is_empty() {
     if let Some(first_pkg) = to_install.first() {
-      base_ver = opkg_installed_version(first_pkg).unwrap_or_default();
+      base_ver = package_manager.installed_version(first_pkg).unwrap_or_default();
     }
   }
 
+  let backend = package_manager.kind().as_str();
   let manifest = json!({
       "pkgname": appname,
       "appname": appname,
@@ -120,12 +138,18 @@ pub fn app_via_opkg(app: &mut App, selector: &str) -> CliResult<()> {
       "os": detect_os(),
       "platform": detect_platform(),
       "arch": "all",
-      "source": "opkg",
-      "pkgmgr": "opkg",
-      "opkg": to_install,
+      // Channel and backend are separate fields: this install came from the
+      // system feeds, and `opkg`/`apk` owns the files.
+      "source": EntrySource::Feed.as_str(),
+      "pkgmgr": backend,
+      // Fixed key: writing the backend name here produced one field per
+      // backend (`apk: [...]`) and leaked it into every downstream consumer.
+      "app": to_install,
   });
 
-  db_set_installed(&app.paths.db_file, &appname, &manifest, "opkg", &to_install)?;
+  // The native package manager owns these files; `files` records the package
+  // names so `-Ql` can still show what this entry brought in.
+  db_set_installed(&app.paths.db_file, &appname, &manifest, backend, &to_install, &[])?;
   app.log_info("Transaction completed");
   Ok(())
 }
@@ -142,12 +166,12 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
+  // Strictly greater, so the first candidate is only a baseline and equal
+  // versions never displace an earlier repo's entry.
   let mut best_index = 0usize;
-  let mut best_ver = String::new();
-  for (index, candidate) in candidates.iter().enumerate() {
-    if pkgver_ge(&candidate.cmpver, &best_ver) {
+  for index in 1..candidates.len() {
+    if pkgver_gt(&candidates[index].cmpver, &candidates[best_index].cmpver) {
       best_index = index;
-      best_ver.clone_from(&candidate.cmpver);
     }
   }
 
@@ -214,12 +238,12 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
 
-  pipeline::pkgfile(app, &cached, Some(selector.to_string()))
+  pipeline::pkgfile(app, &cached, Some(selector.to_string()), EntrySource::Repo)
 }
 
 pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliResult<()> {
   if Path::new(source).is_file() {
-    return pipeline::pkgfile(app, Path::new(source), selector);
+    return pipeline::pkgfile(app, Path::new(source), selector, EntrySource::Local);
   }
 
   if is_supported_url(source) {
@@ -243,7 +267,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
       app.options.fetch_retry_delay,
     )?;
     pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
-    return pipeline::pkgfile(app, &cached, selector);
+    return pipeline::pkgfile(app, &cached, selector, EntrySource::Url);
   }
 
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))

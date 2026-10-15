@@ -1,4 +1,5 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID};
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
+use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_os;
 use crate::state::read_json_file;
 use pica_pkg_core::selector::Selector;
@@ -14,6 +15,7 @@ pub(crate) fn find_pica_candidates_in_index(
   let index = read_json_file(&app.paths.index_file)?;
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let host_os = detect_os();
+  let host_backend = app.backend();
 
   let mut out = Vec::new();
 
@@ -77,6 +79,17 @@ pub(crate) fn find_pica_candidates_in_index(
 
       let os_match = pkg_os.is_empty() || pkg_os == "all" || pkg_os == host_os;
       if !os_match {
+        continue;
+      }
+
+      // Backend identity: a `pica` package ships a payload Pica installs itself
+      // and needs nothing from the host, so it matches anywhere. `opkg` and
+      // `apk` packages need their own backend to be the one in use here.
+      let backend_match = match PackageManagerKind::parse(&pkgmgr) {
+        Some(kind) => !kind.requires_system_binary() || host_backend == kind,
+        None => false,
+      };
+      if !backend_match {
         continue;
       }
 

@@ -5,6 +5,32 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::Path;
 
+/// Separator for backend-scoped overrides, e.g. `app@apk = demo-v3`.
+pub const BACKEND_SCOPE: char = '@';
+
+/// Build targets declared in a source manifest (`targets = opkg`).
+///
+/// Accepts both the repeatable form and a comma-separated list so that the
+/// field behaves like every other list field in the manifest.
+#[must_use]
+pub fn split_targets(values: &[String]) -> Vec<String> {
+  let mut out: Vec<String> = Vec::new();
+  for value in values {
+    for item in value.split(',') {
+      let item = item.trim();
+      if item.is_empty() || out.iter().any(|seen| seen == item) {
+        continue;
+      }
+      out.push(item.to_string());
+    }
+  }
+  out
+}
+
+fn scoped_key(key: &str, backend: &str) -> String {
+  format!("{key}{BACKEND_SCOPE}{backend}")
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
   pub value: Value,
@@ -74,6 +100,30 @@ impl Manifest {
   }
 
   #[must_use]
+  pub fn has(&self, key: &str) -> bool {
+    self.value.get(key).is_some()
+  }
+
+  /// Backend-scoped lookup: `<key>@<backend>` wins when present, otherwise `<key>`.
+  ///
+  /// A present-but-empty scoped value means "explicitly nothing for this backend",
+  /// so presence is checked rather than emptiness.
+  #[must_use]
+  pub fn get_first_for(&self, key: &str, backend: &str) -> String {
+    get_first_for(&self.value, key, backend)
+  }
+
+  #[must_use]
+  pub fn get_array_for(&self, key: &str, backend: &str) -> Vec<String> {
+    get_array_for(&self.value, key, backend)
+  }
+
+  #[must_use]
+  pub fn targets(&self) -> Vec<String> {
+    split_targets(&self.get_array("targets"))
+  }
+
+  #[must_use]
   pub fn pkgver_display(&self) -> String {
     let pkgver = self.get_first("pkgver");
     let pkgrel = self.get_first("pkgrel");
@@ -98,16 +148,6 @@ impl Manifest {
   #[must_use]
   pub fn has_type(&self, target: &str) -> bool {
     self.get_array("type").into_iter().any(|item| item == target)
-  }
-
-  #[must_use]
-  pub fn with_source_default(mut self, source: &str) -> Self {
-    if self.value.get("source").is_none() {
-      if let Some(obj) = self.value.as_object_mut() {
-        obj.insert("source".to_string(), Value::String(source.to_string()));
-      }
-    }
-    self
   }
 
   #[must_use]
@@ -149,11 +189,7 @@ impl Manifest {
         }
       }
     }
-    if lines.is_empty() {
-      String::new()
-    } else {
-      format!("{}\n", lines.join("\n"))
-    }
+    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
   }
 
   /// # Errors
@@ -196,6 +232,24 @@ pub fn get_array(value: &Value, key: &str) -> Vec<String> {
     Value::Null => Vec::new(),
     _ => vec![value_to_text(entry)],
   }
+}
+
+/// [`Manifest::get_first_for`] for callers holding a raw JSON manifest, such as
+/// database records.
+#[must_use]
+pub fn get_first_for(value: &Value, key: &str, backend: &str) -> String {
+  get_first(value, &scoped_lookup_key(value, key, backend))
+}
+
+/// [`Manifest::get_array_for`] for callers holding a raw JSON manifest.
+#[must_use]
+pub fn get_array_for(value: &Value, key: &str, backend: &str) -> Vec<String> {
+  get_array(value, &scoped_lookup_key(value, key, backend))
+}
+
+fn scoped_lookup_key(value: &Value, key: &str, backend: &str) -> String {
+  let scoped = scoped_key(key, backend);
+  if value.get(&scoped).is_some() { scoped } else { key.to_string() }
 }
 
 fn trim_comment(input: &str) -> &str {
@@ -246,5 +300,44 @@ mod tests {
         ";
     let manifest = Manifest::from_text(text).expect("parse manifest");
     assert_eq!(manifest.canonical_selector("hello"), "hello(stable)");
+  }
+
+  #[test]
+  fn backend_scope_overrides_shared_key() {
+    let manifest = Manifest::from_text(
+      r"
+        app = demo
+        app = luci-app-demo
+        app@apk = demo-v3
+        base = luci-base
+        base@apk =
+        ",
+    )
+    .expect("parse manifest");
+
+    assert_eq!(manifest.get_array_for("app", "opkg"), vec!["demo", "luci-app-demo"]);
+    assert_eq!(manifest.get_array_for("app", "apk"), vec!["demo-v3"]);
+    assert_eq!(manifest.get_array_for("base", "opkg"), vec!["luci-base"]);
+    // An empty scoped value shadows the shared list; callers drop empty entries.
+    let apk_base_raw = manifest.get_array_for("base", "apk");
+    let apk_base: Vec<&str> =
+      apk_base_raw.iter().map(String::as_str).filter(|item| !item.is_empty()).collect();
+    assert!(apk_base.is_empty());
+    assert_eq!(manifest.get_first_for("app", "apk"), "demo-v3");
+    assert_eq!(manifest.get_first_for("app", "pica"), "demo");
+  }
+
+  #[test]
+  fn targets_accepts_repeated_and_comma_forms() {
+    let repeated = Manifest::from_text("targets = opkg\ntargets = apk\n").expect("parse");
+    assert_eq!(repeated.targets(), vec!["opkg", "apk"]);
+
+    let comma = Manifest::from_text("targets = apk,opkg,apk\n").expect("parse");
+    assert_eq!(comma.targets(), vec!["apk", "opkg"]);
+
+    let mixed = Manifest::from_text("targets = opkg, apk\ntargets = pica\n").expect("parse");
+    assert_eq!(mixed.targets(), vec!["opkg", "apk", "pica"]);
+
+    assert!(Manifest::from_text("pkgname = x").expect("parse").targets().is_empty());
   }
 }

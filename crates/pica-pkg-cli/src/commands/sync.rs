@@ -1,25 +1,24 @@
 use crate::app::{
-  ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID, ensure_dirs,
 };
 use crate::platform::detect_platform;
 use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
-use crate::system::{fetch_url, has_command, opkg_has_package, opkg_update_ignore};
+use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::{is_supported_url, parse_repo_json};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   app.log_info("Synchronizing package databases...");
 
   let conf = read_json_file(&app.paths.conf_file)?;
-  let repos =
-    conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
-      CliError::new(
-        E_CONFIG_INVALID,
-        format!("no repos configured in {}", app.paths.conf_file.display()),
-      )
-    })?;
+  let repos = conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
+    CliError::new(
+      E_CONFIG_INVALID,
+      format!("no repos configured in {}", app.paths.conf_file.display()),
+    )
+  })?;
 
   if repos.is_empty() {
     return Err(CliError::new(
@@ -102,26 +101,44 @@ pub fn repos(app: &mut App) -> CliResult<()> {
 }
 
 fn check_index_dependencies(app: &mut App) {
-  if !has_command("opkg") {
-    return;
-  }
-
-  opkg_update_ignore();
-
   let Ok(index) = read_json_file(&app.paths.index_file) else {
     return;
   };
 
-  let mut missing_any = false;
-  for dep in collect_declared_dependencies(&index) {
-    if !opkg_has_package(&dep) {
-      app.log_warn(format!("opkg feed missing dependency: {dep}"));
-      missing_any = true;
-    }
-  }
+  let (manager_name, checked) = {
+    let Ok(package_manager) = app.package_manager() else {
+      app.log_warn("skip dependency check: no supported package manager found");
+      return;
+    };
+    let checked = package_manager.update_index().and_then(|()| {
+      let mut missing = Vec::new();
+      for dep in collect_declared_dependencies(&index) {
+        if !package_manager.package_exists(&dep)? {
+          missing.push(dep);
+        }
+      }
+      Ok(missing)
+    });
+    (package_manager.kind().as_str(), checked)
+  };
 
-  if missing_any {
-    app.log_warn("Some declared dependencies are missing in opkg feeds");
+  // The check is a warning, not a gate, so a backend that cannot be read costs a
+  // warning of its own. It must not cost anything else: reporting a feed as
+  // missing a dependency it was never asked about would read as a fact about
+  // the repository, on a host whose repositories are simply out of reach.
+  let missing = match checked {
+    Ok(missing) => missing,
+    Err(err) => {
+      app.log_warn(format!("skip dependency check: {}", err.message));
+      return;
+    }
+  };
+
+  for dep in &missing {
+    app.log_warn(format!("{manager_name} feed missing dependency: {dep}"));
+  }
+  if !missing.is_empty() {
+    app.log_warn(format!("Some declared dependencies are missing in {manager_name} feeds"));
   }
 }
 

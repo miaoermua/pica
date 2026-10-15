@@ -2,3 +2,5 @@
 docs/local_agent_cache/*
 target/*
 examples/*
+.codebuddy/*
+.workbuddy/*

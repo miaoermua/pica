@@ -1,8 +1,8 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, Paths, E_DB_INVALID, E_RUNTIME};
+use crate::app::{App, CliError, CliResult, E_DB_INVALID, E_RUNTIME, Paths, ensure_dirs};
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::selector::Selector;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::Path;
 
@@ -31,11 +31,7 @@ pub fn report_set_install_result(
 
   let program_url = {
     let value = manifest_get_first(manifest, "url");
-    if value.is_empty() {
-      manifest_get_first(manifest, "origin")
-    } else {
-      value
-    }
+    if value.is_empty() { manifest_get_first(manifest, "origin") } else { value }
   };
 
   report["reports"][pkgname] = json!({
@@ -62,12 +58,18 @@ pub fn report_set_install_result(
   write_json_atomic_pretty(&paths.report_file, &report)
 }
 
+/// Records an installation.
+///
+/// `files` and `dirs` are the payload this install created; removal replays them
+/// in reverse. Installs delegated to a native package manager pass `packages` in
+/// `files` instead, because that backend, not Pica, owns the real file list.
 pub fn db_set_installed(
   db_file: &Path,
   pkgname: &str,
   manifest: &Value,
   pkgfile: &str,
   files: &[String],
+  dirs: &[String],
 ) -> CliResult<()> {
   let mut db = read_json_file(db_file)?;
   ensure_json_object_field(&mut db, "installed")?;
@@ -83,6 +85,7 @@ pub fn db_set_installed(
         "manifest": manifest,
         "pkgfile": pkgfile,
         "files": files,
+        "dirs": dirs,
         "installed_at": now_unix_secs(),
     }),
   );
@@ -202,7 +205,7 @@ mod tests {
   use crate::app::E_RUNTIME;
   use pica_pkg_core::selector::Selector;
   use pretty_assertions::assert_eq;
-  use serde_json::{json, Value};
+  use serde_json::{Value, json};
 
   #[test]
   fn ensure_json_object_field_creates_and_validates() {

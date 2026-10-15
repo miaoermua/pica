@@ -13,8 +13,9 @@
 ## 归档类型与载荷边界
 
 - 当前唯一标准归档类型：`*.pkg.tar.gz`。
-- `*.apk` 目前不作为可直接安装归档；后续可能引入兼容能力（以版本发布说明为准）。
-- 在 OpenWrt 场景，`pkgmgr=opkg` 可结合 `src/` 分发非二进制资源（包括 `docker-compose` 相关文件）。
+- `pkgs/` 里可以放后端原生包（`.ipk` / `.apk`），它们不是 Pica 归档，只是随包分发给后端安装的载荷。
+- `pkgmgr` 是**包身份**的一部分：`opkg`、`apk`、`pica` 三种后端各自独立打包、独立索引、独立安装。
+- `opkg` / `apk` 把 `pkgs/` 交给系统包管理器安装；`pica` 由 Pica 自己解包 `pkgs/` 并部署 `root/`。
 - Pica 仅负责包分发、校验、生命周期脚本执行，不提供 Docker 管理服务。
 
 ## 包格式（.pkg.tar.gz）
@@ -22,14 +23,22 @@
 ### 文件名
 
 ```
-<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch><suffix>.pkg.tar.gz
 ```
 
-当 `platform = all` 时，为避免出现 `all-all`，文件名可简化为：
+当 `platform = all` 时，为避免出现 `all-all`，文件名简化为：
 
 ```
-<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<arch><suffix>.pkg.tar.gz
 ```
+
+`<suffix>` 只由 `pkgmgr` 单向生成，永不反向解析：
+
+| `pkgmgr` | `<suffix>` |
+| --- | --- |
+| `opkg` | （空） |
+| `apk` | `-apk` |
+| `pica` | `-pica` |
 
 说明：
 
@@ -41,68 +50,115 @@
 压缩包根目录结构约定如下：
 
 - `manifest`（必需，文件）
-- `cmd/`（必需，目录）
-- `binary/`（可选，目录）
-- `depend/`（可选，目录；用于放 pica 封装的依赖 ipk）
-- `src/`（可选，目录；用于放非 ipk 的资源/原始文件）
+- `scripts/`（可选，目录）
+- `root/`（可选，目录）
+- `pkgs/`（可选，目录；仅 `opkg` / `apk` 后端会包含）
+- `LICENSE`（可选，文件）
 
 语义：
 
-- `cmd/`：要安装到 `/usr/bin/` 的脚本/可执行文件。
-- `binary/`：应用本体（或其 opkg 子包）对应的 `.ipk` 资源。
-- `depend/`：可选；基础依赖的 `.ipk` 资源（允许只提供部分，交由 opkg 基于依赖信息补全）。
-- `src/`：可选；生命周期脚本需要的源码/模板/静态资源，安装时复制到 `/usr/lib/pica/src/<pkgname>/`。
+- `scripts/`：生命周期脚本，**不进 PATH**。安装时复制到 `/usr/lib/pica/scripts/<pkgname>/`，`scripts/.env` 复制到 `/etc/pica/env.d/<pkgname>.env`。
+- `root/`：按目标路径镜像的载荷。`root/etc/init.d/demo` → `/etc/init.d/demo`，`root/usr/bin/demo` → `/usr/bin/demo`。
+- `pkgs/`：要交给系统包管理器安装的原生包，打包时按后端过滤后拍平存放（见下）。
 
-`binary/` 推荐结构（多变体）：
+`scripts/` 中约定的文件名与 `manifest` 的对应关系：
+
+| 文件 | `manifest` 字段 | 执行时机 |
+| --- | --- | --- |
+| `scripts/install` | `script_install` | 首次安装时执行 |
+| `scripts/update` | `script_update` | 覆盖安装/升级时执行 |
+| `scripts/remove` | `script_remove` | 卸载时执行 |
+| `scripts/.env` | — | 提供默认 `PICA_KEEP_SCRIPT_*` 策略 |
+
+`root/` 内的路径必须是相对路径，且不得包含 `..`、不得以 `/` 开头；安装时若发现逃逸路径会直接拒绝该包。
+
+`pkgs/` 的源目录结构按后端和变体分：
 
 ```
-binary/<platform>/<arch>/*.ipk
-
-`depend/` 推荐结构与 `binary/` 相同：
-
-```
-depend/<platform>/<arch>/*.ipk
-```
+pkgs/<backend>/<platform>/<arch>/*.<ipk|apk>
+pkgs/<backend>/*.<ipk|apk>          # 无变体时的简化写法
 ```
 
-打包器会把每个 `<platform>/<arch>` 组合单独生成一个 pica 包，并在产物中只保留对应组合的 `binary/` 与 `depend/`（若存在）；`src/`（若存在）会原样打入每个变体包。
+打包器会把每个 `<platform>/<arch>` 组合单独生成一个 pica 包，并只保留该组合的 `pkgs/<backend>/` 内容；`scripts/` 与 `root/` 会原样打入每个变体包。
+
+### `pica` 后端的载荷合并规则
+
+`targets = pica` 时，`pkgs/pica/` 里的容器会在打包阶段解包，与 `root/` 合并进同一个 `root/`（产物中不出现 `pkgs/`）。合并规则：
+
+- **目录可以合并**：多个包都装进 `etc/init.d` 是常态，共享目录不算冲突。
+- **同一路径的文件/符号链接只能有一个提供者**：
+  - `root/` 覆盖容器：`root/etc/demo.conf` 的内容即产物内容，用来修补容器里的文件。
+  - 两个容器提供同一路径 → 构建失败，报错给出两个容器名与路径，并提示保留一份或改放进 `root/` 指定胜者。
+  - 同一路径的类型冲突（文件 ↔ 目录 ↔ 符号链接）→ 构建失败，与来源无关。
+- **符号链接原样保留**：打包阶段不跟随链接递归复制；链接目标必须落在 `root/` 内，越界（绝对路径或 `..` 爬出）直接构建失败，否则会把构建机上的文件带进产物。
+- **`size` 在解包完成之后统计**：只放 `pkgs/pica/`、不写 `root/` 的包，`size` 依然是解包后 `root/` 的总字节数（只计普通文件，符号链接与目录不计）。`apk`/`opkg` 后端不合并容器，但统计口径相同——容器照旧要解包才数得出，见下节。
+
+### `apk`/`opkg` 后端：本地容器的安装参数与信任边界
+
+`pkgmgr = apk|opkg` 时，`pkgs/` 里的容器由系统包管理器安装。Pica 传给后端的是**解包后的本地文件路径**，而“按名字从仓库安装”是另一种请求，两者不加同一个参数：
+
+| 请求 | 命令形态 | 信任来源 |
+| --- | --- | --- |
+| Pica 归档里的本地容器 | `apk add --allow-untrusted [--force-non-repository] -- <path>` | Pica 对归档自身的校验（`repo` 渠道安装时先比对 `repo.json` 的 `sha256`）；`--pkgmgr`/`-U` 手工指定的文件由操作者自己负责 |
+| 仓库包（`app/base/kmod` 清单） | `apk add -- <name>` | apk 自己的仓库与签名机制，Pica 不做任何放宽 |
+
+- **`--allow-untrusted`**：豁免 apk 对包签名的检查。Pica 归档里的 `.apk` 不一定由本机信任的密钥签名，所以要装就得放宽；请把它理解为“信任的是这个归档，而不是这个 `.apk` 的签名”。仓库包（按名字安装）永远不会带上这个参数。
+- **`--force-non-repository`**：apk-tools 3.x（OpenWrt 25.12 及以后）会拒绝安装不属于任何已配置仓库的软件包，本地文件因此需要显式允许；2.x 没有这个选项，传入未知选项会让命令直接失败，所以 Pica 先读 `apk --version` 的大版本号：**≥3 才加，2.x 不加，读不出来时按需要加处理**（读不出来时更可能遇上 3.x 的拒绝，而多传参数会以 `unrecognized option` 明确报错并提示改配置）。
+- 配置开关 `apk_force_non_repository`（默认 `true`）决定是否使用该参数；设为 `false` 时本地 apk 按 2.x 的形态安装。非布尔值（如 `"yes"`）会让命令直接报错，不会替你选一个值——这个开关决定的是“是否放宽一项检查”，拼写错误不该静默生效。
+- **`size` 是“装到设备上占多少字节”，不是“`root/` 里有多少字节”**：`pica` 后端的容器已经合并进 `root/`，所以 `size` 就是合并后 `root/` 的总字节数；`apk`/`opkg` 后端把 `pkgs/` 整个交给系统包管理器安装，所以 `size` 是 `root/` 加上 `pkgs/` 里**每个容器解包后**的载荷之和。只计普通文件，符号链接与目录不计；容器之间重复提供同一路径会各计一次（这类产物在设备上本来就由后端决定谁胜出）。
+- **算不出来的容器不会被当成 0**：pica 无法解包 apk-tools 3.x 的 ADB 容器，遇到这种容器时构建照常成功、容器照常打进产物，只在构建输出里给出 `WARNING: not counted, pica cannot unpack them: ...`——这时 `size` 只统计了能统计的部分，宁可比真实值小且说明，也不静默报 0。
+
+### `pkgs/` 是整包一次调度，不是按阶段调度
+
+`pkgs/` 属于**产物**，不属于 `base` 或 `app` 阶段：打包只按后端过滤它，产物里没有任何信息说明某个容器服务于哪个阶段。因此安装时的规则是：
+
+- **依赖来源只判定一次**：把 manifest 声明的 `base` + `app` 合成一次请求，交给 `--feed-policy` 判定走仓库还是走本地容器。判定结果对两个阶段一致，同一个 `pkgs/` 不会被调度两次。列表为空但带了 `pkgs/` 时按“只能走容器”处理。
+- **走仓库时仍分阶段**：`base` 一个请求、`app` 一个请求，先 base 后 app，让 base 依赖先落盘。每个请求内部仍是**一次**包管理器调用，所以同阶段内两个包互相依赖也能被解析。
+- **走容器时整批一次**：`apk add --allow-untrusted [...] -- <f1> <f2> ...` 把所有容器放进**同一条命令**。容器之间会互相依赖（应用容器依赖同批的核心容器），而包管理器只在**同一次请求的文件之间**解析依赖；逐个安装会让循环顺序（字典序或任何 Pica 选的顺序）决定安装能否成功，而任何 Pica 能选的顺序都不是依赖拓扑序。
+- **kmod 始终走仓库**，并且只装本机还没有的那些（一次请求）。
+- `pkgs/` 存在但**一个包都没有**时，视为空包：在安装前的校验阶段就拒绝，不会先装一半再报错。
 
 ## pica-pack 输出目录约定
 
-默认情况下（不传 `--outdir`），`pica-pack` 会输出到 `pica-pack/bin/<pkgname>/`：
+默认情况下（不传 `--outdir`），`pica-pack` 输出到 `pica-pack/bin/<pkgname>/<backend>/`：
 
 ```
-pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz
+pica-pack/bin/<pkgname>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
+pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
 ```
 
-当 `platform = all` 时：
-
-```
-pica-pack/bin/<pkgname>/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
-```
+每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。
 
 ## repo.json 强约束（schema + filename）
 
 `pica -S` 同步阶段会对 `repo.json` 做严格校验：
 
-- `schema` 必须为 `1`
+- `schema` 必须为 `2`
 - `packages` 必须为数组
 - 每个 package 项必须包含非空字符串字段：
   - `pkgname`
   - `pkgver`
   - `pkgrel`
+  - `pkgmgr`（`opkg` / `apk` / `pica`）
+  - `os`
   - `platform`
   - `arch`
   - `filename`
   - `sha256`
+- `size` 必须是数字，表示安装到设备上的普通文件总字节数（`pica-pack` 构建时统计：`pica` 后端为合并后 `root/` 的载荷，`apk`/`opkg` 后端为 `root/` 加上容器解包后的载荷）
+- `csize` 必须是数字，表示归档文件的压缩后字节数
 - `sha256` 必须是 64 位十六进制字符串
 - `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），且必须以 `.pkg.tar.gz` 结尾
 - `filename` 必须与其他字段一致：
-  - `platform != all`：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz`
-  - `platform = all`：`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz`
+  - `platform != all`：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch><suffix>.pkg.tar.gz`
+  - `platform = all`：`<pkgname>-<pkgver>-<pkgrel>-<arch><suffix>.pkg.tar.gz`
+  - `<suffix>` 见上文文件名表
+- 未识别的额外字段会被原样保留（`flatten`），不会在同步时丢失
 
 安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与 `repo.json` 的 `sha256` 一致，否则失败。
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，用于覆盖默认下载路径
+
+同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 
 任一约束不满足，`pica -S` 会拒绝该 repo。
 
@@ -121,6 +177,29 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 - `https://`
 - `file://`
 
+## 安装数据库（db.json）字段语义
+
+`/var/lib/pica/db.json`（可用 `PICA_STATE_DIR` 重定向）记录已安装项。每个条目的字段回答不同的问题，不能互相替代：
+
+- `source`：**这个包是怎么被 Pica 拿到的**，取值 `pica` / `local` / `url` / `feed`。
+- `pkgmgr`：**哪个后端真正拥有这些文件**，取值 `opkg` / `apk` / `pica`。
+- `pkgfile`：产物安装时是归档路径；`feed` 安装时是后端名（因为不存在 Pica 归档）。
+
+写入规则：
+
+- `source` 与 `pkgmgr` 在安装时**覆盖写入**，不沿用产物 manifest 里的值：
+  - `--pkgmgr pica -U x.pkg.tar.gz` 会记住 `pkgmgr = pica`，即使归档声明的是 `apk`，卸载时也就不会去驱动 apk。
+  - URL 下载会记住 `source = url`，即使打包时写的是 `pica`。
+- 因此 `source` 描述渠道，`pkgmgr` 描述后端；二者取值空间不重叠（历史遗留的 `source = opkg` 除外，见下）。
+
+读取规则（旧记录迁移，无需改写数据库）：
+
+- 后端解析阶梯：`pkgmgr` → 旧 `source` 中的后端名 → 旧 `pkgfile` 中的后端名 → `pkgfile` 是归档路径时取 `pica` → 兜底 `opkg`。
+- 历史记录里 `pkgmgr` 写作 `none` 的行仍可读出，会被当作 `pica`；但用户输入的 `--pkgmgr none` 是错误，不再接受。
+- 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
+- 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
+- `-Qi` 只打印**有值**的字段：某字段在这条记录里为空（旧记录没有 `pkgver`、包本身没有 `license`）就整行省略，不打出“标签 + 空值”。空标签比省略更少信息，还会让人以为值曾经存在。`Name` 是唯一的例外——它是这条记录的标识，行行都有。字段取值的列宽固定为 16 字符，省略某行不会让下面的行错位。
+
 ## JSON 输出（显式开启）
 
 `pica` 默认输出面向人工的文本日志，不改变现有使用习惯。
@@ -135,12 +214,21 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 可选参数：
 
 - `--non-interactive`：禁用交互提示，适配后端调用
-- `--feed-policy <mode>`：来源策略
+- `--feed-policy <mode>`：来源策略（对整包判定**一次**：`base` + `app` 合并成一次请求，见「`pkgs/` 是整包一次调度，不是按阶段调度」）
   - `ask`（默认）
   - `feed-first`
   - `packaged-first`
   - `feed-only`
   - `packaged-only`
+
+## 依赖索引：答不出来就不答
+
+pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源选择、`-U` 的依赖预检、`-S` 之后的依赖检查），答案只来自本机后端自己的索引：`opkg` 是每个 feed 的列表文件（`lists_dir` 下的同名文件），`apk` 是每个仓库的索引（本地仓库就地读取，网络仓库按索引 URL 的摘要缓存在缓存目录）。
+
+- 查询前先保证索引可读：只有确实缺索引才调用一次 `opkg update` / `apk update`；已有索引不重复拉取，这是整条路径上唯一昂贵的步骤。
+- 缺索引且刷新没能补上（断网、源地址失效、`opkg` 锁被活进程持有）报 `E_INDEX_UNAVAILABLE`，消息里带上缺哪些源、刷新命令的退出码与其输出，**不会**把"取不到索引"当成"源里没有这个包"，也不会因此把依赖报成 missing。
+- "本机的源"按后端自己读配置的方式认定：`opkg` 是 `/etc/opkg.conf` 与 `/etc/opkg/*.conf`，`apk` 是 `/etc/apk/repositories` 加 `/etc/apk/repositories.d`、`/lib/apk/repositories.d` 下的 `*.list`（OpenWrt 25.12 的 feeds 就在那里，`/etc/apk/repositories` 是空的）。一个源都没配置就是"本机没有源"，不是错误。
+- `--feed-policy packaged-only` 不询问源，因此在源不可达的主机上依旧可以只从 pica 仓库安装。
 
 ## app 安装顺序
 
@@ -156,7 +244,7 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 
 - 这些参数为显式开启；不传时行为保持不变。
 - 当某些命令本身已经输出文本结果（例如 `-Q/-Qi/-Ql`），成功 JSON 会被自动抑制，避免混淆机器解析。
-- `--json/--json-errors` 依赖 `jq`（缺失时会直接报错退出）。
+- `--json/--json-errors` 由 Rust 侧直接输出 JSON，不依赖任何外部 JSON 工具。
 
 ## 兼容维度：os + arch + uname（platform 仅展示）
 
@@ -178,35 +266,50 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 - `key = value` 一行一个字段
 - 支持 `#` 注释
 - 支持重复 key（表示数组）
+- 支持后端覆盖 key：`<key>@<backend>`，存在时优先于 `<key>`
+
+### 字段类型规则
+
+同一个字段名不允许在构建期与运行期有两种含义，因此：
+
+- `targets`（可重复）：只出现在**源码 manifest**，声明要构建哪些后端，默认 `opkg`。
+- `pkgmgr`（单值）：只出现在**产物 manifest**，由 `pica-pack` 写入，声明这个包属于哪个后端。
+
+源码 manifest 声明 `pkgmgr` 会让 `pica-pack` 直接报错（应改用 `targets`）；`targets` 属于构建期字段，会在打包时从产物 manifest 中剥离，安装期不再出现。
 
 ### 必需字段
 
 ```
 pkgname = <name>
+appname = <name>
 pkgver = <version>
-pkgrel = <pica-release>
-platform = all
-os = openwrt
-arch = all
-pica = <min pica-cli version>
+os = <system>
 ```
 
-### 最新推荐字段模板（0.2.8）
+以下字段有默认值，可省略：
+
+- `pkgrel`：省略时，`pkgver = 1.0.0-2` 会拆出 `pkgrel = 2`，否则默认 `1`
+- `platform`：默认 `all`
+- `arch`：默认 `all`
+- `pica`：省略时不校验最低 pica-cli 版本
+- `targets`：默认 `opkg`
+
+### 推荐模板
 
 ```ini
 # Required
 pkgname = hello
 appname = hello
-url = https://github.com/miaoermua/pica
-luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hello
-branch = stable
-protocol = luci
-luci_desc = LuCI plugin for hello service
-
 pkgver = 0.2.8
-pkgrel = 1
 os = openwrt
-platform = arm64
+
+# Optional build targets (repeatable, default: opkg)
+targets = opkg
+targets = apk
+# targets = pica
+
+pkgrel = 1
+platform = all
 arch = all
 pica = 0.2.8
 
@@ -215,6 +318,12 @@ pkgdesc = Example lifecycle package
 packager = pica-pack
 license = GPL-3.0-only
 visibility = open
+url = https://github.com/miaoermua/pica
+luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hello
+branch = stable
+protocol = luci
+luci_desc = LuCI plugin for hello service
+source = pica
 
 # Optional strong compatibility gate
 # uname = aarch64
@@ -223,25 +332,18 @@ visibility = open
 # type = cli
 # type = luci
 # luci = lua1
-#
-# Optional source metadata
-source = pica
 
-# Optional package manager backend
-# opkg: install/remove by app/base/kmod mapping (default)
-# none: lifecycle-only mode, skip package-manager install/remove
-pkgmgr = opkg
-
-# Install plan
+# Install plan (repeatable, optional per-backend override)
 app = hello
 app_i18n = luci-i18n-hello-{lang}
 base = busybox
 # kmod = kmod-tun
+# base@apk = busybox-apk
 
-# Lifecycle scripts (optional)
-cmd_install = cmd/install
-cmd_update = cmd/update
-cmd_remove = cmd/remove
+# Lifecycle scripts (optional, paths inside scripts/)
+script_install = scripts/install
+script_update = scripts/update
+script_remove = scripts/remove
 ```
 
 关于 `pica` 字段：
@@ -274,24 +376,29 @@ visibility = open
 约定：
 
 - `builddate`：可选；Unix 时间戳（秒）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动补全。
-- `size`：可选；字节数（bytes）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动计算并补全。
+- `size`：可选；字节数（bytes），口径见「`apk`/`opkg` 后端」一节（装到设备上的普通文件总字节数，含容器解包后的载荷）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动计算并补全。
 
 校验文件（由 `pica-pack build` 自动生成，不写入 manifest）：
 
 - `SHA256SUMS`：输出目录下的校验清单，格式为 `<sha256>  <filename>`
 - 每次构建会为产物 `.pkg.tar.gz` 写入/更新对应条目
 
-### 与 OpenWrt 安装相关的扩展字段（可重复，可选）
+### 与安装相关的扩展字段（可重复，可选）
 
 ```
 # Install plan (repeatable)
-app = <opkg package name>
-base = <opkg package name>
-kmod = <opkg package name>
+app = <native package name>
+base = <native package name>
+kmod = <native package name>
+
+# Backend override (repeatable); wins over the plain key when present
+app@apk = <native package name>
+base@apk = <native package name>
+kmod@apk = <native package name>
 
 # Optional: i18n template for app packages
 # The {lang} placeholder is resolved from pica config (default: zh-cn).
-app_i18n = <opkg package name template>
+app_i18n = <native package name template>
 
 # Program source metadata
 url = <project homepage or repository URL>
@@ -302,13 +409,10 @@ luci_url = <LuCI plugin homepage or repository URL>
 # LuCI description metadata (optional)
 luci_desc = <short LuCI plugin description>
 
-# Package-manager backend (optional)
-pkgmgr = <opkg|none>
-
-# lifecycle cmd scripts (optional)
-cmd_install = <relative file>
-cmd_update = <relative file>
-cmd_remove = <relative file>
+# lifecycle scripts (optional)
+script_install = <relative file>
+script_update = <relative file>
+script_remove = <relative file>
 
 # optional type tags (repeatable)
 type = cli
@@ -320,21 +424,24 @@ luci = lua1
 
 约定：
 
-- `app/base/kmod` 定义“安装清单”，pica 安装时必须遍历这些字段来决定需要安装的 opkg 包。
+- `app/base/kmod` 定义“安装清单”，pica 安装时遍历这些字段决定需要安装的原生包。
+- `<key>@<backend>` 是该后端的**整体覆盖**，不是追加：只要出现了 `<key>@<backend>`，该后端就只用带注解的那些值，未带注解的 `<key>` 全部忽略；其他后端仍用 `<key>`。
+  - `base = luci-base` + `base@apk = luci-base-apk`：`apk` 装 `luci-base-apk`，`opkg` 装 `luci-base`。
+  - `app@apk =`（空值）表示该后端不安装任何 `app`。
+- 解析顺序为 `<key>@<backend>` → `<key>` → 空。
 - `app_i18n` 允许包含 `{lang}` 占位符，pica 根据配置 `i18n` 选择实际 i18n 包名（当前仅 `zh-cn` 时参与安装/卸载）。
 - `url` 用于记录程序来源（建议直接填仓库/项目地址，如 GitHub URL）。
 - `luci_url` 用于记录 LuCI 插件来源（可选；仅 LuCI 包建议填写）。
 - `luci_desc` 用于记录 LuCI 插件描述（与 `pkgdesc` 的通用程序描述分离）。
-- `pkgmgr` 用于声明包管理后端：`opkg`（默认）或 `none`（仅生命周期脚本，不走包管理器安装/卸载）。
-- 当 `pkgmgr = opkg` 时：按 `app/base/kmod` 安装、按 `app` + `app_i18n`（`i18n=zh-cn`）卸载。
-- 当 `pkgmgr = none` 时：跳过包管理器安装/卸载，仅执行 `cmd_install/cmd_update/cmd_remove` 与 `cmd/` 文件部署。
-- 若包内存在 `src/`：安装阶段复制到 `/usr/lib/pica/src/<pkgname>/`，卸载阶段清理该目录。
-- `src/` 可用于携带脚本/模板/Compose 清单，但容器运行与编排策略由外部工具负责（不由 Pica 托管）。
-- `cmd_install/cmd_update/cmd_remove` 是生命周期脚本（包内路径，一般在 `cmd/` 下），应按 POSIX `sh` 语法编写。
-- 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不再依赖 `bash`。
-- 生命周期脚本保留策略（默认）：`cmd_remove` 保留；`cmd_install/cmd_update` 执行后不保留。
-- 如果包内无任何生命周期脚本，视为无生命周期包：安装/升级/卸载均不会触发钩子执行。
-- 可在 `cmd/.env` 中声明保留策略：`PICA_KEEP_CMD_INSTALL/PICA_KEEP_CMD_UPDATE/PICA_KEEP_CMD_REMOVE/PICA_KEEP_CMD_ALL`（布尔值）。
+- `pkgmgr = opkg|apk` 时：按 `app/base/kmod` 安装，按 `app` + `app_i18n`（`i18n=zh-cn`）卸载，`pkgs/` 中的原生包交给系统包管理器。
+- `pkgmgr = pica` 时：Pica 自己解包 `pkgs/` 中的 `.ipk` / `.apk` 并部署 `root/`、执行生命周期脚本，不解析依赖。
+- `root/` 按路径镜像部署到真实根文件系统，安装的文件与目录会被记录，卸载时逐条回滚。
+- `script_install/script_update/script_remove` 是生命周期脚本（包内路径，一般在 `scripts/` 下），应按 POSIX `sh` 语法编写。
+- 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不依赖 `bash`。
+- 生命周期脚本保留策略（默认）：`script_remove` 保留；`script_install/script_update` 执行后不保留。
+- 如果包内无任何生命周期脚本，视为无生命周期包：安装/升级/卸载均不会触发脚本执行。
+- 脚本、`root/` 内文件、`pkgs/` 三者至少提供其一，否则构建与安装都会以“空包”拒绝。
+- 可在 `scripts/.env` 中声明保留策略：`PICA_KEEP_SCRIPT_INSTALL/PICA_KEEP_SCRIPT_UPDATE/PICA_KEEP_SCRIPT_REMOVE/PICA_KEEP_SCRIPT_ALL`（布尔值）。
 - 每次命令事务结束都会打印 `正在清理 pica 缓存`，并清理 `/var/lib/pica/cache/pkgs/` 目录内容。
 
 - `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。
@@ -343,19 +450,21 @@ luci = lua1
 - 仅声明 `type = cli` 时，不需要 `luci = ...`。
 - `source` 用于记录安装来源（例如 `pica` / `opkg` / `local` / `url`），便于升级与排错。默认可不写；安装后 CLI 会在本地数据库里补全 `source`。
 
-## arch（OpenWrt/opkg）
+## arch（后端架构字段）
 
-`arch` 不是 pica 自定义标签，它对应 OpenWrt/opkg 的架构字段。
+`arch` 不是 pica 自定义标签，它对应后端的架构字段。
 
 推荐实践：
 
 - 对绝大多数 pica 包：统一写 `arch = all`
-- 仅当确实需要限制某些设备时：写 opkg 的具体 arch（例如 `aarch64_cortex-a53`）
+- 仅当确实需要限制某些设备时：写具体 arch（例如 `aarch64_cortex-a53`）
 
 `pica-cli` 的检查逻辑：
 
 - `arch = all`：永远允许
-- `arch != all`：必须出现在 `opkg print-architecture` 输出中，否则安装失败
+- `arch != all`：必须出现在当前后端的架构列表中，否则安装失败
+  - `opkg`：取自 `opkg print-architecture`
+  - `apk`：取自 `apk --print-arch`
 
 ## os（系统类型）
 
@@ -366,9 +475,9 @@ luci = lua1
 - `os = all`：永远允许
 - `os != all`：必须与当前系统类型一致，否则安装失败
 
-## OpenWrt：一个 app 多个 opkg 包
+## 一个 app 多个原生包
 
-OpenWrt/LEDE 生态里，一个“应用”（你希望用一个 `pkgname` 表示）通常拆成多个 opkg 包：
+无论 opkg 还是 apk 生态，一个“应用”（你希望用一个 `pkgname` 表示）通常拆成多个原生包：
 
 ```
 myapp                 # 本体二进制/服务
@@ -380,27 +489,28 @@ luci-i18n-myapp-zh-cn # i18n
 
 - `pkgname` 用“应用名”做 pica 包唯一标识。
 - 安装清单用 `app = ...`（以及可选 `app_i18n = ...`）列出应用子包。
+- 两个后端包名不同时，用 `<key>@apk` 覆盖，例如 `base = luci-base` 配 `base@apk = luci-base-apk`。
 - 卸载时 pica 按 `app` + `app_i18n` 映射处理（当前仅 `i18n=zh-cn` 时处理 i18n 包）。
 
-## cmd/.env 预留
+## scripts/.env 预留
 
-`cmd/` 目录下允许存在一个可选文件：
+`scripts/` 目录下允许存在一个可选文件：
 
 ```
-cmd/.env
+scripts/.env
 ```
 
-用途：为后续脚本/命令提供环境变量预留（默认不要求存在）。
+用途：为生命周期脚本提供环境变量预留（默认不要求存在）。
 
-建议约定：
+约定：
 
-- 安装时保存到 `/etc/pica/env.d/<pkgname>.env`
+- 安装时复制到 `/etc/pica/env.d/<pkgname>.env`
 - 卸载时同步删除该 env 文件
 - 可选生命周期保留控制（布尔值）：
-  - `PICA_KEEP_CMD_INSTALL`
-  - `PICA_KEEP_CMD_UPDATE`
-  - `PICA_KEEP_CMD_REMOVE`
-  - `PICA_KEEP_CMD_ALL`
+  - `PICA_KEEP_SCRIPT_INSTALL`
+  - `PICA_KEEP_SCRIPT_UPDATE`
+  - `PICA_KEEP_SCRIPT_REMOVE`
+  - `PICA_KEEP_SCRIPT_ALL`
 
 ## type/luci：LuCI 版本/实现（可选）
 
@@ -469,9 +579,9 @@ app:branch
 - 当前选择器仅支持按 `branch` 过滤。
 - 当前不提供历史版本安装，仓库仅保留最新包。
 
-## manifest 示例（LuCI1）
+## manifest 示例（LuCI1，双后端）
 
-```
+```ini
 pkgname = luci-app-example
 appname = example
 url = https://github.com/example/example
@@ -482,12 +592,14 @@ luci_desc = Example LuCI plugin for OpenWrt
 
 pkgver = 1.0.0
 pkgrel = 1
-pkgmgr = opkg
-
 pkgdesc = Example LuCI application
 packager = example
 license = GPL-3.0-only
 visibility = open
+
+# 要构建的后端（可重复，默认 opkg）
+targets = opkg
+targets = apk
 
 arch = all
 os = openwrt
@@ -506,10 +618,11 @@ app_i18n = luci-i18n-example-{lang}
 base = luci-base
 base = rpcd
 base = ca-bundle
+base@apk = luci-base-apk
 kmod = kmod-tun
 
 # Lifecycle scripts (optional)
-cmd_install = cmd/install
-cmd_update = cmd/update
-cmd_remove = cmd/remove
+script_install = scripts/install
+script_update = scripts/update
+script_remove = scripts/remove
 ```

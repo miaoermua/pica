@@ -1,137 +1,167 @@
 use crate::app::{
-  prompt_yn, App, CliError, CliResult, FeedPolicy, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID,
-  E_RUNTIME,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID, E_RUNTIME, FeedPolicy,
+  prompt_yn,
 };
-use crate::system::{opkg_has_package, opkg_install_pkg, opkg_update_ignore};
 use std::fs;
 use std::path::Path;
 
-pub(crate) fn should_use_feeds(
+/// Where an artifact's declared dependencies are satisfied from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DependencySource {
+  /// The backend's feeds, by the names the manifest declares.
+  Feeds,
+  /// The containers the artifact ships in `pkgs/`.
+  Containers,
+}
+
+/// Decides where the artifact's dependencies come from, once for the whole
+/// request.
+///
+/// `declared` is every package name the artifact declares — `base` and `app`
+/// together — and `have_pkgs_dir` says whether it shipped containers. One
+/// decision for both phases, because `pkgs/` is a single set of containers owned
+/// by the artifact rather than a per-phase resource: the packer filters it by
+/// backend only, so it says nothing about which phase a container belongs to. A
+/// policy asked once per phase would answer "the containers" twice, scheduling
+/// the same batch twice, or answer "feeds" for a phase whose names only exist in
+/// a container.
+///
+/// `Ok(None)` means there is nothing to install either way.
+pub(crate) fn dependency_source(
   app: &App,
-  label: &str,
-  pkg_list: &[String],
-  have_ipk_dir: bool,
-) -> i8 {
+  declared: &[String],
+  have_pkgs_dir: bool,
+) -> CliResult<Option<DependencySource>> {
+  if declared.is_empty() && !have_pkgs_dir {
+    return Ok(None);
+  }
+
   match app.options.feed_policy {
+    // Feed-only refuses the artifact's own containers: an artifact that ships
+    // them without declaring the packages they replace has nothing this policy
+    // will install.
     FeedPolicy::FeedOnly => {
-      if pkg_list.is_empty() {
-        -1
-      } else {
-        1
+      if declared.is_empty() {
+        return Err(CliError::new(
+          E_POLICY_INVALID,
+          "feed-only policy: the artifact declares no packages, and its packaged containers \
+           may not be used (declare them, or install with another --feed-policy)"
+            .to_string(),
+        ));
       }
+      Ok(Some(DependencySource::Feeds))
     }
-    FeedPolicy::PackagedOnly => 0,
-    FeedPolicy::FeedFirst => i8::from(!pkg_list.is_empty()),
-    FeedPolicy::PackagedFirst => i8::from(!have_ipk_dir),
-    FeedPolicy::Ask => {
-      if !have_ipk_dir {
-        return 1;
+    // The reverse: nothing but the containers may be used, so an artifact that
+    // ships none has no source left.
+    FeedPolicy::PackagedOnly => {
+      if !have_pkgs_dir {
+        return Err(CliError::new(
+          E_RUNTIME,
+          "packaged-only policy: the artifact ships no containers, and feeds may not be used"
+            .to_string(),
+        ));
       }
-      if pkg_list.is_empty() {
-        return 0;
+      Ok(Some(DependencySource::Containers))
+    }
+    // Feeds win when they have anything to offer; containers are the fallback.
+    FeedPolicy::FeedFirst => Ok(Some(if declared.is_empty() {
+      DependencySource::Containers
+    } else {
+      DependencySource::Feeds
+    })),
+    // The artifact's own containers win; feeds are the fallback.
+    FeedPolicy::PackagedFirst => {
+      Ok(Some(if have_pkgs_dir { DependencySource::Containers } else { DependencySource::Feeds }))
+    }
+    FeedPolicy::Ask => {
+      // Without containers the declarations are the only source there is, and
+      // asking would offer a choice that does not exist.
+      if !have_pkgs_dir {
+        return Ok(Some(DependencySource::Feeds));
+      }
+      if declared.is_empty() {
+        return Ok(Some(DependencySource::Containers));
       }
 
-      opkg_update_ignore();
-      let mut total = 0usize;
-      let mut available = 0usize;
-      for dep in pkg_list {
-        if dep.is_empty() {
-          continue;
-        }
-        total += 1;
-        if opkg_has_package(dep) {
+      // No backend at all means no feeds at all, which is an answer rather than
+      // a failure: the containers are the source that is left.
+      let Ok(package_manager) = app.package_manager() else {
+        return Ok(Some(DependencySource::Containers));
+      };
+      // An index that cannot be made readable stops the question here: counting
+      // the declared packages against a feed nobody could fetch would report
+      // "0/n in the feeds" for a host whose feeds were merely unreachable.
+      package_manager.update_index()?;
+      // An empty entry is not a package anybody could look up, so it counts on
+      // neither side of the fraction.
+      let named: Vec<&String> = declared.iter().filter(|dep| !dep.is_empty()).collect();
+      let total = named.len();
+      let mut available = 0;
+      for dep in &named {
+        if package_manager.package_exists(dep)? {
           available += 1;
         }
       }
 
+      // Nothing the artifact declares is in the feeds, so the containers are the
+      // only way to satisfy it.
       if available == 0 {
-        return 0;
+        return Ok(Some(DependencySource::Containers));
       }
-
       if app.options.non_interactive {
-        return 1;
+        return Ok(Some(DependencySource::Feeds));
       }
 
-      i8::from(prompt_yn(
+      let use_feeds = prompt_yn(
         &format!(
-          "Found {available}/{total} {label} packages in opkg feeds. Use feeds instead of packaged ipks?"
+          "Found {available}/{total} declared packages in the {} feeds. Use feeds instead of the \
+           packaged containers?",
+          app.backend().as_str()
         ),
         true,
-      ))
+      );
+      Ok(Some(if use_feeds { DependencySource::Feeds } else { DependencySource::Containers }))
     }
   }
 }
 
-pub(crate) fn install_via_feeds_or_ipk(
-  app: &App,
-  label: &str,
-  pkg_list: &[String],
-  ipk_dir: &Path,
-  have_ipk_dir: bool,
-) -> CliResult<()> {
-  if pkg_list.is_empty() && !have_ipk_dir {
-    return Ok(());
-  }
-
-  let use_feeds = should_use_feeds(app, label, pkg_list, have_ipk_dir);
-  if use_feeds == -1 {
-    return Err(CliError::new(
-      E_POLICY_INVALID,
-      format!("{label} requires feed packages under feed-only policy"),
-    ));
-  }
-
-  if use_feeds == 1 {
-    if pkg_list.is_empty() {
-      return Err(CliError::new(
-        E_CONFIG_INVALID,
-        format!("{label} packages not defined in manifest"),
-      ));
-    }
-    for dep in pkg_list {
-      if dep.is_empty() {
-        continue;
-      }
-      opkg_install_pkg(label, dep)?;
-    }
-    return Ok(());
-  }
-
-  if have_ipk_dir {
-    install_ipk_dir(label, ipk_dir)?;
-    return Ok(());
-  }
-
-  Err(CliError::new(
-    E_RUNTIME,
-    format!("{label} not available in feeds and no packaged ipks provided"),
-  ))
-}
-
-pub(crate) fn install_ipk_dir(label: &str, dir: &Path) -> CliResult<()> {
+/// Installs every native package shipped in the artifact's `pkgs/`, in one call
+/// to the backend. Only the artifact's own backend packages are present, because
+/// the packer filters by backend, so no extension-based filtering happens here.
+///
+/// One call, and not one per container: the containers of a single artifact
+/// depend on one another — an app container and the core container it needs
+/// arrive together — and a backend resolves such a dependency only among the
+/// files of the same request. Handing them over one at a time would leave the
+/// order of the loop, alphabetical or otherwise, deciding whether the install
+/// works, and no order pica can pick is a topological one.
+///
+/// `label` names the group in messages. There is deliberately no per-phase
+/// split here: nothing in the artifact says which container serves `base` and
+/// which serves `app`, so any split would be a guess — and a guess that
+/// separates two dependent containers is worse than one batch.
+pub(crate) fn install_pkgs_dir(app: &App, label: &str, dir: &Path) -> CliResult<()> {
   if !dir.is_dir() {
     return Ok(());
   }
 
-  let mut installed_any = false;
-  let entries = fs::read_dir(dir)
-    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?;
+  let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)
+    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?
+    .flatten()
+    .map(|entry| entry.path())
+    .filter(|path| path.is_file())
+    .collect();
+  paths.sort();
 
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if path.extension().and_then(|v| v.to_str()) != Some("ipk") {
-      continue;
-    }
-    opkg_install_pkg(label, &path.display().to_string())?;
-    installed_any = true;
-  }
-
-  if !installed_any {
+  if paths.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("no ipk files found in {label} dir: {}", dir.display()),
+      format!("no packages found in {label} dir: {}", dir.display()),
     ));
   }
+
+  let targets: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+  app.package_manager()?.install(label, &targets)?;
 
   Ok(())
 }
@@ -172,10 +202,11 @@ pub(crate) fn pkg_list_diff_added(before: &[String], after: &[String]) -> Vec<St
 
 #[cfg(test)]
 mod tests {
-  use super::{install_via_feeds_or_ipk, pkg_list_diff_added, reorder_app_list, should_use_feeds};
+  use super::{
+    DependencySource, dependency_source, install_pkgs_dir, pkg_list_diff_added, reorder_app_list,
+  };
   use crate::app::{App, FeedPolicy, JsonMode, Options, Paths};
   use pretty_assertions::assert_eq;
-  use std::path::Path;
 
   #[test]
   fn reorder_app_list_moves_luci_and_i18n_last() {
@@ -207,58 +238,86 @@ mod tests {
     assert_eq!(added, vec!["c".to_string()]);
   }
 
-  #[test]
-  fn should_use_feeds_policy_matrix_basics() {
-    let paths = Paths::from_env();
-    let base = App::new(
-      paths,
-      Options {
-        json_mode: JsonMode::None,
-        non_interactive: true,
-        feed_policy: FeedPolicy::FeedOnly,
-        fetch_timeout: 30,
-        fetch_retry: 2,
-        fetch_retry_delay: 1,
-      },
-    );
-
-    let decision = should_use_feeds(&base, "app", &["a".to_string()], true);
-    assert_eq!(decision, 1);
-
-    let no_feed = should_use_feeds(&base, "app", &[], true);
-    assert_eq!(no_feed, -1);
-
-    let mut packaged_only = base;
-    packaged_only.options.feed_policy = FeedPolicy::PackagedOnly;
-    let packaged = should_use_feeds(&packaged_only, "app", &["a".to_string()], true);
-    assert_eq!(packaged, 0);
-
-    let mut feed_first = packaged_only;
-    feed_first.options.feed_policy = FeedPolicy::FeedFirst;
-    let feed_first_choice = should_use_feeds(&feed_first, "app", &["a".to_string()], true);
-    assert_eq!(feed_first_choice, 1);
-
-    let mut packaged_first = feed_first;
-    packaged_first.options.feed_policy = FeedPolicy::PackagedFirst;
-    let packaged_first_choice = should_use_feeds(&packaged_first, "app", &["a".to_string()], true);
-    assert_eq!(packaged_first_choice, 0);
-  }
-
-  #[test]
-  fn install_via_feeds_or_ipk_skips_empty_optional_group() {
-    let app = App::new(
+  fn app_with(policy: FeedPolicy) -> App {
+    App::new(
       Paths::from_env(),
       Options {
         json_mode: JsonMode::None,
         non_interactive: true,
-        feed_policy: FeedPolicy::Ask,
+        feed_policy: policy,
         fetch_timeout: 30,
         fetch_retry: 2,
         fetch_retry_delay: 1,
+        pkgmgr: None,
       },
+    )
+  }
+
+  fn declared() -> Vec<String> {
+    vec!["base-a".to_string(), "app-b".to_string()]
+  }
+
+  #[test]
+  fn the_source_is_decided_once_for_the_whole_request() {
+    // `pkgs/` belongs to the artifact, not to a phase, so the answer is about the
+    // artifact: asking per phase is what let the same batch be scheduled twice.
+    let cases = [
+      (FeedPolicy::FeedOnly, true, Some(DependencySource::Feeds)),
+      (FeedPolicy::PackagedOnly, true, Some(DependencySource::Containers)),
+      (FeedPolicy::FeedFirst, true, Some(DependencySource::Feeds)),
+      (FeedPolicy::PackagedFirst, true, Some(DependencySource::Containers)),
+    ];
+    for (policy, have_pkgs_dir, expected) in cases {
+      let app = app_with(policy);
+      let source = dependency_source(&app, &declared(), have_pkgs_dir).expect("decided");
+      assert_eq!(source, expected, "{policy:?}");
+    }
+
+    // Nothing declared and no containers: no source, and no error either.
+    let app = app_with(FeedPolicy::Ask);
+    assert_eq!(dependency_source(&app, &[], false).expect("decided"), None);
+
+    // Containers are the only source when the declarations are missing, which is
+    // the case an artifact with a packaged app and no manifest list lands in.
+    let app = app_with(FeedPolicy::FeedFirst);
+    assert_eq!(
+      dependency_source(&app, &[], true).expect("decided"),
+      Some(DependencySource::Containers),
+      "a name-less artifact falls back to the batch rather than installing nothing"
+    );
+    let app = app_with(FeedPolicy::Ask);
+    assert_eq!(
+      dependency_source(&app, &[], true).expect("decided"),
+      Some(DependencySource::Containers)
     );
 
-    let result = install_via_feeds_or_ipk(&app, "base", &[], Path::new("/nonexistent"), false);
-    assert!(result.is_ok());
+    // And feeds are the only source when no containers were shipped at all.
+    let app = app_with(FeedPolicy::PackagedFirst);
+    assert_eq!(
+      dependency_source(&app, &declared(), false).expect("decided"),
+      Some(DependencySource::Feeds)
+    );
+  }
+
+  #[test]
+  fn a_policy_without_a_source_refuses_instead_of_installing_nothing() {
+    // Feed-only will not touch the containers, and the declarations it needs are
+    // absent: the install has to stop rather than quietly do nothing.
+    let err = dependency_source(&app_with(FeedPolicy::FeedOnly), &[], true)
+      .expect_err("feed-only has no packages to install");
+    assert!(err.message.contains("feed-only"), "{}", err.message);
+
+    // The reverse: packaged-only has no containers to install.
+    let err = dependency_source(&app_with(FeedPolicy::PackagedOnly), &declared(), false)
+      .expect_err("packaged-only has nothing to install");
+    assert!(err.message.contains("packaged-only"), "{}", err.message);
+  }
+
+  #[test]
+  fn install_pkgs_dir_rejects_empty_directory() {
+    let app = app_with(FeedPolicy::PackagedOnly);
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let err = install_pkgs_dir(&app, "packaged", dir.path()).expect_err("empty pkgs dir must fail");
+    assert!(err.message.contains("no packages found"), "{}", err.message);
   }
 }

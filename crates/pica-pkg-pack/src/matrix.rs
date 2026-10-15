@@ -3,6 +3,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+/// Scans `pkgs/<backend>/` for the optional `<platform>/<arch>` matrix layout.
+///
+/// Detection is per backend, so an arch-specific opkg build and a noarch-only
+/// apk build can coexist in one pkgdir.
 pub(crate) fn has_platform_arch_matrix(root: &Path) -> bool {
   if !root.is_dir() {
     return false;
@@ -16,7 +20,7 @@ pub(crate) fn has_platform_arch_matrix(root: &Path) -> bool {
     if !platform_path.is_dir() {
       continue;
     }
-    let Ok(arch_entries) = fs::read_dir(platform_path) else {
+    let Ok(arch_entries) = fs::read_dir(&platform_path) else {
       continue;
     };
     for arch_entry in arch_entries.flatten() {
@@ -68,18 +72,26 @@ mod tests {
   #[test]
   fn matrix_detection_and_collection_work() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    let binary = root.join("binary");
-    fs::create_dir_all(binary.join("mt7621").join("all")).expect("mkdir binary mt7621/all");
-    fs::create_dir_all(binary.join("mt7621").join("arm")).expect("mkdir binary mt7621/arm");
-    fs::create_dir_all(binary.join("x86").join("all")).expect("mkdir binary x86/all");
+    let pkgs = tmp.path().join("pkgs").join("opkg");
+    fs::create_dir_all(pkgs.join("mt7621/all")).expect("mkdir mt7621/all");
+    fs::create_dir_all(pkgs.join("mt7621/arm")).expect("mkdir mt7621/arm");
+    fs::create_dir_all(pkgs.join("x86/all")).expect("mkdir x86/all");
 
-    assert!(has_platform_arch_matrix(&binary));
+    assert!(has_platform_arch_matrix(&pkgs));
 
-    let platforms = collect_platforms(&[binary.as_path()]).expect("collect platforms");
-    assert_eq!(platforms, vec!["mt7621".to_string(), "x86".to_string()]);
+    let roots = [pkgs.as_path()];
+    assert_eq!(collect_platforms(&roots).expect("collect platforms"), vec!["mt7621", "x86"]);
+    assert_eq!(collect_archs(&roots, "mt7621").expect("collect archs"), vec!["all", "arm"]);
+  }
 
-    let archs = collect_archs(&[binary.as_path()], "mt7621").expect("collect archs");
-    assert_eq!(archs, vec!["all".to_string(), "arm".to_string()]);
+  #[test]
+  fn flat_layout_is_not_a_matrix() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let pkgs = tmp.path().join("pkgs").join("apk");
+    fs::create_dir_all(&pkgs).expect("mkdir");
+    fs::write(pkgs.join("demo-1.0.0-r1.apk"), b"apk").expect("write package");
+
+    assert!(!has_platform_arch_matrix(&pkgs));
+    assert!(!has_platform_arch_matrix(&tmp.path().join("missing")));
   }
 }
