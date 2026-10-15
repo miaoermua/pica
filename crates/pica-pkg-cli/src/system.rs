@@ -173,7 +173,7 @@ pub fn run_tar_extract(pkgfile: &Path, target_dir: &Path) -> CliResult<()> {
 /// members.
 ///
 /// That layout is gone in apk-tools 3.x, whose packages are ADB archives that
-/// no tar can open; [`crate::container`] refuses those before reaching here.
+/// no tar can open; `pica_pack_core::container` refuses those before reaching here.
 ///
 /// The flag goes *after* the archive because `-f` consumes the argument that
 /// follows it: `tar -xzf --ignore-zeros ARCHIVE` asks tar to open a member

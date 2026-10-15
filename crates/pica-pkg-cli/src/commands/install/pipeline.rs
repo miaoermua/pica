@@ -4,7 +4,6 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
   E_RUNTIME, E_VERSION_INCOMPATIBLE, ensure_dirs, resolve_lang,
 };
-use crate::container::unpack_container;
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
@@ -443,9 +442,13 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
 /// it has none.
 ///
 /// A system backend is asked to install the app/base/kmod lists — from its feeds
-/// when the policy says so, from the containers in the artifact otherwise. The
-/// `pica` backend has no feeds to ask, so it unpacks the artifact's own
-/// containers instead; that is the whole of dependency handling for this backend.
+/// when the policy says so, from the containers in the artifact otherwise.
+///
+/// The `pica` backend has no feeds and no solver, so it is given no dependency
+/// work at all: `pica-pack` expanded any container into `root/` at build time,
+/// and `deploy_payload` lays those files down like any other payload. A
+/// `pica`-backend artifact that still carries `pkgs/` was built by a packer that
+/// predates that rule, and is refused rather than half-installed.
 fn install_dependency_containers(
   app: &mut App,
   ctx: &InstallContext<'_>,
@@ -455,8 +458,15 @@ fn install_dependency_containers(
   let pkgs_dir = ctx.tmpdir.join(PKGS);
 
   if !installs_declared_dependencies(ctx.pkgmgr) {
-    for container in install_prebuilt_pkgs(app, &pkgs_dir, ctx.target)? {
-      tx.record_container(container.pkgname, container.install);
+    if pkgs_dir.is_dir() {
+      return Err(CliError::new(
+        E_PACKAGE_INVALID,
+        format!(
+          "a pica-backend artifact must not carry {PKGS}/: pica-pack expands containers \
+           into root/ at build time. Rebuild it, or build with `targets = apk` to let \
+           the device's own package manager install them"
+        ),
+      ));
     }
     return Ok(());
   }
@@ -477,44 +487,6 @@ fn install_dependency_containers(
   tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
 
   Ok(())
-}
-
-/// Unpacks the containers an artifact ships in `pkgs/`.
-///
-/// This is what "the `pica` backend installs a container" means: nobody else is
-/// going to, so Pica unpacks it and records every file it produced. Containers
-/// are processed in file-name order so two installs of the same artifact do the
-/// same thing.
-fn install_prebuilt_pkgs(
-  app: &mut App,
-  pkgs_dir: &Path,
-  target: &TargetRoot,
-) -> CliResult<Vec<crate::container::UnpackedContainer>> {
-  if !pkgs_dir.is_dir() {
-    return Ok(Vec::new());
-  }
-
-  let entries = fs::read_dir(pkgs_dir)
-    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", pkgs_dir.display())))?;
-  let mut containers: Vec<PathBuf> =
-    entries.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect();
-  containers.sort();
-
-  if containers.is_empty() {
-    return Ok(Vec::new());
-  }
-
-  app.log_info(format!("Unpacking {} container(s)...", containers.len()));
-
-  let mut unpacked = Vec::new();
-  for container in &containers {
-    let name = container.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let result = unpack_container(container, target.as_path())?;
-    app.log_info(format!("  unpacked {name} ({})", result.pkgname));
-    unpacked.push(result);
-  }
-
-  Ok(unpacked)
 }
 
 /// Steps 4 to 8: the part of an install that changes the system.
@@ -1123,6 +1095,9 @@ arch = all
   }
 
   impl PicaFixture {
+    /// A fixture whose artifact carries a `demo-lib` container and a `root/`
+    /// overlay, for the backends that still hand containers to a system package
+    /// manager.
     fn new() -> Self {
       let work = tempfile::tempdir().expect("temp dir");
       let work_path = work.path().to_path_buf();
@@ -1159,52 +1134,65 @@ arch = all
       )
     }
 
+    /// The same install without a `pkgs/` entry.
+    ///
+    /// A `pica`-backend artifact is built by `pica-pack`, which expands any
+    /// container into `root/`, so a pica install never has containers to lay
+    /// down. Rollback tests want the payload path, not the container path.
+    fn install_without_containers(
+      &mut self,
+      manifest: &str,
+      root_files: &[(&str, &str)],
+      root_symlinks: &[(&str, &str)],
+      extra_files: &[(&str, &str)],
+    ) -> CliResult<()> {
+      install_artifact(
+        &self.work_path,
+        &mut self.app,
+        &self.target,
+        manifest,
+        root_files,
+        root_symlinks,
+        &[],
+        extra_files,
+      )
+    }
+
     fn path(&self, relative: &str) -> PathBuf {
       self.target.as_path().join(relative)
     }
   }
 
   #[test]
-  fn pica_unpacks_the_container_and_lays_the_overlay_over_it() {
+  fn a_pica_artifact_must_not_carry_containers() {
+    // pica-pack expands pkgs/ into root/ at build time, so an artifact that
+    // still has containers came from a packer that predates that rule. Laying
+    // some of it down and then failing would leave the device inconsistent, so
+    // the install is refused before anything is written.
     let mut fixture = PicaFixture::new();
 
-    fixture
+    let err = fixture
       .install(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
-        &[("etc/demo.conf", "overlay\n"), ("etc/demo.extra", "extra\n")],
+        &[("etc/demo.conf", "overlay\n")],
         &[],
         &[],
       )
-      .expect("install");
+      .expect_err("a pica artifact must not ship containers");
 
-    assert_eq!(
-      fs::read_to_string(fixture.path("usr/lib/demo/helper")).expect("helper"),
-      "payload\n"
-    );
-    assert_eq!(fs::read_to_string(fixture.path("etc/demo.extra")).expect("extra"), "extra\n");
-    assert_eq!(
-      fs::read_to_string(fixture.path("etc/demo.conf")).expect("overlay"),
-      "overlay\n",
-      "root/ is deployed after the containers, so it wins a file both provide"
-    );
-
-    let record = db_record(&fixture.app, "demo").expect("the install must be recorded");
-    assert_eq!(record["manifest"]["pkgmgr"], json!("pica"));
-    assert_eq!(
-      record["manifest"]["installed_pkgs"],
-      json!(["demo-lib"]),
-      "the unpacks are recorded by name so -Qi and -R can see them"
-    );
-
-    let files: Vec<&str> =
-      record["files"].as_array().expect("files").iter().filter_map(Value::as_str).collect();
+    assert!(err.message.contains("must not carry pkgs/"), "{}", err.message);
     assert!(
-      files.iter().any(|file| file.ends_with("usr/lib/demo/helper")),
-      "the container's files must be recorded or -R cannot remove them: {files:?}"
+      err.message.contains("targets = apk"),
+      "the error must offer the way forward: {}",
+      err.message
     );
     assert!(
-      files.iter().any(|file| file.ends_with("etc/demo.conf")),
-      "the overlay's files must be recorded too: {files:?}"
+      !fixture.path("etc/demo.conf").exists(),
+      "nothing may be laid down when the artifact is refused"
+    );
+    assert!(
+      db_record(&fixture.app, "demo").is_none(),
+      "a refused install must leave no database record"
     );
   }
 
@@ -1263,7 +1251,7 @@ arch = all
     let mut fixture = PicaFixture::new();
 
     let err = fixture
-      .install(
+      .install_without_containers(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/fail\n"),
         &[("etc/demo.conf", "overlay\n")],
         &[],
@@ -1292,7 +1280,7 @@ arch = all
     let mut fixture = PicaFixture::new();
 
     let err = fixture
-      .install(
+      .install_without_containers(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
         &[("aaa.conf", "copied before the walk failed\n")],
         &[("zzz-escape", "/etc/passwd")],
@@ -1374,7 +1362,7 @@ arch = all
     fs::create_dir_all(&pre_existing).expect("mkdir keep");
 
     let err = fixture
-      .install(
+      .install_without_containers(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
         &[("keep/file", "copied before the walk failed\n")],
         &[("zzz-escape", "/etc/passwd")],
@@ -1396,32 +1384,51 @@ arch = all
   fn a_rollback_that_cannot_finish_keeps_a_record_to_remove_by_hand() {
     let mut fixture = PicaFixture::new();
 
-    // The hook drops a file of its own next to the container's, so the rollback
-    // cannot remove the container's directory and cannot finish cleanly.
-    let hook =
-      format!("#!/bin/sh\ntouch {}/usr/lib/demo/local.conf\n", fixture.target.as_path().display());
+    // A hook writes a file of its own into the kept-scripts directory. That
+    // directory is recorded as one this install created and its files are
+    // recorded for removal, but the hook's file is not among them, so the
+    // rollback empties what it knows about, finds the directory still holding
+    // something, and cannot finish. That is the case a record has to survive
+    // for: `-R` driven by it is the only thing left that can clean up.
+    let hook = format!(
+      "#!/bin/sh\nmkdir -p {dir}\ntouch {dir}/hook-made-this.conf\n",
+      dir = fixture
+        .target
+        .as_path()
+        .join("usr/lib/pica/scripts/demo")
+        .display()
+    );
 
     let err = fixture
-      .install(
+      .install_without_containers(
         &format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/hook\n"),
+        // The payload walk must trip, and it must trip after something has been
+        // recorded, so `aaa.conf` sorts ahead of the escaping symlink.
         &[("aaa.conf", "copied before the walk failed\n")],
         &[("zzz-escape", "/etc/passwd")],
-        &[("scripts/hook", hook.as_str())],
+        &[
+          ("scripts/hook", hook.as_str()),
+          ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=1\nPICA_KEEP_SCRIPT_REMOVE=1\n"),
+          ("scripts/remove", hook.as_str()),
+        ],
       )
-      .expect_err("step 7 fails");
+      .expect_err("the payload walk trips on the escaping symlink");
 
     assert!(err.message.contains("rollback incomplete"), "{}", err.message);
-    assert!(!fixture.path("usr/lib/demo/helper").exists(), "the container's own file is removed");
     assert!(
-      fixture.path("usr/lib/demo/local.conf").exists(),
+      !fixture.path("aaa.conf").exists(),
+      "what the walk did copy is taken back out"
+    );
+    assert!(
+      fixture.path("usr/lib/pica/scripts/demo/hook-made-this.conf").exists(),
       "Pica cannot know the hook's file is disposable, so it stays"
     );
 
     let record = db_record(&fixture.app, "demo")
-      .expect("a partial install keeps a record, because -R is the only way left to clean up");
+      .expect("an incomplete rollback keeps a record, because -R is the only way left");
     assert!(
       record["files"].as_array().is_some_and(Vec::is_empty),
-      "the files were removed; only the directories are left: {record}"
+      "the recorded files were removed; only directories are left: {record}"
     );
     assert!(
       record["dirs"].as_array().is_some_and(|dirs| !dirs.is_empty()),

@@ -283,8 +283,21 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
     copy_dir_recursive(&root_src, &tmpdir.join(ROOT))?;
   }
 
+  // A `pica`-backend artifact has to be self-contained: the device only ever
+  // copies files, so any container it ships is expanded here at build time and
+  // its payload becomes part of `root/`. `opkg`/`apk` artifacts keep `pkgs/`
+  // and let the system package manager install it, which is the only way those
+  // formats get their dependencies handled.
   if req.backend.expects_containers() {
-    stage_packages(req, &tmpdir.join(PKGS))?;
+    let pkgs_src = req.pkgdir.join(PKGS);
+    if req.backend == BuildBackend::Pica {
+      let names = crate::container::unpack_into(&pkgs_src, &tmpdir.join(ROOT))?;
+      if !names.is_empty() {
+        msg2(format!("  -> Expanded {} container(s): {}", names.len(), names.join(" ")));
+      }
+    } else {
+      stage_packages(req, &tmpdir.join(PKGS))?;
+    }
   }
 
   let license_src = req.pkgdir.join(LICENSE);

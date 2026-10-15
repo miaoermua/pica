@@ -1,6 +1,7 @@
 mod archive;
 mod backend;
 mod build;
+mod container;
 mod matrix;
 mod rewrite;
 
