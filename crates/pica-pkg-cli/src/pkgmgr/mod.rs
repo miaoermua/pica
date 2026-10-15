@@ -108,12 +108,31 @@ pub trait PackageManager {
   }
 }
 
-pub fn package_manager_for(kind: PackageManagerKind) -> Option<Box<dyn PackageManager>> {
+/// The backend for `kind` as the configuration file describes it.
+///
+/// `apk_force_non_repository` is the only setting a backend takes: it decides
+/// whether a local `.apk` is installed with the flag apk-tools 3.x wants for a
+/// package no repository provides. Everything that installs goes through here;
+/// [`package_manager_for`] is for callers that only ask questions.
+pub fn package_manager_with(
+  kind: PackageManagerKind,
+  apk_force_non_repository: bool,
+) -> Option<Box<dyn PackageManager>> {
   match kind {
     PackageManagerKind::Opkg if crate::system::has_command("opkg") => Some(Box::new(OpkgBackend)),
-    PackageManagerKind::Apk if crate::system::has_command("apk") => Some(Box::new(ApkBackend)),
+    PackageManagerKind::Apk if crate::system::has_command("apk") => {
+      Some(Box::new(ApkBackend::new(apk_force_non_repository)))
+    }
     _ => None,
   }
+}
+
+/// The backend for `kind`, with the local-install policy left at its default.
+///
+/// Probing a host — its architectures, its luci variant — asks the backend
+/// questions and installs nothing, so it does not need the setting.
+pub fn package_manager_for(kind: PackageManagerKind) -> Option<Box<dyn PackageManager>> {
+  package_manager_with(kind, true)
 }
 
 /// Auto-detection order used when neither the CLI, the package manifest nor the

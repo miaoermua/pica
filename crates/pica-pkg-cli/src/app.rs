@@ -135,6 +135,10 @@ pub struct App {
   pub options: Options,
   pub package_manager: Option<Box<dyn crate::pkgmgr::PackageManager>>,
   pub backend: crate::pkgmgr::PackageManagerKind,
+  /// The `apk_force_non_repository` setting, read by
+  /// [`App::apply_backend_config`]. Until then the default stands, which is what
+  /// the tests and the probing paths see.
+  pub apk_force_non_repository: bool,
   pub json_last_phase: String,
   pub json_has_text: bool,
 }
@@ -142,11 +146,13 @@ pub struct App {
 impl App {
   pub fn new(paths: Paths, options: Options) -> Self {
     let backend = crate::pkgmgr::detect_kind();
+    let apk_force_non_repository = true;
     Self {
       paths,
       options,
       package_manager: crate::pkgmgr::package_manager_for(backend),
       backend,
+      apk_force_non_repository,
       json_last_phase: String::new(),
       json_has_text: false,
     }
@@ -179,9 +185,10 @@ impl App {
     if self.backend == kind && self.package_manager.is_some() {
       return Ok(());
     }
-    let manager = crate::pkgmgr::package_manager_for(kind).ok_or_else(|| {
-      CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
-    })?;
+    let manager = crate::pkgmgr::package_manager_with(kind, self.apk_force_non_repository)
+      .ok_or_else(|| {
+        CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
+      })?;
     self.backend = kind;
     self.package_manager = Some(manager);
     Ok(())
@@ -189,7 +196,17 @@ impl App {
 
   /// Applies backend selection in priority order: `--pkgmgr`, then the config
   /// file, then the auto-detected backend chosen in [`App::new`].
+  ///
+  /// The apk setting is read first and the auto-detected backend rebuilt with
+  /// it, so the policy applies whether or not the config names a backend:
+  /// `apk` is what most routers end up with, and it is the backend that has a
+  /// setting to carry.
   pub fn apply_backend_config(&mut self) -> CliResult<()> {
+    self.apk_force_non_repository = conf_get_apk_force_non_repository(&self.paths.conf_file)?;
+    if self.backend.requires_system_binary() {
+      self.package_manager =
+        crate::pkgmgr::package_manager_with(self.backend, self.apk_force_non_repository);
+    }
     if let Some(value) = self.options.pkgmgr.clone() {
       return self.select_package_manager(&value);
     }
@@ -447,6 +464,32 @@ pub(crate) fn conf_get_pkgmgr(conf_file: &Path) -> Option<String> {
   (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Whether a local `.apk` is installed with `--force-non-repository`.
+///
+/// apk-tools 3.x, which `OpenWrt` 25.12 and later ship, refuses to install a
+/// package that no configured repository provides unless that flag is given.
+/// Pica unpacks its own `pkgs/apk/*.apk` and hands the files to `apk add`, so
+/// the default is `true`; `false` keeps the call to what apk 2.x accepted, for a
+/// router whose apk build does not know the option.
+///
+/// A missing key or `null` means the default. Anything other than `true`/`false`
+/// is an error: this decides whether a check is waived, so a typo must not fall
+/// back to a value the operator did not choose.
+pub(crate) fn conf_get_apk_force_non_repository(conf_file: &Path) -> CliResult<bool> {
+  let Ok(conf) = read_json_file(conf_file) else { return Ok(true) };
+  match conf.get("apk_force_non_repository") {
+    None | Some(Value::Null) => Ok(true),
+    Some(Value::Bool(value)) => Ok(*value),
+    Some(other) => Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!(
+        "invalid \"apk_force_non_repository\" in {}: expected true or false, found {other}",
+        conf_file.display()
+      ),
+    )),
+  }
+}
+
 pub(crate) fn resolve_lang(conf_file: &Path) -> String {
   let conf = read_json_file(conf_file).ok();
   conf
@@ -456,7 +499,7 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{FeedPolicy, conf_get_pkgmgr, parse_options};
+  use super::{FeedPolicy, conf_get_apk_force_non_repository, conf_get_pkgmgr, parse_options};
   use serde_json::json;
   use std::fs;
 
@@ -538,5 +581,37 @@ mod tests {
     assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("opkg"));
     fs::write(&conf, json!({ "pkgmgr": "bogus" }).to_string()).expect("write config");
     assert_eq!(conf_get_pkgmgr(&conf).as_deref(), Some("bogus"));
+  }
+
+  #[test]
+  fn the_apk_local_install_setting_defaults_to_on() {
+    // apk-tools 3.x refuses a local file that no repository provides, which is
+    // every file Pica installs from its own `pkgs/`, so an unset key means the
+    // flag is passed rather than the install failing on a current router.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+
+    assert!(conf_get_apk_force_non_repository(&dir.path().join("missing.json")).expect("default"));
+    fs::write(&conf, json!({ "repos": [] }).to_string()).expect("write config");
+    assert!(conf_get_apk_force_non_repository(&conf).expect("default"));
+    fs::write(&conf, json!({ "apk_force_non_repository": null }).to_string())
+      .expect("write config");
+    assert!(conf_get_apk_force_non_repository(&conf).expect("null means the default"));
+    fs::write(&conf, json!({ "apk_force_non_repository": false }).to_string())
+      .expect("write config");
+    assert!(!conf_get_apk_force_non_repository(&conf).expect("off"));
+  }
+
+  #[test]
+  fn a_non_boolean_apk_local_install_setting_is_rejected() {
+    // The setting decides whether a signature check is waived, so a value that
+    // is neither true nor false fails the command instead of picking one.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let conf = dir.path().join("pica.json");
+    fs::write(&conf, json!({ "apk_force_non_repository": "yes" }).to_string()).expect("config");
+
+    let err = conf_get_apk_force_non_repository(&conf).expect_err("must reject the value");
+    assert!(err.message.contains("apk_force_non_repository"), "{}", err.message);
+    assert!(err.message.contains("expected true or false"), "{}", err.message);
   }
 }

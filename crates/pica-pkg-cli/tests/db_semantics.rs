@@ -12,6 +12,7 @@
 
 use assert_cmd::Command;
 use assert_cmd::assert::Assert;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -33,14 +34,23 @@ exit 0
 /// The `apk` counterpart. Its presence also means auto-detection would pick
 /// `apk` over `opkg`, which is what makes the "recorded backend wins" cases
 /// meaningful.
+///
+/// `@VERSION@` is replaced by the version the stub reports for `--version`:
+/// apk-tools 3.x (`OpenWrt` 25.12 and later) is the one that refuses a local file
+/// no repository provides, so a test can put either release on `PATH`.
 const APK_STUB: &str = r#"#!/bin/sh
 printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
 case "$1" in
+  --version) printf 'apk-tools @VERSION@\n' ;;
   --print-arch) printf 'x86_64\n' ;;
   search) printf '%s-1.0.0\n' "$2" ;;
 esac
 exit 0
 "#;
+
+/// The apk-tools release `OpenWrt` 25.12 ships, and the one it shipped before.
+const APK_3: &str = "3.0.0";
+const APK_2: &str = "2.14.4";
 
 /// A row from the `opkg` era: the backend lived in `source`, `pkgmgr` did not
 /// exist yet, and `pkgfile` held a backend name instead of an artifact path.
@@ -137,8 +147,14 @@ struct Sandbox {
 }
 
 impl Sandbox {
-  /// `db` becomes `state/db.json` verbatim.
+  /// `db` becomes `state/db.json` verbatim, on an apk host of the current
+  /// release: the one whose behaviour the CLI is written for.
   fn new(db: &str) -> Self {
+    Self::with_apk_version(db, APK_3)
+  }
+
+  /// The same, with the apk on `PATH` reporting `version`.
+  fn with_apk_version(db: &str, version: &str) -> Self {
     let dir = tempfile::tempdir().expect("create temp dir");
     let state = dir.path().join("state");
     fs::create_dir_all(&state).expect("create state dir");
@@ -148,7 +164,7 @@ impl Sandbox {
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).expect("create stub dir");
     stub(&bin.join("opkg"), OPKG_STUB);
-    stub(&bin.join("apk"), APK_STUB);
+    stub(&bin.join("apk"), &APK_STUB.replace("@VERSION@", version));
 
     Self { dir }
   }
@@ -241,6 +257,40 @@ impl Sandbox {
       .expect("run tar");
     assert!(status.success(), "tar failed to build {pkgname}");
     out
+  }
+
+  /// An `apk` artifact carrying one local container. `stage_packages` flattens
+  /// `pkgs/<backend>/` into the archive's `pkgs/`, so the file sits directly
+  /// there, which is also where `install_pkgs_dir` looks for it.
+  fn apk_artifact(&self, pkgname: &str) -> PathBuf {
+    let src = self.dir.path().join(format!("src-{pkgname}"));
+    fs::create_dir_all(src.join("pkgs")).expect("create pkgdir");
+    fs::write(
+      src.join("manifest"),
+      format!(
+        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = apk\nplatform = all\nos = all\narch = all\n"
+      ),
+    )
+    .expect("write manifest");
+    fs::write(src.join("pkgs").join(format!("{pkgname}.apk")), b"apk payload")
+      .expect("write container");
+
+    let out = self.dir.path().join(format!("{pkgname}.pkg.tar.gz"));
+    let status = std::process::Command::new("tar")
+      .arg("-czf")
+      .arg(&out)
+      .args(["-C"])
+      .arg(&src)
+      .args(["manifest", "pkgs"])
+      .status()
+      .expect("run tar");
+    assert!(status.success(), "tar failed to build {pkgname}");
+    out
+  }
+
+  /// `json` becomes `etc/pica.json` verbatim.
+  fn write_conf(&self, json: &str) {
+    fs::write(self.dir.path().join("etc/pica.json"), json).expect("write pica.json");
   }
 
   fn state_dir(&self) -> PathBuf {
@@ -396,4 +446,87 @@ fn install_records_the_backend_in_use_not_the_declared_one() {
   // Removal follows the record rather than the declaration.
   sandbox.run(&["-R", "declared-apk"]).success();
   assert_eq!(sandbox.calls(), "", "apk must not be asked to remove it");
+}
+
+// -- Local apk containers ------------------------------------------------------
+//
+// `pkgs/*.apk` is a file, not a package a repository provides. apk-tools 3.x,
+// which OpenWrt 25.12 ships, refuses such a file unless it is told otherwise, so
+// what the CLI hands to `apk add` decides whether a Pica install works at all on
+// a current router.
+
+/// The target of the first `apk add` recorded, which is the argument after the
+/// `--` separator.
+fn installed_apk_target(calls: &str) -> String {
+  let add = calls.lines().find(|line| line.starts_with("apk add ")).expect("apk add ran");
+  add.rsplit(" -- ").next().expect("a -- separator before the target").to_string()
+}
+
+#[test]
+fn a_local_apk_is_installed_with_the_non_repository_flag() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.apk_artifact("local-apk");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact]).success();
+
+  let calls = sandbox.calls();
+  let add = calls.lines().find(|line| line.starts_with("apk add ")).expect("apk add ran");
+  assert!(add.contains("--force-non-repository"), "apk 3.x needs it for a local file: {calls}");
+  assert!(add.contains("--allow-untrusted"), "{calls}");
+  assert!(
+    installed_apk_target(&calls).ends_with("local-apk.apk"),
+    "apk is given the file, not a name it would look up in a repository: {calls}"
+  );
+}
+
+#[test]
+fn the_setting_can_turn_the_non_repository_flag_off() {
+  // The escape hatch for a router whose apk build does not know the option: the
+  // flag leaves the command line, and the signature waiver stays, because that
+  // is what a file signed by someone other than this router's key needs.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  sandbox.write_conf(r#"{"apk_force_non_repository": false}"#);
+  let artifact = sandbox.apk_artifact("local-apk");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact]).success();
+
+  let calls = sandbox.calls();
+  assert!(!calls.contains("--force-non-repository"), "{calls}");
+  assert!(calls.contains("--allow-untrusted"), "{calls}");
+}
+
+#[test]
+fn an_apk_2_host_is_not_given_the_non_repository_flag() {
+  // apk-tools 2.x has no such option, and an unknown option stops the command
+  // before it installs anything; the setting is on by default, so the version is
+  // what has to hold it back.
+  let sandbox = Sandbox::with_apk_version(EMPTY_DB, APK_2);
+  let artifact = sandbox.apk_artifact("local-apk");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact]).success();
+
+  let calls = sandbox.calls();
+  assert!(calls.contains("apk --version"), "the version has to be asked for: {calls}");
+  assert!(!calls.contains("--force-non-repository"), "{calls}");
+  assert!(calls.contains("--allow-untrusted"), "{calls}");
+}
+
+#[test]
+fn a_non_boolean_apk_setting_is_refused() {
+  // This setting decides whether a signature check is waived, so a typo has to
+  // stop the install rather than quietly resolve to one of the two answers.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  sandbox.write_conf(r#"{"apk_force_non_repository": "yes"}"#);
+  let artifact = sandbox.apk_artifact("local-apk");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact])
+    .failure()
+    .stderr(contains("apk_force_non_repository").and(contains("expected true or false")));
+
+  assert_eq!(sandbox.calls(), "", "nothing may be installed");
 }

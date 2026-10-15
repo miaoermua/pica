@@ -71,12 +71,14 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 ```json
 {
   "repos": [],
-  "i18n": "zh-cn"
+  "i18n": "zh-cn",
+  "apk_force_non_repository": true
 }
 ```
 
 - `repos[]`：pica 仓库列表（`pica -S` 同步与 `pica -Si/-Sp` 查询/安装使用）
 - `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，不影响 pica 自身输出语言）
+- `apk_force_non_repository`（默认 `true`）：apk 后端安装 Pica 归档中的本地 `.apk` 时是否加 `--force-non-repository`。OpenWrt 25.12 起的 apk-tools 3.x 会拒绝不属于任何仓库的软件包，因此默认开启；Pica 会先读 `apk --version`，2.x 不传该参数。详见 `docs/standard.md`
 
 ---
 
