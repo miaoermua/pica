@@ -220,12 +220,11 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
 
 ## 依赖索引：答不出来就不答
 
-pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源选择、`-U` 的依赖预检、`-S` 之后的依赖检查），答案只来自本机后端自己的索引：`opkg` 是每个 feed 的列表文件（`lists_dir` 下的同名文件），`apk` 是缓存目录里的 `APKINDEX.*`。
+pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源选择、`-U` 的依赖预检、`-S` 之后的依赖检查），答案只来自本机后端自己的索引：`opkg` 是每个 feed 的列表文件（`lists_dir` 下的同名文件），`apk` 是每个仓库的索引（本地仓库就地读取，网络仓库按索引 URL 的摘要缓存在缓存目录）。
 
 - 查询前先保证索引可读：只有确实缺索引才调用一次 `opkg update` / `apk update`；已有索引不重复拉取，这是整条路径上唯一昂贵的步骤。
-- 缺索引且刷新没能补上（断网、源地址失效、`opkg` 锁被活进程持有）报 `E_INDEX_UNAVAILABLE`，消息里带上刷新命令的退出码与其输出，**不会**把"取不到索引"当成"源里没有这个包"，也不会因此把依赖报成 missing。
-- 只做提示的地方不阻塞：`-S` 之后的依赖检查降级为一条 warning（`skip dependency check: ...`）。
-- 主机没有配置任何源（没有 `/etc/opkg.conf`、`/etc/opkg/*.conf`、`/etc/apk/repositories`）就是"本机没有源"，不是错误。
+- 缺索引且刷新没能补上（断网、源地址失效、`opkg` 锁被活进程持有）报 `E_INDEX_UNAVAILABLE`，消息里带上缺哪些源、刷新命令的退出码与其输出，**不会**把"取不到索引"当成"源里没有这个包"，也不会因此把依赖报成 missing。
+- "本机的源"按后端自己读配置的方式认定：`opkg` 是 `/etc/opkg.conf` 与 `/etc/opkg/*.conf`，`apk` 是 `/etc/apk/repositories` 加 `/etc/apk/repositories.d`、`/lib/apk/repositories.d` 下的 `*.list`（OpenWrt 25.12 的 feeds 就在那里，`/etc/apk/repositories` 是空的）。一个源都没配置就是"本机没有源"，不是错误。
 - `--feed-policy packaged-only` 不询问源，因此在源不可达的主机上依旧可以只从 pica 仓库安装。
 
 ## app 安装顺序

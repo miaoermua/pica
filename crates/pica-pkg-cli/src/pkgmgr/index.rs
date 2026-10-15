@@ -38,9 +38,9 @@ pub(crate) trait IndexSource {
   fn conf_files(&self) -> Vec<PathBuf>;
 
   /// What this host's configured repositories need and do not have, phrased
-  /// for the error message — `opkg`'s missing list file per feed, `apk`'s
-  /// index files that are fewer than its repositories (or older than the file
-  /// that names them).
+  /// for the error message — `opkg`'s missing list file per feed, and `apk`'s
+  /// missing index per repository, which it knows exactly because apk names a
+  /// cached index after the URL it came from.
   ///
   /// Empty when every configured repository has a readable index, and also
   /// empty when no repository is configured, since there is then nothing that

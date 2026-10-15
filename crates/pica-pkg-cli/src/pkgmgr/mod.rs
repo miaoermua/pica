@@ -1,6 +1,7 @@
 use crate::app::CliResult;
 
 pub mod apk;
+pub(crate) mod apk_repositories;
 pub(crate) mod index;
 pub mod opkg;
 
