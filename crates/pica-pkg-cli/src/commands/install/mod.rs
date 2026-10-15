@@ -49,21 +49,27 @@ pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   }
 
   let package_manager = app.package_manager()?;
-  package_manager.update_index();
 
-  if !Selector::is_structured(selector) && package_manager.package_exists(&parsed.appname) {
-    let should_install_opkg = if app.options.non_interactive {
-      matches!(
-        app.options.feed_policy,
-        crate::app::FeedPolicy::Ask
-          | crate::app::FeedPolicy::FeedFirst
-          | crate::app::FeedPolicy::FeedOnly
-      )
-    } else {
-      !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
-    };
+  // Whether the feeds decide this request at all. Under a policy that will not
+  // install from them, the answer is not consulted — and asking anyway would
+  // make a pica-repo install depend on an index whose answer nothing uses.
+  let feeds_decide = if app.options.non_interactive {
+    matches!(
+      app.options.feed_policy,
+      crate::app::FeedPolicy::Ask
+        | crate::app::FeedPolicy::FeedFirst
+        | crate::app::FeedPolicy::FeedOnly
+    )
+  } else {
+    !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
+  };
 
-    if should_install_opkg {
+  if feeds_decide && !Selector::is_structured(selector) {
+    // The feeds decide whether this install goes to the package manager, so the
+    // answer has to be one: an index nobody could fetch would send a package the
+    // feeds do carry to the pica repository instead.
+    package_manager.update_index()?;
+    if package_manager.package_exists(&parsed.appname)? {
       app_via_package_manager(app, selector)?;
       return Ok(());
     }
@@ -89,7 +95,10 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
 
   let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
   let package_manager = app.package_manager()?;
-  package_manager.update_index();
+  // This function installs from the feeds, so a feed whose index could not be
+  // read is reported as itself: "package not found" would name a fact about a
+  // feed that was never fetched.
+  package_manager.update_index()?;
 
   let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
   if lang == "zh-cn" {
@@ -98,7 +107,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
 
   let mut to_install = Vec::new();
   for pkg in candidates {
-    if package_manager.package_exists(&pkg) {
+    if package_manager.package_exists(&pkg)? {
       to_install.push(pkg);
     }
   }

@@ -41,17 +41,39 @@ pub(crate) fn pkgs_dir_has_pkg(dir: &Path, pkg: &str) -> bool {
   false
 }
 
-pub(crate) fn precheck_dep_source(app: &App, dep: &str, pkgs_dir: &Path) -> String {
-  if app.package_manager().is_ok_and(|manager| manager.is_installed(dep)) {
-    return "installed".to_string();
+/// Where one declared dependency would come from, as the precheck report says it.
+///
+/// `Err` when the feeds cannot be read at all: "missing" is an answer *about*
+/// the feeds, and a backend whose index was never fetched would give it for
+/// every name there is.
+pub(crate) fn precheck_dep_source(app: &App, dep: &str, pkgs_dir: &Path) -> CliResult<String> {
+  let Ok(package_manager) = app.package_manager() else {
+    // No backend at all is not a failure: it means no feeds, and the containers
+    // are the only source that could name this dependency.
+    return Ok(packaged_or_missing(pkgs_dir, dep));
+  };
+  if package_manager.is_installed(dep) {
+    return Ok("installed".to_string());
   }
-  if app.package_manager().is_ok_and(|manager| manager.package_exists(dep)) {
-    return "feed".to_string();
+  if package_manager.package_exists(dep)? {
+    return Ok("feed".to_string());
   }
-  if pkgs_dir_has_pkg(pkgs_dir, dep) {
-    return "packaged".to_string();
+  Ok(packaged_or_missing(pkgs_dir, dep))
+}
+
+/// The source left when the feeds do not have `dep`.
+fn packaged_or_missing(pkgs_dir: &Path, dep: &str) -> String {
+  if pkgs_dir_has_pkg(pkgs_dir, dep) { "packaged".to_string() } else { "missing".to_string() }
+}
+
+/// The status of every name in `deps`, in the order they were declared.
+fn dep_entries(app: &App, deps: Vec<String>, pkgs_dir: &Path) -> CliResult<Vec<Value>> {
+  let mut entries = Vec::new();
+  for dep in deps.into_iter().filter(|dep| !dep.is_empty()) {
+    let status = precheck_dep_source(app, &dep, pkgs_dir)?;
+    entries.push(json!({"name": dep, "status": status}));
   }
-  "missing".to_string()
+  Ok(entries)
 }
 
 pub(crate) fn build_precheck_report(
@@ -59,36 +81,21 @@ pub(crate) fn build_precheck_report(
   manifest: &Manifest,
   pkgs_dir: &Path,
   app_list: &[String],
-) -> Value {
+) -> CliResult<Value> {
   let backend = app.backend().as_str();
 
-  let kmod = manifest
-    .get_array_for("kmod", backend)
-    .into_iter()
-    .filter(|dep| !dep.is_empty())
-    // kmods are always resolved through feeds: the OpenWrt kernel module
-    // packages cannot be shipped inside an application artifact.
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, Path::new(""))}))
-    .collect::<Vec<Value>>();
+  // kmods are always resolved through feeds: the OpenWrt kernel module packages
+  // cannot be shipped inside an application artifact, so their `pkgs_dir` is
+  // empty on purpose.
+  let kmod = dep_entries(app, manifest.get_array_for("kmod", backend), Path::new(""))?;
+  let base = dep_entries(app, manifest.get_array_for("base", backend), pkgs_dir)?;
+  let app = dep_entries(app, app_list.to_vec(), pkgs_dir)?;
 
-  let base = manifest
-    .get_array_for("base", backend)
-    .into_iter()
-    .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, &dep, pkgs_dir)}))
-    .collect::<Vec<Value>>();
-
-  let app = app_list
-    .iter()
-    .filter(|dep| !dep.is_empty())
-    .map(|dep| json!({"name": dep.clone(), "status": precheck_dep_source(app, dep, pkgs_dir)}))
-    .collect::<Vec<Value>>();
-
-  json!({
-      "kmod": kmod,
-      "base": base,
-      "app": app,
-  })
+  Ok(json!({
+    "kmod": kmod,
+    "base": base,
+    "app": app,
+  }))
 }
 
 pub(super) fn summarize_missing_precheck(precheck: &Value) -> Vec<String> {

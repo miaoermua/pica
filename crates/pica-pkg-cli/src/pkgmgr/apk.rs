@@ -1,8 +1,18 @@
+use super::index::{self, IndexSource, run_refresh};
 use super::{PackageManager, PackageManagerKind, describe_targets};
-use crate::app::{CliError, CliResult, E_NO_SPACE, E_RUNTIME};
-use crate::system::{has_command, stderr_or_stdout};
-use std::path::Path;
+use crate::app::{CliError, CliResult, E_IO, E_MISSING_COMMAND, E_NO_SPACE, E_RUNTIME};
+use crate::system::stderr_or_stdout;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
+
+/// Where apk keeps the indexes it fetched, in the order apk looks for them: the
+/// configured cache directory, else `var/cache/apk` under the root.
+const APK_CACHE_DIRS: [&str; 2] = ["/etc/apk/cache", "/var/cache/apk"];
+/// The file that names apk's repositories.
+const APK_REPOSITORIES: &str = "/etc/apk/repositories";
 
 pub struct ApkBackend {
   /// The `apk_force_non_repository` setting, which decides whether a local
@@ -17,6 +27,154 @@ impl ApkBackend {
   pub fn new(force_non_repository: bool) -> Self {
     Self { force_non_repository }
   }
+
+  /// The index of this host, as its configuration describes it.
+  fn index() -> ApkIndex {
+    ApkIndex::system()
+  }
+}
+
+/// The feed index `apk` answers "is this package available" from.
+pub(crate) struct ApkIndex {
+  conf_files: Vec<PathBuf>,
+  cache_dirs: Vec<PathBuf>,
+  /// The refresh command, program first.
+  update: Vec<String>,
+}
+
+impl ApkIndex {
+  fn system() -> Self {
+    Self {
+      conf_files: vec![PathBuf::from(APK_REPOSITORIES)],
+      cache_dirs: APK_CACHE_DIRS.iter().map(PathBuf::from).collect(),
+      update: vec!["apk".to_string(), "update".to_string()],
+    }
+  }
+
+  /// The directory apk caches its indexes in, when there is one.
+  fn cache_dir(&self) -> Option<&Path> {
+    self.cache_dirs.iter().find(|dir| dir.is_dir()).map(PathBuf::as_path)
+  }
+
+  /// The indexes apk has cached.
+  ///
+  /// apk names each one after a digest of the repository URL it came from
+  /// (`APKINDEX.<digest>.tar.gz`, and a `.adb` on apk-tools 3.x), and that
+  /// digest changed between releases, so pica cannot work out which file
+  /// belongs to which feed: it counts them instead, and leaves it to the
+  /// refresh to make the count match the configuration.
+  fn cached_indexes(&self) -> Vec<PathBuf> {
+    let Some(dir) = self.cache_dir() else {
+      return Vec::new();
+    };
+    fs::read_dir(dir)
+      .into_iter()
+      .flatten()
+      .flatten()
+      .map(|entry| entry.path())
+      .filter(|path| {
+        path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("APKINDEX"))
+      })
+      .collect()
+  }
+
+  /// When the newest configured repository list was written.
+  fn newest_conf(&self) -> Option<SystemTime> {
+    self
+      .conf_files
+      .iter()
+      .filter_map(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok())
+      .max()
+  }
+}
+
+impl IndexSource for ApkIndex {
+  fn backend(&self) -> &'static str {
+    "apk"
+  }
+
+  fn conf_files(&self) -> Vec<PathBuf> {
+    self.conf_files.clone()
+  }
+
+  fn missing_indexes(&self) -> CliResult<Vec<String>> {
+    let repos = read_apk_repositories(&self.conf_files)?;
+    if repos.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let dirs: Vec<String> = self.cache_dirs.iter().map(|dir| dir.display().to_string()).collect();
+    let Some(dir) = self.cache_dir() else {
+      return Ok(vec![format!("no index cache directory ({})", dirs.join(", "))]);
+    };
+
+    let indexes = self.cached_indexes();
+    // apk fetches one index per repository, so fewer files than repositories
+    // means at least one of them was never fetched — which one cannot be told
+    // (the file names carry a digest, not the URL), and does not have to be.
+    if indexes.len() < repos.len() {
+      return Ok(vec![format!(
+        "too few indexes cached in {}: {} for {} repositories",
+        dir.display(),
+        indexes.len(),
+        repos.len()
+      )]);
+    }
+
+    // A repository list edited after the last update is not what the cached
+    // indexes were fetched for, so apk would answer about feeds that are no
+    // longer the ones this host names.
+    let newest = indexes
+      .iter()
+      .filter_map(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok())
+      .max();
+    match (self.newest_conf(), newest) {
+      (Some(conf), Some(newest)) if newest < conf => {
+        let file = self
+          .conf_files
+          .iter()
+          .map(|path| path.display().to_string())
+          .collect::<Vec<_>>()
+          .join(", ");
+        Ok(vec![format!("the APKINDEX in {} is older than {file}", dir.display())])
+      }
+      _ => Ok(Vec::new()),
+    }
+  }
+
+  fn refresh(&self) -> CliResult<()> {
+    let program = self.update.first().cloned().unwrap_or_else(|| "apk".to_string());
+    let outcome = run_refresh(&self.update)?;
+    if outcome.success { Ok(()) } else { Err(CliError::new(E_RUNTIME, outcome.failure(&program))) }
+  }
+}
+
+/// The repository URLs of an apk repository file: one per line, `#` comments
+/// skipped, and a leading `@tag` dropped since it pins a priority rather than
+/// naming a feed of its own.
+fn read_apk_repositories(paths: &[PathBuf]) -> CliResult<Vec<String>> {
+  let mut repos = Vec::new();
+  for path in paths {
+    match fs::read_to_string(path) {
+      Ok(text) => repos.extend(parse_apk_repositories(&text)),
+      Err(err) if err.kind() == ErrorKind::NotFound => {}
+      Err(err) => {
+        return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
+      }
+    }
+  }
+  Ok(repos)
+}
+
+fn parse_apk_repositories(text: &str) -> Vec<String> {
+  text
+    .lines()
+    .map(|line| line.split('#').next().unwrap_or_default().trim())
+    .filter(|line| !line.is_empty())
+    .map(|line| line.split_whitespace().last().unwrap_or_default())
+    .filter(|url| !url.is_empty())
+    .map(ToString::to_string)
+    .collect()
 }
 
 impl Default for ApkBackend {
@@ -33,19 +191,50 @@ impl PackageManager for ApkBackend {
     PackageManagerKind::Apk
   }
 
-  fn update_index(&self) {
-    if !has_command("apk") {
-      return;
-    }
-    let _ = Command::new("apk").arg("update").output();
+  fn update_index(&self) -> CliResult<()> {
+    index::ensure_index(&Self::index())
   }
 
-  fn package_exists(&self, name: &str) -> bool {
-    let Ok(output) = Command::new("apk").args(["search", "--exact", name]).output() else {
-      return false;
-    };
-    output.status.success()
-      && String::from_utf8_lossy(&output.stdout).lines().any(|line| !line.trim().is_empty())
+  fn package_exists(&self, name: &str) -> CliResult<bool> {
+    let output = Command::new("apk").args(["search", "--exact", name]).output().map_err(|err| {
+      let (code, message) = if err.kind() == ErrorKind::NotFound {
+        (E_MISSING_COMMAND, "missing required command: apk".to_string())
+      } else {
+        (E_RUNTIME, format!("apk search --exact {name} failed: {err}"))
+      };
+      CliError::new(code, message)
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let names: Vec<String> = stdout.lines().filter_map(apk_result_name).collect();
+    if names.iter().any(|found| found == name) {
+      return Ok(true);
+    }
+
+    let detail = || stderr_or_stdout(&output.stdout, &output.stderr);
+    match output.status.code() {
+      // apk 3.x exits 1 for a query that matched nothing; the releases that
+      // exit 0 say the same thing with an empty list. Either way an answer that
+      // names no package is the answer "not there".
+      Some(0 | 1) if names.is_empty() => {
+        // ...but only if apk had an index to answer from: with none cached it
+        // matches nothing for *every* name, which is not an answer to give
+        // about one of them.
+        index::index_ready(&Self::index())?;
+        Ok(false)
+      }
+      // A match that is not this package by name: a feed package that
+      // `provides` it, which is what `apk add <name>` would resolve to.
+      Some(0) => Ok(true),
+      Some(code) => Err(CliError::new(
+        E_RUNTIME,
+        format!("apk search --exact {name} failed (exit {code}): {}", detail()),
+      )),
+      None => Err(CliError::new(
+        E_RUNTIME,
+        format!("apk search --exact {name} was killed by a signal: {}", detail()),
+      )),
+    }
   }
 
   fn is_installed(&self, name: &str) -> bool {
@@ -303,12 +492,183 @@ fn split_installed_line(line: &str) -> Option<(String, String)> {
   })
 }
 
+/// The package a line of `apk search --exact` output names.
+///
+/// The output is `name-version` (or `name-version [installed]`), and a release
+/// that prints bare names is read as one too. Anything else — a warning, a
+/// progress line — names no package, and is not a match for anything.
+fn apk_result_name(line: &str) -> Option<String> {
+  let value = line.trim();
+  if let Some((name, _)) = split_installed_line(value) {
+    return Some(name);
+  }
+  valid_package_name(value).then(|| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
-    accepts_force_non_repository, apk_major_version, install_command, is_local_apk_path,
-    parse_package_version, split_installed_line,
+    ApkIndex, accepts_force_non_repository, apk_major_version, apk_result_name, install_command,
+    is_local_apk_path, parse_apk_repositories, parse_package_version, split_installed_line,
   };
+  use crate::app::{E_INDEX_UNAVAILABLE, E_IO};
+  use crate::pkgmgr::index::{self, IndexSource};
+  use pretty_assertions::assert_eq;
+  use std::fs;
+  use std::path::{Path, PathBuf};
+  use std::time::{Duration, SystemTime};
+
+  /// An index reading one repository file and one cache directory, refreshed by
+  /// whatever command the test hands it.
+  fn index_for(root: &Path, repos: &str, update: Vec<String>) -> (ApkIndex, PathBuf) {
+    let conf = root.join("repositories");
+    fs::write(&conf, repos).expect("write repositories");
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).expect("create cache dir");
+    let index = ApkIndex { conf_files: vec![conf], cache_dirs: vec![cache.clone()], update };
+    (index, cache)
+  }
+
+  fn shell(script: String) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), script]
+  }
+
+  /// Backdates `path`, which is how a test says "this index was fetched before
+  /// the repository list it is being asked about".
+  fn age(path: &Path, seconds: u64) {
+    let file = fs::File::options().write(true).open(path).expect("open file to age");
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+    file.set_times(fs::FileTimes::new().set_modified(when)).expect("set mtime");
+  }
+
+  #[test]
+  fn parses_apk_repository_lines() {
+    assert_eq!(
+      parse_apk_repositories(
+        "# a comment\n\
+         \n\
+         https://dl-cdn.alpinelinux.org/alpine/v3.20/main\n\
+         \t https://example.test/edge  # trailing comment\n\
+         @edge https://example.test/pinned\n"
+      ),
+      vec![
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main".to_string(),
+        "https://example.test/edge".to_string(),
+        "https://example.test/pinned".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn apk_search_output_names_packages_or_nothing() {
+    assert_eq!(apk_result_name("luci-app-demo-1.2.3-r0"), Some("luci-app-demo".to_string()));
+    assert_eq!(
+      apk_result_name("luci-app-demo-1.2.3-r0 [installed]"),
+      Some("luci-app-demo".to_string())
+    );
+    assert_eq!(apk_result_name("luci-app-demo"), Some("luci-app-demo".to_string()));
+    assert_eq!(apk_result_name("ERROR: unable to select packages"), None);
+    assert_eq!(apk_result_name(""), None);
+  }
+
+  #[test]
+  fn a_host_without_repositories_has_no_index_to_need() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let (index, _) = index_for(root.path(), "# no repositories\n", Vec::new());
+    assert_eq!(index.missing_indexes().expect("repositories are readable"), Vec::<String>::new());
+  }
+
+  #[test]
+  fn every_repository_needs_an_index_file_of_its_own() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let (index, cache) = index_for(
+      root.path(),
+      "https://example.test/main\nhttps://example.test/community\n",
+      Vec::new(),
+    );
+    let missing = index.missing_indexes().expect("repositories are readable");
+    assert_eq!(missing.len(), 1);
+    assert!(missing[0].contains("too few indexes cached in"), "{}", missing[0]);
+    assert!(missing[0].contains("0 for 2 repositories"), "{}", missing[0]);
+    assert!(missing[0].contains(&cache.display().to_string()), "{}", missing[0]);
+
+    // apk names the cached index after a digest of the repository URL, which
+    // pica does not try to reproduce — so the files are counted, not matched.
+    fs::write(cache.join("APKINDEX.abcdef12.tar.gz"), b"index").expect("write index");
+    let missing = index.missing_indexes().expect("repositories are readable");
+    assert_eq!(missing.len(), 1);
+    assert!(missing[0].contains("1 for 2 repositories"), "{}", missing[0]);
+
+    fs::write(cache.join("APKINDEX.34567890.tar.gz"), b"index").expect("write second index");
+    assert_eq!(index.missing_indexes().expect("repositories are readable"), Vec::<String>::new());
+  }
+
+  #[test]
+  fn an_index_older_than_the_repository_list_is_missing() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let (index, cache) = index_for(root.path(), "https://example.test/main\n", Vec::new());
+    let cached = cache.join("APKINDEX.abcdef12.tar.gz");
+    fs::write(&cached, b"index").expect("write index");
+    // Written long before the repository list that is being asked about: it
+    // cannot say which feeds that list names.
+    age(&cached, 0);
+
+    let missing = index.missing_indexes().expect("repositories are readable");
+    assert_eq!(missing.len(), 1);
+    assert!(missing[0].contains("older than"), "{}", missing[0]);
+  }
+
+  #[test]
+  fn a_repository_file_that_cannot_be_read_is_an_error() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let cache = root.path().join("cache");
+    fs::create_dir_all(&cache).expect("create cache dir");
+    let index = ApkIndex {
+      // A directory where a file belongs: present, and impossible to read.
+      conf_files: vec![root.path().to_path_buf()],
+      cache_dirs: vec![cache],
+      update: Vec::new(),
+    };
+    let err = index.missing_indexes().expect_err("the repositories are unknown, not absent");
+    assert_eq!(err.code, E_IO);
+  }
+
+  #[test]
+  fn a_missing_index_is_fetched_and_a_present_one_is_not() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let fetch = shell(format!(
+      "mkdir -p {0} && echo index > {0}/APKINDEX.abcdef12.tar.gz",
+      root.path().join("cache").display()
+    ));
+    let (index, cache) = index_for(root.path(), "https://example.test/main\n", fetch);
+    index::ensure_index(&index).expect("the refresh wrote the index");
+    assert!(cache.join("APKINDEX.abcdef12.tar.gz").is_file());
+
+    // The same repositories, this time with a refresh that would fail: an index
+    // that is already cached is not fetched again, which is what keeps the
+    // expensive step off the routers.
+    let would_fail = ApkIndex { update: shell("exit 9".to_string()), ..index };
+    index::ensure_index(&would_fail).expect("an index that is there is not refetched");
+  }
+
+  #[test]
+  fn a_refresh_that_fetched_nothing_is_reported() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let (index, cache) = index_for(
+      root.path(),
+      "https://example.test/main\n",
+      shell("echo 'ERROR: https://example.test/main: temporary failure' >&2; exit 1".to_string()),
+    );
+    let err = index::ensure_index(&index).expect_err("no index was written");
+    assert_eq!(err.code, E_INDEX_UNAVAILABLE);
+    assert!(err.message.contains("too few indexes cached in"), "{}", err.message);
+    assert!(err.message.contains(&cache.display().to_string()), "{}", err.message);
+    assert!(
+      err.message.contains("update failed (exit 1): ERROR: https://example.test/main"),
+      "{}",
+      err.message
+    );
+  }
 
   #[test]
   fn parses_apk_name_version() {

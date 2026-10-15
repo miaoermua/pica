@@ -119,5 +119,6 @@ PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 - **同步（-S）**：单纯读取配置表的 `url` 到临时队列 -> 下发至后端请求工具并发或串行抓取 `repo.json`。
 - **索引刷新防抖（-U 生命周期部分）**：
   - 当通过 `-S` 引发的远程依赖（base/app/kmod）安装前发现缺少依赖必须拉外网资源执行 `opkg install` 之前。
-  - Pica 会先探测本机的依赖索引目录状态（如 OpenWrt 内存系统的 `/var/opkg-lists/` 是否填满），只有空置才会调用昂贵的 `opkg update`。
+  - Pica 会先探测本机的依赖索引状态，只有缺索引才会调用昂贵的 `opkg update` / `apk update`：`opkg` 精确到每个 feed 的列表文件（`lists_dir` 下的同名文件），`apk` 按"缓存目录里的 `APKINDEX.*` 个数是否够得上仓库个数"判断，并额外比较索引与 `repositories` 的修改时间。
+  - `pkgmgr/index.rs` 是这条规则的唯一实现：`missing_indexes` 说缺什么、`ensure_index` 决定要不要刷新。只有"缺索引且刷新没补上"（断网、源失效、`opkg` 锁被活进程持有）才报 `E_INDEX_UNAVAILABLE`，消息里带上刷新命令的退出码与输出。少了索引就等于答不出"源里有没有这个包"，绝不能当成"源里没有"。
 - **状态审计落盘（Install-Report）**：每次成功的安装流完成，不仅 `db.json` 被追加对象关系。它会在 `/var/lib/pica/` 生成一份详细 JSON，用以记录（新增了哪些库，kmod 层补充了哪些依赖）的事务安装审计快照。

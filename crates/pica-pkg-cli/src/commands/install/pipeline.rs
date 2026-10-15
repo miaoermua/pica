@@ -425,9 +425,13 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   let base_list = non_empty(ctx.manifest.get_array_for("base", ctx.pkgmgr));
 
   let package_manager = app.package_manager()?;
-  package_manager.update_index();
+  // The report below calls a dependency missing when the backend's index does
+  // not have it, so an index that cannot be read has to stop the precheck here:
+  // a router with unreachable feeds would otherwise be told its dependencies
+  // were missing and the install would be refused for them.
+  package_manager.update_index()?;
 
-  let report = build_precheck_report(app, ctx.manifest, &ctx.tmpdir.join(PKGS), &app_list);
+  let report = build_precheck_report(app, ctx.manifest, &ctx.tmpdir.join(PKGS), &app_list)?;
   let missing = summarize_missing_precheck(&report);
   if !missing.is_empty() {
     app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));

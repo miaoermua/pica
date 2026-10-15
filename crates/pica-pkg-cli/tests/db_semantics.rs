@@ -43,7 +43,7 @@ printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
 case "$1" in
   --version) printf 'apk-tools @VERSION@\n' ;;
   --print-arch) printf 'x86_64\n' ;;
-  search) printf '%s-1.0.0\n' "$2" ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
 esac
 exit 0
 "#;
@@ -719,4 +719,36 @@ fn a_pkgs_dir_with_no_packages_is_refused_before_anything_is_installed() {
   sandbox.run(&["-U", artifact]).failure().stderr(contains("would be empty"));
 
   assert_eq!(sandbox.calls(), "", "nothing may be installed");
+}
+
+#[test]
+fn a_policy_that_will_not_install_from_the_feeds_does_not_ask_them() {
+  // `-S new-app` may install from the feeds or from the pica repository, and
+  // under `packaged-only` the feeds are not a source at all. Asking them anyway
+  // would make a repository install depend on an index whose answer nothing
+  // uses — and on a host whose feeds are out of reach, on a fetch that must
+  // fail before the install starts.
+  let sandbox = Sandbox::new(EMPTY_DB);
+
+  sandbox
+    .run(&["-S", "new-app", "--feed-policy", "packaged-only"])
+    .failure()
+    .stderr(contains("package not found in pica repos"));
+
+  assert_eq!(sandbox.calls(), "", "the feeds were not consulted at all");
+}
+
+#[test]
+fn the_feeds_are_asked_when_they_are_the_source() {
+  // The other side of the same decision: under the default policy the feeds
+  // decide first, so the detected backend is asked about the package before the
+  // repository is. Auto-detection picks the apk on `PATH`, which answers for
+  // every name it is given.
+  let sandbox = Sandbox::new(EMPTY_DB);
+
+  sandbox.run(&["-S", "feed-app"]).success();
+
+  let calls = sandbox.calls();
+  assert!(calls.contains("apk search --exact feed-app"), "the feed answer decides it: {calls}");
+  assert!(calls.contains("apk add -- feed-app"), "and the feeds install it: {calls}");
 }

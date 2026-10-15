@@ -105,19 +105,35 @@ fn check_index_dependencies(app: &mut App) {
     return;
   };
 
-  let (manager_name, missing) = {
+  let (manager_name, checked) = {
     let Ok(package_manager) = app.package_manager() else {
       app.log_warn("skip dependency check: no supported package manager found");
       return;
     };
-    package_manager.update_index();
-    let manager_name = package_manager.kind().as_str();
-    let missing = collect_declared_dependencies(&index)
-      .into_iter()
-      .filter(|dep| !package_manager.package_exists(dep))
-      .collect::<Vec<_>>();
-    (manager_name, missing)
+    let checked = package_manager.update_index().and_then(|()| {
+      let mut missing = Vec::new();
+      for dep in collect_declared_dependencies(&index) {
+        if !package_manager.package_exists(&dep)? {
+          missing.push(dep);
+        }
+      }
+      Ok(missing)
+    });
+    (package_manager.kind().as_str(), checked)
   };
+
+  // The check is a warning, not a gate, so a backend that cannot be read costs a
+  // warning of its own. It must not cost anything else: reporting a feed as
+  // missing a dependency it was never asked about would read as a fact about
+  // the repository, on a host whose repositories are simply out of reach.
+  let missing = match checked {
+    Ok(missing) => missing,
+    Err(err) => {
+      app.log_warn(format!("skip dependency check: {}", err.message));
+      return;
+    }
+  };
+
   for dep in &missing {
     app.log_warn(format!("{manager_name} feed missing dependency: {dep}"));
   }

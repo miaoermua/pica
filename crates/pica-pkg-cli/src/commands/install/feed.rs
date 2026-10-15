@@ -83,17 +83,25 @@ pub(crate) fn dependency_source(
         return Ok(Some(DependencySource::Containers));
       }
 
-      if let Ok(package_manager) = app.package_manager() {
-        package_manager.update_index();
-      }
+      // No backend at all means no feeds at all, which is an answer rather than
+      // a failure: the containers are the source that is left.
+      let Ok(package_manager) = app.package_manager() else {
+        return Ok(Some(DependencySource::Containers));
+      };
+      // An index that cannot be made readable stops the question here: counting
+      // the declared packages against a feed nobody could fetch would report
+      // "0/n in the feeds" for a host whose feeds were merely unreachable.
+      package_manager.update_index()?;
       // An empty entry is not a package anybody could look up, so it counts on
       // neither side of the fraction.
       let named: Vec<&String> = declared.iter().filter(|dep| !dep.is_empty()).collect();
       let total = named.len();
-      let available = named
-        .iter()
-        .filter(|dep| app.package_manager().is_ok_and(|manager| manager.package_exists(dep)))
-        .count();
+      let mut available = 0;
+      for dep in &named {
+        if package_manager.package_exists(dep)? {
+          available += 1;
+        }
+      }
 
       // Nothing the artifact declares is in the feeds, so the containers are the
       // only way to satisfy it.

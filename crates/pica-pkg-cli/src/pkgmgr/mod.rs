@@ -1,6 +1,7 @@
 use crate::app::CliResult;
 
 pub mod apk;
+pub(crate) mod index;
 pub mod opkg;
 
 pub use apk::ApkBackend;
@@ -83,8 +84,22 @@ impl PackageManagerKind {
 
 pub trait PackageManager {
   fn kind(&self) -> PackageManagerKind;
-  fn update_index(&self);
-  fn package_exists(&self, name: &str) -> bool;
+
+  /// Makes the dependency index of this host's configured feeds readable,
+  /// fetching it only when it is not already there.
+  ///
+  /// `Err` when a configured feed has no index and the backend's own refresh
+  /// did not produce one. That is the state in which every "which packages
+  /// exist" question has no answer, so callers that would otherwise read the
+  /// backend's silence as "not available" must stop instead.
+  fn update_index(&self) -> CliResult<()>;
+
+  /// Whether `name` is a package of one of this host's configured feeds.
+  ///
+  /// `Ok(false)` is the answer "the feeds do not have it". `Err` is the answer
+  /// "the feeds cannot be read", which no caller may treat as the first: a
+  /// backend whose index was never fetched reports every package as missing.
+  fn package_exists(&self, name: &str) -> CliResult<bool>;
   fn is_installed(&self, name: &str) -> bool;
   fn installed_version(&self, name: &str) -> Option<String>;
   /// Installs `targets` — package names, or the paths of local package files —

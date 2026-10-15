@@ -12,6 +12,7 @@ pub const E_IO: &str = "E_IO";
 pub const E_JSON_INVALID: &str = "E_JSON_INVALID";
 pub const E_DB_INVALID: &str = "E_DB_INVALID";
 pub const E_INDEX_INVALID: &str = "E_INDEX_INVALID";
+pub const E_INDEX_UNAVAILABLE: &str = "E_INDEX_UNAVAILABLE";
 pub const E_CONFIG_INVALID: &str = "E_CONFIG_INVALID";
 pub const E_POLICY_INVALID: &str = "E_POLICY_INVALID";
 pub const E_REPO_INVALID: &str = "E_REPO_INVALID";
