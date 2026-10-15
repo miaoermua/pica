@@ -1,4 +1,6 @@
-use super::feed::{install_via_feeds_or_pkgs, pkg_list_diff_added, reorder_app_list};
+use super::feed::{
+  DependencySource, dependency_source, install_pkgs_dir, pkg_list_diff_added, reorder_app_list,
+};
 use super::precheck::{build_precheck_report, summarize_missing_precheck, validate_package};
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
@@ -442,7 +444,10 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
 /// it has none.
 ///
 /// A system backend is asked to install the app/base/kmod lists — from its feeds
-/// when the policy says so, from the containers in the artifact otherwise.
+/// when the policy says so, from the containers in the artifact otherwise. Which
+/// of the two is decided once, before either phase runs: see
+/// [`dependency_source`]. The two phases are then either two feed requests, in
+/// `base`-then-`app` order, or one request holding the whole container batch.
 ///
 /// The `pica` backend has no feeds and no solver, so it is given no dependency
 /// work at all: `pica-pack` expanded any container into `root/` at build time,
@@ -471,20 +476,43 @@ fn install_dependency_containers(
     return Ok(());
   }
 
+  // kmods are always resolved through the feeds: an OpenWrt kernel module is not
+  // something an application artifact can carry (see `build_precheck_report`).
+  // One request for the missing ones, so the backend sees the set at once.
   let package_manager = app.package_manager()?;
-  for dep in &precheck.kmod_list {
-    if !package_manager.is_installed(dep) {
-      package_manager.install("kmod", dep)?;
+  let missing_kmods: Vec<String> =
+    precheck.kmod_list.iter().filter(|dep| !package_manager.is_installed(dep)).cloned().collect();
+  package_manager.install("kmod", &missing_kmods)?;
+
+  // `base` and `app` are one decision, taken before either is installed. Two
+  // decisions — one per phase, both looking at the same `pkgs/` — is what let the
+  // same container batch be handed to the backend twice.
+  let declared: Vec<String> =
+    precheck.base_list.iter().chain(&precheck.app_list).cloned().collect();
+  let source = dependency_source(app, &declared, pkgs_dir.is_dir())?;
+  let Some(source) = source else {
+    return Ok(());
+  };
+
+  match source {
+    // Feeds are installed in phases, base first: a base dependency has to be on
+    // the device before the app asks its own resolver for anything. Each phase is
+    // one request, so a name in a phase can depend on a sibling of the same phase.
+    DependencySource::Feeds => {
+      let package_manager = app.package_manager()?;
+      package_manager.install("base", &precheck.base_list)?;
+      let snap_before_app = package_manager.snapshot_installed();
+      package_manager.install("app", &precheck.app_list)?;
+      let snap_after_app = app.package_manager()?.snapshot_installed();
+      tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
     }
+    // The artifact's containers are one batch, installed once. Nothing in the
+    // artifact says which container serves `base` and which serves `app`, and the
+    // containers of one application depend on each other, so the batch is left
+    // whole: a split would be a guess, and a guess that separates two dependent
+    // containers fails the install outright.
+    DependencySource::Containers => install_pkgs_dir(app, "packaged", &pkgs_dir)?,
   }
-
-  let has_pkgs_dir = pkgs_dir.is_dir();
-  install_via_feeds_or_pkgs(app, "base", &precheck.base_list, &pkgs_dir, has_pkgs_dir)?;
-
-  let snap_before_app = app.package_manager()?.snapshot_installed();
-  install_via_feeds_or_pkgs(app, "app", &precheck.app_list, &pkgs_dir, true)?;
-  let snap_after_app = app.package_manager()?.snapshot_installed();
-  tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
 
   Ok(())
 }
@@ -725,7 +753,10 @@ struct InstallTransaction {
   tx_before: Option<Vec<String>>,
   /// Packages step 5 added, diffed against `tx_before` once it returned.
   tx_added: Vec<String>,
-  /// The part of `tx_added` that came from the `app` list.
+  /// The part of `tx_added` that came from the `app` stage, which is the `app`
+  /// list when the dependencies came from feeds. A container batch is installed
+  /// as one request covering `base` and `app` at once, so it appears in
+  /// `tx_added` only.
   app_added: Vec<String>,
   /// Containers Pica unpacked itself, by package name.
   pkgs: Vec<String>,

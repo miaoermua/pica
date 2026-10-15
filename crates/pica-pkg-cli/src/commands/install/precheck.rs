@@ -117,10 +117,39 @@ pub(super) fn summarize_missing_precheck(precheck: &Value) -> Vec<String> {
   missing
 }
 
-/// A package is empty when it declares no dependency group either, since then
-/// installing it would change nothing on disk.
+/// Whether installing this package would change anything on disk.
+///
+/// `root/` and `scripts/` are payload by being there: `root/` is laid down file
+/// by file and a hook runs. `pkgs/` is not — an empty one installs nothing — so
+/// it counts only when it holds a file, which is the same view
+/// `install_pkgs_dir` takes. The difference matters because an artifact whose
+/// only payload is an empty `pkgs/` used to pass validation and then fail in the
+/// middle of the install with "no packages found in packaged dir".
 fn has_payload(tmpdir: &Path) -> bool {
-  ["root", "scripts", "pkgs"].iter().any(|name| tmpdir.join(name).is_dir())
+  ["root", "scripts"].iter().any(|name| tmpdir.join(name).is_dir())
+    || dir_has_file(&tmpdir.join("pkgs"), 0)
+}
+
+/// True when `dir` holds a file, at any depth.
+///
+/// The packer flattens containers into `pkgs/` — one level is what an artifact
+/// has — but a nested layout is still a payload, so the search descends. The
+/// depth limit is for the archive that points a directory symlink at one of its
+/// ancestors: without it the recursion would follow the cycle forever.
+fn dir_has_file(dir: &Path, depth: usize) -> bool {
+  /// Levels below `pkgs/` that are still considered payload.
+  const MAX_DEPTH: usize = 8;
+
+  if depth > MAX_DEPTH {
+    return false;
+  }
+  let Ok(entries) = fs::read_dir(dir) else {
+    return false;
+  };
+  entries.flatten().any(|entry| {
+    let path = entry.path();
+    if path.is_dir() { dir_has_file(&path, depth + 1) } else { path.is_file() }
+  })
 }
 
 /// Gates a package's declared `arch` against what this host can say about
@@ -218,7 +247,7 @@ pub(super) fn validate_package(
   if !has_payload(tmpdir) {
     return Err(CliError::new(
       E_PACKAGE_INVALID,
-      "package would be empty: it ships none of root/, scripts/ or pkgs/",
+      "package would be empty: it ships no root/ or scripts/, and its pkgs/ holds no packages",
     ));
   }
 

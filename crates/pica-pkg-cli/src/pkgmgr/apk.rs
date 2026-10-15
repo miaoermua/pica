@@ -1,4 +1,4 @@
-use super::{PackageManager, PackageManagerKind};
+use super::{PackageManager, PackageManagerKind, describe_targets};
 use crate::app::{CliError, CliResult, E_NO_SPACE, E_RUNTIME};
 use crate::system::{has_command, stderr_or_stdout};
 use std::path::Path;
@@ -63,26 +63,30 @@ impl PackageManager for ApkBackend {
     parse_package_version(&String::from_utf8_lossy(&output.stdout), name)
   }
 
-  fn install(&self, label: &str, target: &str) -> CliResult<()> {
-    let local = is_local_apk_path(target);
+  fn install(&self, label: &str, targets: &[String]) -> CliResult<()> {
+    let Some(first) = targets.first() else {
+      return Ok(());
+    };
+    let local = is_local_apk_path(first);
     let forced = local
       && self.force_non_repository
       && accepts_force_non_repository(installed_apk_version().as_deref());
 
-    let output = install_command(target, forced)?
+    let output = install_command(targets, forced)?
       .output()
       .map_err(|err| CliError::new("E_APK_INSTALL", format!("apk add failed: {err}")))?;
     if output.status.success() {
       return Ok(());
     }
-    let mut detail = stderr_or_stdout(&output.stdout, &output.stderr);
     // apk's own wording for the two ways a local file is turned down is not
     // something to guess at, so the message says what pica did instead: which
     // knob to move, and which way it is currently set.
+    let target = describe_targets(targets);
+    let mut detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if local && !forced {
       detail.push_str(
-        "; this local apk was installed without --force-non-repository, which apk 3.x requires for a \
-         package that no repository provides (set \"apk_force_non_repository\": true in pica.json)",
+        "; a local apk needs --force-non-repository on apk 3.x for a package no repository provides, \
+         and this request ran without it (set \"apk_force_non_repository\": true in pica.json)",
       );
     }
     if forced && detail.to_ascii_lowercase().contains("force-non-repository") {
@@ -165,19 +169,36 @@ impl PackageManager for ApkBackend {
   }
 }
 
-/// The `apk add` for `target`, with `force_non_repository` saying whether a
-/// local file may be installed without a repository vouching for it.
+/// The `apk add` for `targets`, with `force_non_repository` saying whether local
+/// files may be installed without a repository vouching for them.
 ///
-/// A local file and a package name are two different requests and are built
-/// apart here: the file flags apply to a path pica extracted from its own
-/// archive, while a name is left to apk's own repositories and their signatures.
-fn install_command(target: &str, force_non_repository: bool) -> CliResult<Command> {
+/// Local files and package names are two different requests and are built apart
+/// here: the file flags apply to paths pica extracted from its own archive,
+/// while a name is left to apk's own repositories and their signatures.
+///
+/// One command carries the whole request, which is what lets apk resolve a
+/// dependency between two of the files it is given. apk sees every package of a
+/// single `add` as one transaction; a file installed on its own can only be
+/// satisfied from the repositories.
+fn install_command(targets: &[String], force_non_repository: bool) -> CliResult<Command> {
   let mut command = Command::new("apk");
   command.arg("add");
-  if is_local_apk_path(target) {
-    let path = Path::new(target)
-      .canonicalize()
-      .map_err(|err| CliError::new("E_PACKAGE_INVALID", format!("invalid local apk: {err}")))?;
+  let Some(first) = targets.first() else {
+    return Ok(command);
+  };
+
+  // Local files and repository names are two different requests. A file carries
+  // flags a name must not be given, so a request holding both has no single
+  // meaning and is refused rather than guessed at.
+  let local = is_local_apk_path(first);
+  if targets.iter().any(|target| is_local_apk_path(target) != local) {
+    return Err(CliError::new(
+      "E_PACKAGE_INVALID",
+      "one apk request cannot mix local apk files with package names",
+    ));
+  }
+
+  if local {
     // `--allow-untrusted` waives apk's signature check, which is what an apk
     // extracted from a Pica archive needs: it was signed by whoever built it,
     // not by a key this router holds. What stands in its place is Pica's own
@@ -193,17 +214,26 @@ fn install_command(target: &str, force_non_repository: bool) -> CliResult<Comman
     if force_non_repository {
       command.arg("--force-non-repository");
     }
-    command.arg("--").arg(path);
-  } else {
-    if !valid_package_name(target)
-      || Path::new(target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
-    {
-      return Err(CliError::new(
-        "E_PACKAGE_INVALID",
-        "expected a package name or an existing local apk file",
-      ));
+    command.arg("--");
+    for target in targets {
+      let path = Path::new(target)
+        .canonicalize()
+        .map_err(|err| CliError::new("E_PACKAGE_INVALID", format!("invalid local apk: {err}")))?;
+      command.arg(path);
     }
-    command.arg("--").arg(target);
+  } else {
+    for target in targets {
+      if !valid_package_name(target)
+        || Path::new(target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
+      {
+        return Err(CliError::new(
+          "E_PACKAGE_INVALID",
+          "expected a package name or an existing local apk file",
+        ));
+      }
+    }
+    command.arg("--");
+    command.args(targets);
   }
   Ok(command)
 }
@@ -326,8 +356,9 @@ mod tests {
   }
 
   /// The argument list `install_command` would run, as text.
-  fn args(target: &str, force_non_repository: bool) -> Vec<String> {
-    install_command(target, force_non_repository)
+  fn args(targets: &[&str], force_non_repository: bool) -> Vec<String> {
+    let targets: Vec<String> = targets.iter().map(ToString::to_string).collect();
+    install_command(&targets, force_non_repository)
       .expect("command")
       .get_args()
       .map(|arg| arg.to_string_lossy().into_owned())
@@ -342,7 +373,7 @@ mod tests {
     let canonical_apk = apk.canonicalize().expect("canonical apk").to_string_lossy().into_owned();
 
     assert_eq!(
-      args(&apk.to_string_lossy(), true),
+      args(&[&apk.to_string_lossy()], true),
       vec![
         "add".to_string(),
         "--allow-untrusted".to_string(),
@@ -353,15 +384,63 @@ mod tests {
       "a local file carries the flags that make apk 3.x accept one"
     );
     assert_eq!(
-      args(&apk.to_string_lossy(), false),
+      args(&[&apk.to_string_lossy()], false),
       vec!["add".to_string(), "--allow-untrusted".to_string(), "--".to_string(), canonical_apk]
     );
     assert_eq!(
-      args("luci-app-demo", true),
+      args(&["luci-app-demo"], true),
       vec!["add", "--", "luci-app-demo"],
       "a repository package is left to apk and its signatures: neither local flag applies to a name"
     );
-    assert!(install_command("missing.apk", true).is_err());
+    assert!(install_command(&["missing.apk".to_string()], true).is_err());
+    assert!(install_command(&["a/b.apk".to_string()], true).is_err());
+  }
+
+  #[test]
+  fn one_apk_add_carries_a_whole_set_of_local_files() {
+    // The containers of one application are installed in one request, so a file
+    // that depends on a sibling can be resolved: apk only sees the two as one
+    // transaction when they arrive together.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mut files = Vec::new();
+    for name in ["aaa-app.apk", "zzz-core.apk"] {
+      let path = dir.path().join(name);
+      std::fs::write(&path, b"apk").expect("write apk");
+      files.push(path.canonicalize().expect("canonical apk").to_string_lossy().into_owned());
+    }
+    let targets: Vec<&str> = files.iter().map(String::as_str).collect();
+
+    assert_eq!(
+      args(&targets, true),
+      vec![
+        "add".to_string(),
+        "--allow-untrusted".to_string(),
+        "--force-non-repository".to_string(),
+        "--".to_string(),
+        files[0].clone(),
+        files[1].clone()
+      ],
+      "both files, in the order the caller gave, after the one `--`"
+    );
+
+    // A repository request keeps the same shape, and keeps its names.
+    assert_eq!(args(&["aaa-app", "luci-base"], true), vec!["add", "--", "aaa-app", "luci-base"]);
+  }
+
+  #[test]
+  fn a_local_file_and_a_package_name_are_not_one_request() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let apk = dir.path().join("demo.apk");
+    std::fs::write(&apk, b"apk").expect("write apk");
+    let mixed = vec![apk.to_string_lossy().into_owned(), "luci-app-demo".to_string()];
+
+    let err = install_command(&mixed, true).expect_err("a mixed request has no single meaning");
+    assert!(err.message.contains("package name"), "{}", err.message);
+
+    // The same the other way round: a name first, a file after it.
+    let reversed = vec!["luci-app-demo".to_string(), mixed[0].clone()];
+    let err = install_command(&reversed, true).expect_err("a mixed request has no single meaning");
+    assert!(err.message.contains("package name"), "{}", err.message);
   }
 
   #[test]

@@ -1,4 +1,4 @@
-use super::{PackageManager, PackageManagerKind};
+use super::{PackageManager, PackageManagerKind, describe_targets};
 use crate::app::{CliError, CliResult, E_NO_SPACE, E_OPKG_INSTALL, E_OPKG_REMOVE};
 use crate::system::{has_command, run_command_capture_output, stderr_or_stdout};
 use std::fs;
@@ -67,16 +67,25 @@ impl PackageManager for OpkgBackend {
       .find_map(|line| line.trim().strip_prefix("Version: ").map(str::trim).map(str::to_string))
   }
 
-  fn install(&self, label: &str, target: &str) -> CliResult<()> {
+  fn install(&self, label: &str, targets: &[String]) -> CliResult<()> {
+    // One `opkg install` for the whole request: opkg reads the local files in a
+    // single run as one dependency graph, so a container that depends on a
+    // sibling in the same request is satisfied by that sibling. Installing a
+    // local file on its own leaves opkg with nothing but the repositories to
+    // resolve against.
+    if targets.is_empty() {
+      return Ok(());
+    }
     Self::update_ignore();
     let output = Command::new("opkg")
       .arg("install")
-      .arg(target)
+      .args(targets)
       .output()
       .map_err(|err| CliError::new(E_OPKG_INSTALL, format!("opkg install failed: {err}")))?;
     if output.status.success() {
       return Ok(());
     }
+    let target = describe_targets(targets);
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if detail.to_ascii_lowercase().contains("no space left on device") {
       return Err(CliError::new(

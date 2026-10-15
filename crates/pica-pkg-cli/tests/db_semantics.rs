@@ -259,10 +259,54 @@ impl Sandbox {
     out
   }
 
-  /// An `apk` artifact carrying one local container. `stage_packages` flattens
-  /// `pkgs/<backend>/` into the archive's `pkgs/`, so the file sits directly
-  /// there, which is also where `install_pkgs_dir` looks for it.
+  /// An artifact whose payload is the `pkgs/` batch `containers` names.
+  ///
+  /// `stage_packages` flattens `pkgs/<backend>/` into the archive's `pkgs/`, so
+  /// the files sit directly there — which is also where `install_pkgs_dir` looks
+  /// for them. `extra` is appended to the manifest and is where dependency
+  /// declarations (`base = ...`, `app = ...`) go.
+  fn container_artifact(
+    &self,
+    pkgname: &str,
+    backend: &str,
+    extra: &str,
+    containers: &[&str],
+  ) -> PathBuf {
+    let src = self.dir.path().join(format!("src-{pkgname}"));
+    fs::create_dir_all(src.join("pkgs")).expect("create pkgdir");
+    fs::write(
+      src.join("manifest"),
+      format!(
+        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = {backend}\nplatform = all\nos = all\narch = all\n{extra}"
+      ),
+    )
+    .expect("write manifest");
+    for container in containers {
+      fs::write(src.join("pkgs").join(container), b"container payload").expect("write container");
+    }
+
+    let out = self.dir.path().join(format!("{pkgname}.pkg.tar.gz"));
+    let status = std::process::Command::new("tar")
+      .arg("-czf")
+      .arg(&out)
+      .args(["-C"])
+      .arg(&src)
+      .args(["manifest", "pkgs"])
+      .status()
+      .expect("run tar");
+    assert!(status.success(), "tar failed to build {pkgname}");
+    out
+  }
+
+  /// An `apk` artifact carrying one local container.
   fn apk_artifact(&self, pkgname: &str) -> PathBuf {
+    let container = format!("{pkgname}.apk");
+    self.container_artifact(pkgname, "apk", "", &[&container])
+  }
+
+  /// An `apk` artifact whose `pkgs/` is present and holds nothing: an archive
+  /// that would install no package at all.
+  fn artifact_with_empty_pkgs(&self, pkgname: &str) -> PathBuf {
     let src = self.dir.path().join(format!("src-{pkgname}"));
     fs::create_dir_all(src.join("pkgs")).expect("create pkgdir");
     fs::write(
@@ -272,8 +316,6 @@ impl Sandbox {
       ),
     )
     .expect("write manifest");
-    fs::write(src.join("pkgs").join(format!("{pkgname}.apk")), b"apk payload")
-      .expect("write container");
 
     let out = self.dir.path().join(format!("{pkgname}.pkg.tar.gz"));
     let status = std::process::Command::new("tar")
@@ -527,6 +569,154 @@ fn a_non_boolean_apk_setting_is_refused() {
     .run(&["-U", artifact])
     .failure()
     .stderr(contains("apk_force_non_repository").and(contains("expected true or false")));
+
+  assert_eq!(sandbox.calls(), "", "nothing may be installed");
+}
+
+// -- One batch per artifact ---------------------------------------------------
+//
+// `pkgs/` is a set of containers owned by the artifact, not a per-phase
+// resource. The containers of one application depend on each other, and a
+// backend only resolves such a dependency among the files of one request, so the
+// batch has to reach it in a single call — and reach it once.
+
+/// Every `apk add` recorded, as the target list each one ended with.
+fn apk_add_targets(calls: &str) -> Vec<Vec<String>> {
+  calls
+    .lines()
+    .filter(|line| line.starts_with("apk add "))
+    .map(|line| {
+      line
+        .split_once(" -- ")
+        .map(|(_, targets)| targets.split_whitespace().map(ToString::to_string).collect())
+        .unwrap_or_default()
+    })
+    .collect()
+}
+
+/// Every `opkg install` recorded, as the arguments after the sub-command.
+fn opkg_install_args(calls: &str) -> Vec<Vec<String>> {
+  calls
+    .lines()
+    .filter_map(|line| line.strip_prefix("opkg install "))
+    .map(|args| args.split_whitespace().map(ToString::to_string).collect())
+    .collect()
+}
+
+/// What a target list installed, as bare file names.
+fn file_names(targets: &[String]) -> Vec<String> {
+  targets.iter().map(|target| target.rsplit('/').next().unwrap_or(target).to_string()).collect()
+}
+
+#[test]
+fn the_container_batch_reaches_apk_in_one_call() {
+  // `aaa-app` depends on `zzz-core`, and the declared order is not the
+  // alphabetical one. Handing them over separately would leave apk looking up the
+  // dependency in its repositories, where a container that only this artifact
+  // ships is not to be found.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact =
+    sandbox.container_artifact("batch-apk", "apk", "", &["aaa-app.apk", "zzz-core.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds.len(), 1, "one request for the whole batch, at any policy: {calls}");
+  assert_eq!(
+    file_names(&adds[0]),
+    vec!["aaa-app.apk".to_string(), "zzz-core.apk".to_string()],
+    "both containers, together: {calls}"
+  );
+
+  let add = calls.lines().find(|line| line.starts_with("apk add ")).expect("apk add ran");
+  assert_eq!(add.matches(" -- ").count(), 1, "one separator for the whole list: {add}");
+  assert!(add.contains("--force-non-repository"), "{add}");
+}
+
+#[test]
+fn a_second_phase_does_not_reinstall_the_batch() {
+  // Both the `base` and the `app` phase used to look at the same `pkgs/` and each
+  // decide for itself to hand it over, so the batch was installed twice. The
+  // decision is now taken once for the artifact; a phase cannot disagree with it.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.container_artifact(
+    "batch-apk",
+    "apk",
+    "base = base-dep\napp = app-dep\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "packaged-first"]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds.len(), 1, "the batch is one request, and it happens once: {calls}");
+  assert_eq!(file_names(&adds[0]), vec!["demo-app.apk".to_string()], "{calls}");
+  let installed: Vec<String> = adds.iter().flatten().cloned().collect();
+  assert!(
+    !installed.iter().any(|target| target.contains("base-dep") || target.contains("app-dep")),
+    "`packaged-first` takes the containers: the declared names are not installed as well: {calls}"
+  );
+}
+
+#[test]
+fn feeds_answered_in_phases_leave_the_containers_alone() {
+  // The other side of the same decision: when the policy takes the feeds, the
+  // declared names are installed — base before app — and the containers are never
+  // unpacked.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.container_artifact(
+    "batch-apk",
+    "apk",
+    "base = base-dep\napp = app-dep\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds.len(), 2, "one request per phase: {calls}");
+  assert_eq!(adds[0], vec!["base-dep".to_string()], "base goes first: {calls}");
+  assert_eq!(adds[1], vec!["app-dep".to_string()], "then app: {calls}");
+  assert!(!calls.contains("demo-app.apk"), "the batch stays unused: {calls}");
+}
+
+#[test]
+fn opkg_is_given_the_whole_batch_too() {
+  // The same rule under the other system backend: one `opkg install` for the
+  // files, so its own solver sees them as one set.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact =
+    sandbox.container_artifact("batch-opkg", "opkg", "", &["aaa-app.ipk", "zzz-core.ipk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--pkgmgr", "opkg"]).success();
+
+  let calls = sandbox.calls();
+  let installs = opkg_install_args(&calls);
+  assert_eq!(installs.len(), 1, "one request for the whole batch: {calls}");
+  assert_eq!(
+    file_names(&installs[0]),
+    vec!["aaa-app.ipk".to_string(), "zzz-core.ipk".to_string()],
+    "{calls}"
+  );
+}
+
+#[test]
+fn a_pkgs_dir_with_no_packages_is_refused_before_anything_is_installed() {
+  // An empty `pkgs/` installs nothing, so the artifact is empty rather than
+  // merely surprising. Refusing it here keeps the failure at validation instead
+  // of in the middle of the install.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.artifact_with_empty_pkgs("no-containers");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact]).failure().stderr(contains("would be empty"));
 
   assert_eq!(sandbox.calls(), "", "nothing may be installed");
 }

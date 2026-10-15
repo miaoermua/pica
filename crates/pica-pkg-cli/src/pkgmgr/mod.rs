@@ -87,7 +87,18 @@ pub trait PackageManager {
   fn package_exists(&self, name: &str) -> bool;
   fn is_installed(&self, name: &str) -> bool;
   fn installed_version(&self, name: &str) -> Option<String>;
-  fn install(&self, label: &str, target: &str) -> CliResult<()>;
+  /// Installs `targets` — package names, or the paths of local package files —
+  /// in one call to the backend.
+  ///
+  /// `label` names the group of the request for messages ("base", "app",
+  /// "kmod", "packaged"). One call carries however many targets the request
+  /// has, because a request can be the whole set of containers an artifact
+  /// ships: the containers of one application depend on each other, and a
+  /// backend can only satisfy such a dependency from packages that arrive in
+  /// the same request. Installing them one at a time puts the order — some
+  /// order pica chose, alphabetical or otherwise — in charge of resolution,
+  /// and no order pica can pick is a topological one.
+  fn install(&self, label: &str, targets: &[String]) -> CliResult<()>;
   fn remove(&self, target: &str) -> CliResult<()>;
   fn architectures(&self) -> Vec<String>;
 
@@ -105,6 +116,27 @@ pub trait PackageManager {
     packages.sort();
     packages.dedup();
     packages
+  }
+}
+
+/// How a set of install targets reads in a message: the target itself when the
+/// request held one, and a bounded list when the backend was handed a whole set.
+pub(crate) fn describe_targets(targets: &[String]) -> String {
+  /// Targets listed before the message switches to a count.
+  const SHOWN: usize = 3;
+
+  match targets {
+    [] => "nothing".to_string(),
+    [one] => one.clone(),
+    many => {
+      let shown: Vec<&str> = many.iter().take(SHOWN).map(String::as_str).collect();
+      let rest = many.len() - shown.len();
+      if rest == 0 {
+        format!("{} packages ({})", many.len(), shown.join(", "))
+      } else {
+        format!("{} packages ({}, and {rest} more)", many.len(), shown.join(", "))
+      }
+    }
   }
 }
 

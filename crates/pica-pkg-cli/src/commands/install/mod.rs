@@ -110,9 +110,9 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  for pkg in &to_install {
-    package_manager.install(package_manager.kind().as_str(), pkg)?;
-  }
+  // The candidates that were found are one request: an app and its i18n pack
+  // are installed together, so the backend resolves them in one transaction.
+  package_manager.install(package_manager.kind().as_str(), &to_install)?;
   let mut base_ver = package_manager.installed_version(&appname).unwrap_or_default();
   if base_ver.is_empty() {
     if let Some(first_pkg) = to_install.first() {
