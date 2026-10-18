@@ -181,11 +181,21 @@ fn normalize_operators(input: &str) -> String {
   out
 }
 
+/// Whether `name` is spellable as an opkg/apk package name.
+///
+/// The name is what a backend is later asked to install, so it has to look like
+/// one: `[A-Za-z0-9._+-]`. Without this check `libfoo!=1.2` would parse as a
+/// package called `libfoo!` and only fail at the precheck, as "missing
+/// dependency libfoo!" — a message pointing at the wrong problem.
+fn is_valid_name(name: &str) -> bool {
+  name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-'))
+}
+
 fn require_name(name: &str, raw: &str) -> PicaResult<()> {
   if name.is_empty() {
     return Err(PicaError::msg(format!("missing package name in dependency: {raw}")));
   }
-  if name.chars().any(char::is_whitespace) {
+  if !is_valid_name(name) {
     return Err(PicaError::msg(format!("invalid package name in dependency: {raw}")));
   }
   Ok(())
@@ -250,6 +260,15 @@ mod tests {
   }
 
   #[test]
+  fn the_whitelist_keeps_real_package_names() {
+    // `.` `_` `+` `-` are all part of opkg/apk names; a whitelist that dropped
+    // them would refuse packages that exist (`libstdc++`, `python3.11`).
+    for raw in ["libstdc++", "python3.11>=1.0", "ca-certificates_2023", "kmod-nf_tables"] {
+      assert!(Constraint::parse(raw).is_ok(), "{raw} must parse");
+    }
+  }
+
+  #[test]
   fn invalid_declarations_are_refused() {
     for raw in [
       "",
@@ -262,6 +281,10 @@ mod tests {
       "libfoo>1.2<2.0",
       "libfoo>=1.2 beta",
       "lib foo>=1.2",
+      // `!` and `$` are not package-name characters. Left to the precheck,
+      // `libfoo!=1.2` would be reported as a missing package named `libfoo!`.
+      "libfoo!=1.2",
+      "libfoo$>=1.2",
     ] {
       assert!(Constraint::parse(raw).is_err(), "{raw:?} must be refused");
     }
@@ -306,6 +329,11 @@ mod tests {
     assert!(!parsed("libfoo<=1.2").is_met_by("1.2-1"));
     assert!(parsed("libfoo>1.2-1").is_met_by("1.2-2"));
     assert!(!parsed("libfoo>1.2-1").is_met_by("1.2-1"));
+
+    // Alpine's `-rN` is a rel like any other: `>` must not call an installed
+    // `-r1` too old for `>1.2`, and `>=1.2-r2` must not accept `1.2-r1`.
+    assert!(parsed("libfoo>1.2").is_met_by("1.2-r1"));
+    assert!(!parsed("libfoo>=1.2-r2").is_met_by("1.2-r1"));
   }
 
   #[test]

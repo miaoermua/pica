@@ -24,7 +24,7 @@ pub fn pkgver_cmp(a: &str, b: &str) -> Ordering {
     compare_mixed_version(&a_ver, &b_ver)
   };
 
-  if order == Ordering::Equal { compare_numeric_rel(&a_rel, &b_rel) } else { order }
+  if order == Ordering::Equal { compare_rel(&a_rel, &b_rel) } else { order }
 }
 
 #[must_use]
@@ -119,15 +119,49 @@ fn split_pkgver_rel(input: &str) -> (String, String) {
   if let Some((ver, rel)) = input.rsplit_once('-') {
     (ver.to_string(), rel.to_string())
   } else {
-    (input.to_string(), "0".to_string())
+    (input.to_string(), String::new())
   }
 }
 
-fn compare_numeric_rel(a: &str, b: &str) -> Ordering {
-  match (a.parse::<u64>(), b.parse::<u64>()) {
-    (Ok(a_num), Ok(b_num)) => a_num.cmp(&b_num),
-    _ => Ordering::Equal,
+/// Compares pkgrel segments with the same tokenizer pkgver uses.
+///
+/// A rel is not necessarily a bare number: opkg writes `1.2.3-1`, Alpine writes
+/// `1.2.3-r1`, and either can reach pica from a manifest bound or from a feed
+/// listing. So the rel is tokenized and compared pairwise — digits by value,
+/// letters by name, a digit token beating a letter token at the same position.
+/// When one side runs out of tokens first, the longer one is newer, because any
+/// rel outranks no rel at all.
+///
+/// A missing rel, `-0` and `-r0` are the same version: opkg and apk both default
+/// the revision to zero, so `1.2.3`, `1.2.3-0` and `1.2.3-r0` must stay equal —
+/// otherwise `<=1.2.3` would refuse an installed `1.2.3-r0`.
+fn compare_rel(a: &str, b: &str) -> Ordering {
+  let a = if is_revision_zero(a) { "" } else { a };
+  let b = if is_revision_zero(b) { "" } else { b };
+
+  let a_tokens = tokenize_version(a);
+  let b_tokens = tokenize_version(b);
+
+  let len = a_tokens.len().max(b_tokens.len());
+  for index in 0..len {
+    match (a_tokens.get(index), b_tokens.get(index)) {
+      (Some(&left), Some(&right)) => {
+        let ord = compare_token(left, right);
+        if ord != Ordering::Equal {
+          return ord;
+        }
+      }
+      (Some(_), None) => return Ordering::Greater,
+      (None, Some(_)) => return Ordering::Less,
+      (None, None) => break,
+    }
   }
+  Ordering::Equal
+}
+
+/// The three spellings of "no revision": absent, opkg's `-0`, apk's `-r0`.
+fn is_revision_zero(rel: &str) -> bool {
+  rel.is_empty() || rel == "0" || rel == "r0"
 }
 
 fn is_dot_numeric(input: &str) -> bool {
@@ -174,14 +208,35 @@ mod tests {
     assert!(pkgver_ge("1.2.3-2", "1.2.3-1"));
     assert!(pkgver_ge("1.2.4-1", "1.2.3-9"));
     assert!(!pkgver_ge("1.2.3-1", "1.2.3-2"));
+    // `-0` is the default revision, so writing it out changes nothing.
     assert!(pkgver_ge("1.2.3", "1.2.3-0"));
+    assert!(pkgver_ge("1.2.3-0", "1.2.3"));
   }
 
   #[test]
   fn compare_mixed_pkgver_rel() {
     assert!(!pkgver_ge("9.0-1", "10.0-1"));
-    assert!(pkgver_ge("1.0.0-rc10", "1.0.0-rc2"));
-    assert!(pkgver_ge("1.0.0", "1.0.0-rc1"));
+    // `rc10` is strictly newer than `rc2`, not just >=: the rel segments are
+    // compared with tokenize-then-numeric, not lexicographically.
+    assert!(pkgver_gt("1.0.0-rc10", "1.0.0-rc2"));
+    // `rsplit_once('-')` splits `1.0.0-rc1` into pkgver `1.0.0` + rel `rc1`.
+    // Having a rel is newer than having none, so `1.0.0-rc1 > 1.0.0`. This
+    // differs from schemes that treat `-rc` as a pre-release tag inside the
+    // version; pica's split is positional, not semantic.
+    assert!(pkgver_gt("1.0.0-rc1", "1.0.0"));
+  }
+
+  #[test]
+  fn alpine_r_prefix_rel_is_ordered_correctly() {
+    // `-rN` is Alpine's pkgrel syntax. Having a rel is newer than not having
+    // one, and `r2` is newer than `r1`.
+    assert!(pkgver_gt("1.2-r1", "1.2"));
+    assert!(pkgver_gt("1.2-r2", "1.2-r1"));
+    assert!(pkgver_ge("1.2-r2", "1.2-r1"));
+    // `-r0` is the default revision, so it is the same version as no rel at all.
+    assert!(pkgver_ge("1.2", "1.2-r0"));
+    assert!(pkgver_ge("1.2-r0", "1.2"));
+    assert!(pkgver_ge("1.2-r0", "1.2-0"));
   }
 
   #[test]
