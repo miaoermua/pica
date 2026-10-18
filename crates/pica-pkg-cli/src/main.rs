@@ -1,6 +1,7 @@
 mod app;
 mod candidate;
 mod commands;
+mod constraints;
 mod installed;
 mod lock;
 mod pkgmgr;

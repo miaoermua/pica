@@ -4,7 +4,8 @@ use crate::app::{
 use crate::candidate::find_pica_candidates_in_index;
 use crate::installed;
 use crate::state::read_json_file;
-use pica_pkg_core::manifest::get_first as manifest_get_first;
+use pica_pkg_core::constraint::{self, Constraint};
+use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
@@ -191,11 +192,38 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   field("Installed From", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
   field("License", &manifest_get_first(manifest, "license"));
   field("Visibility", &manifest_get_first(manifest, "visibility"));
+  field("Requires", &declared_constraints(manifest, installed::entry_backend(entry).kind.as_str()));
   if let Some(depends) = backend_dependencies(app, entry) {
     field("Depends", &depends);
   }
 
   Ok(())
+}
+
+/// The bounds the manifest declares, as written, one `group:declaration` each.
+///
+/// `Depends` reports what the backend resolved; this reports what the artifact
+/// asked for, bound included, so a bound is shown as it was written rather than
+/// as a comparison pica made up. Names without a bound are left to `Depends`.
+///
+/// Text that cannot be parsed is treated as no declaration at all: `-Qi` is a
+/// read, and refusing to print an installed package over a manifest field would
+/// hide more than it reports.
+fn declared_constraints(manifest: &Value, backend: &str) -> String {
+  let mut declared = Vec::new();
+  for group in crate::constraints::GROUPS {
+    let items = get_array_for(manifest, group, backend);
+    let Ok(constraints) = constraint::parse_all(&items) else {
+      continue;
+    };
+    declared.extend(
+      constraints
+        .into_iter()
+        .filter(Constraint::has_bound)
+        .map(|constraint| format!("{group}:{}", constraint.raw)),
+    );
+  }
+  declared.join(" ")
 }
 
 /// Dependencies the system backend reports for an entry it installed.

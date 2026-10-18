@@ -1,3 +1,4 @@
+pub mod constraint;
 pub mod error;
 pub mod io;
 pub mod manifest;

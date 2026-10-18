@@ -3,7 +3,8 @@ use crate::app::{App, CliResult, ensure_dirs};
 use crate::candidate::find_pica_candidates_in_index;
 use crate::installed;
 use crate::state::read_json_file;
-use pica_pkg_core::manifest::get_first as manifest_get_first;
+use pica_pkg_core::constraint;
+use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
@@ -90,8 +91,55 @@ pub fn all(app: &mut App) -> CliResult<()> {
     updated_any = true;
   }
 
-  if !updated_any {
+  if updated_any {
+    recheck_constraints(app)?;
+  } else {
     app.log_info("All packages are up to date");
+  }
+
+  Ok(())
+}
+
+/// Re-checks every installed package's bounds once the backend is done.
+///
+/// `-Su` hands each version choice to the backend and keeps the result: a
+/// version the backend picked is not pica's to undo, so a broken bound is a
+/// warning, never a downgrade. Saying it here is still worth the query — the
+/// alternative is a mismatch that only surfaces later, at the next `-U`
+/// precheck, as a refusal to install something unrelated to what `-Su` did.
+fn recheck_constraints(app: &mut App) -> CliResult<()> {
+  let db = read_json_file(&app.paths.db_file)?;
+  let Some(entries) = db.get("installed").and_then(Value::as_object) else {
+    return Ok(());
+  };
+
+  for (pkgname, entry) in entries {
+    let backend = installed::entry_backend(entry);
+    if app.options.pkgmgr.is_none() && app.select_package_manager(backend.kind.as_str()).is_err() {
+      // A backend whose command is gone cannot say what is installed. Skipping
+      // the entry keeps the upgrades that did succeed from being reported as a
+      // failed run; the next `-U` that needs this backend says so directly.
+      continue;
+    }
+
+    let manifest = entry.get("manifest").unwrap_or(&Value::Null);
+    for group in crate::constraints::GROUPS {
+      let declarations = get_array_for(manifest, group, backend.kind.as_str());
+      let constraints = match constraint::parse_all(&declarations) {
+        Ok(constraints) => constraints,
+        // Not reachable for an artifact this pica installed (the precheck would
+        // have refused it), but a row written by an older pica may hold any
+        // text. Reporting it beats silently treating it as unconstrained.
+        Err(err) => {
+          app.log_warn(format!("{pkgname}: cannot read {group} constraints: {err}"));
+          continue;
+        }
+      };
+
+      for message in crate::constraints::unmet(app, pkgname, group, &constraints) {
+        app.log_warn(message);
+      }
+    }
   }
 
   Ok(())

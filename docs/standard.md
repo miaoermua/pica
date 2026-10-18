@@ -359,6 +359,8 @@ source = pica
 app = hello
 app_i18n = luci-i18n-hello-{lang}
 base = busybox
+# A bound is checked by pica, never passed to the backend (see below)
+# base = luci-base>=1.2
 # kmod = kmod-tun
 # base@apk = busybox-apk
 
@@ -471,6 +473,27 @@ luci = lua1
 - `type = cli` 表示“该包提供纯命令行程序/脚本”。
 - 仅声明 `type = cli` 时，不需要 `luci = ...`。
 - `source` 用于记录安装来源（例如 `pica` / `opkg` / `local` / `url`），便于升级与排错。默认可不写；安装后 CLI 会在本地数据库里补全 `source`。
+
+### 依赖版本约束（`app` / `base` / `kmod`）
+
+每一项都可以带一个版本约束：
+
+```
+base = luci-base>=1.2
+app  = luci-app-demo>1.0
+kmod = kmod-tun=0.1
+```
+
+支持六种写法：`name`、`name>=ver`、`name<=ver`、`name>ver`、`name<ver`、`name=ver`。比较复用 `pkgver_cmp`，与 opkg/apk 一致地先比 `pkgver` 再比 `pkgrel`，所以 `1.2-1` 高于 `1.2`；写 `=1.2` 要求两段都相等。全角 `≥ ≤ ＞ ＜ ＝` 按对应的 ASCII 运算符处理，其余形状（`>>`、`==`、一个声明里两个运算符、缺名字或缺版本）在解析阶段就报 `E_MANIFEST_INVALID`。
+
+- **约束只用于 pica 侧校验，不传递给后端命令行。** opkg 只按包名或 `.ipk` 路径安装，apk 把 `name>=ver` 当作一个原子；同一个字符串交给两者，必然一边成功一边报错。pica 传给后端的永远是裸包名。
+- **需要精确版本请用 `pkgs/<backend>/` 携带容器**，由后端按路径安装：版本由容器自身决定，pica 不表达、也不校验它。
+- 校验时机：
+  - 安装预检（`-U` / `-S`）：依赖**已安装**且版本不满足时报错（`E_VERSION_INCOMPATIBLE`），消息里同时给出实际版本与要求的约束；依赖**尚未安装**时不阻塞安装，约束写进 `install-report` 供审计。
+  - 安装第 5 步（交给后端）之后：同一组约束再判一次，不满足只 `warning`——容器已经落盘，pica 不撤销后端选定的版本。
+  - 升级（`-Su`）：后端升级完成后复查所有已安装包声明的约束，不满足逐条 `warning`，不自动降级。
+- 约束不会让源里没有的包变成有的：缺失依赖仍走原有的 precheck 报错。
+- `-Qi` 的 `Requires` 字段按原文列出带约束的声明（如 `base:luci-base>=1.2`）；不带约束的包名仍由 `Depends` 汇报。
 
 ## arch（后端架构字段）
 

@@ -1,12 +1,14 @@
 use super::pipeline::{PackageFields, installs_declared_dependencies};
 use crate::app::{
-  App, CliError, CliResult, E_CONFIG_INVALID, E_PACKAGE_INVALID, E_PLATFORM_UNSUPPORTED,
+  App, CliError, CliResult, E_CONFIG_INVALID, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
+  E_PLATFORM_UNSUPPORTED, E_VERSION_INCOMPATIBLE,
 };
 use crate::platform::{
   ArchVerdict, check_arch, detect_luci_variant, detect_os, detect_package_arches, detect_platform,
   normalize_uname,
 };
 use crate::system::run_command_text;
+use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::manifest::Manifest;
 use serde_json::{Value, json};
 use std::fs;
@@ -66,12 +68,71 @@ fn packaged_or_missing(pkgs_dir: &Path, dep: &str) -> String {
   if pkgs_dir_has_pkg(pkgs_dir, dep) { "packaged".to_string() } else { "missing".to_string() }
 }
 
-/// The status of every name in `deps`, in the order they were declared.
-fn dep_entries(app: &App, deps: Vec<String>, pkgs_dir: &Path) -> CliResult<Vec<Value>> {
+/// Parses one dependency list, naming the manifest key in the error.
+pub(super) fn parse_group(items: &[String], field: &str) -> CliResult<Vec<Constraint>> {
+  constraint::parse_all(items)
+    .map_err(|err| CliError::new(E_MANIFEST_INVALID, format!("{field}: {err}")))
+}
+
+/// The parsed dependency declarations of the artifact being installed.
+///
+/// One parse feeds three readers — the precheck, the install-report, and the
+/// step-5 install — so a declaration cannot be accepted by one and refused by
+/// another.
+pub(crate) struct DeclaredDeps {
+  pub(crate) kmod: Vec<Constraint>,
+  pub(crate) base: Vec<Constraint>,
+  pub(crate) app: Vec<Constraint>,
+}
+
+impl DeclaredDeps {
+  /// Parses `kmod`, `base` and `app` for `backend`.
+  ///
+  /// `app_decls` is passed in because the app list is not only the manifest's:
+  /// `app_i18n` adds one name at install time, and the caller is the only place
+  /// that knows whether it applies to this install.
+  pub(crate) fn parse(manifest: &Manifest, backend: &str, app_decls: &[String]) -> CliResult<Self> {
+    Ok(Self {
+      kmod: parse_group(&manifest.get_array_for("kmod", backend), "kmod")?,
+      base: parse_group(&manifest.get_array_for("base", backend), "base")?,
+      app: parse_group(app_decls, "app")?,
+    })
+  }
+}
+
+/// The status of every declaration in `deps`, in the order they were declared.
+///
+/// A bound is enforced here only when the dependency is already installed: that
+/// is the one case where pica knows which version the backend will leave alone.
+/// A dependency that is not installed yet may still arrive at the right version,
+/// so the bound is recorded in the report and checked again after step 5 (see
+/// `pipeline::recheck_constraints`). What is never done is putting the bound on
+/// the backend's command line — the name is all a backend is asked for.
+fn dep_entries(
+  app: &App,
+  requester: &str,
+  group: &str,
+  deps: &[Constraint],
+  pkgs_dir: &Path,
+) -> CliResult<Vec<Value>> {
   let mut entries = Vec::new();
-  for dep in deps.into_iter().filter(|dep| !dep.is_empty()) {
-    let status = precheck_dep_source(app, &dep, pkgs_dir)?;
-    entries.push(json!({"name": dep, "status": status}));
+  for dep in deps {
+    let status = precheck_dep_source(app, &dep.name, pkgs_dir)?;
+    if status == "installed" {
+      let violations = crate::constraints::unmet(app, requester, group, std::slice::from_ref(dep));
+      if let Some(message) = violations.into_iter().next() {
+        return Err(CliError::new(E_VERSION_INCOMPATIBLE, message));
+      }
+    }
+
+    let mut entry = json!({"name": dep.name, "status": status});
+    if dep.has_bound() {
+      // The report is what an install leaves behind for auditing: it records
+      // that the artifact asserted a version, even when the dependency was not
+      // installed yet and the assertion could not be checked.
+      entry["constraint"] = json!(dep.requirement());
+    }
+    entries.push(entry);
   }
   Ok(entries)
 }
@@ -80,16 +141,16 @@ pub(crate) fn build_precheck_report(
   app: &App,
   manifest: &Manifest,
   pkgs_dir: &Path,
-  app_list: &[String],
+  deps: &DeclaredDeps,
 ) -> CliResult<Value> {
-  let backend = app.backend().as_str();
+  let requester = manifest.get_first("pkgname");
 
   // kmods are always resolved through feeds: the OpenWrt kernel module packages
   // cannot be shipped inside an application artifact, so their `pkgs_dir` is
   // empty on purpose.
-  let kmod = dep_entries(app, manifest.get_array_for("kmod", backend), Path::new(""))?;
-  let base = dep_entries(app, manifest.get_array_for("base", backend), pkgs_dir)?;
-  let app = dep_entries(app, app_list.to_vec(), pkgs_dir)?;
+  let kmod = dep_entries(app, &requester, "kmod", &deps.kmod, Path::new(""))?;
+  let base = dep_entries(app, &requester, "base", &deps.base, pkgs_dir)?;
+  let app = dep_entries(app, &requester, "app", &deps.app, pkgs_dir)?;
 
   Ok(json!({
     "kmod": kmod,

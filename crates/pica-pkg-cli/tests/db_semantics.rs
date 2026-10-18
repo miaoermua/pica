@@ -52,6 +52,34 @@ exit 0
 const APK_3: &str = "3.0.0";
 const APK_2: &str = "2.14.4";
 
+/// `APK_STUB` plus the answer a bound check needs.
+///
+/// `installed_version` reads `apk list --installed -- <name>`, which apk-tools
+/// prints as `<name>-<version>`. `@INSTALLED@` is the version the test says is
+/// on the box.
+const APK_STUB_WITH_INSTALLED: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
+  list) printf '%s-@INSTALLED@\n' "$4" ;;
+esac
+exit 0
+"#;
+
+/// The opkg counterpart: both `is_installed` and `installed_version` read
+/// `opkg status <name>`, so the line has to look like a real status block.
+const OPKG_STUB_WITH_INSTALLED: &str = r#"#!/bin/sh
+printf 'opkg %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  status) printf 'Package: %s\nStatus: install user installed\nVersion: @INSTALLED@\n' "$2" ;;
+  info) printf 'Package: %s\nVersion: @INSTALLED@\n' "$2" ;;
+  print-architecture) printf 'all 100\n' ;;
+esac
+exit 0
+"#;
+
 /// A row from the `opkg` era: the backend lived in `source`, `pkgmgr` did not
 /// exist yet, and `pkgfile` held a backend name instead of an artifact path.
 const LEGACY_FEED_ROW: &str = r#"{
@@ -193,6 +221,17 @@ impl Sandbox {
 
   /// The same, with the apk on `PATH` reporting `version`.
   fn with_apk_version(db: &str, version: &str) -> Self {
+    Self::with_stubs(db, OPKG_STUB, &APK_STUB.replace("@VERSION@", version))
+  }
+
+  /// The same, with the two stubs replaced body for body.
+  ///
+  /// A bound can only be judged against an installed version, and the default
+  /// stubs answer nothing about what is installed — the honest answer for a
+  /// package manager whose state no test set up. A test that needs a version
+  /// supplies a body instead of teaching the shared stub a fact every other
+  /// test would then see as well.
+  fn with_stubs(db: &str, opkg_body: &str, apk_body: &str) -> Self {
     let dir = tempfile::tempdir().expect("create temp dir");
     let state = dir.path().join("state");
     fs::create_dir_all(&state).expect("create state dir");
@@ -201,8 +240,8 @@ impl Sandbox {
 
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).expect("create stub dir");
-    stub(&bin.join("opkg"), OPKG_STUB);
-    stub(&bin.join("apk"), &APK_STUB.replace("@VERSION@", version));
+    stub(&bin.join("opkg"), opkg_body);
+    stub(&bin.join("apk"), apk_body);
 
     Self { dir }
   }
@@ -862,4 +901,169 @@ fn the_feeds_are_asked_when_they_are_the_source() {
   let calls = sandbox.calls();
   assert!(calls.contains("apk search --exact feed-app"), "the feed answer decides it: {calls}");
   assert!(calls.contains("apk add -- feed-app"), "and the feeds install it: {calls}");
+}
+
+// -- Dependency bounds ---------------------------------------------------------
+//
+// A bound (`base = libfoo>=1.2`) is an assertion pica checks itself. The one
+// thing it must never become is an argument: opkg installs by name or by `.ipk`
+// path, apk reads a versioned atom, so passing the declaration on makes one
+// backend succeed and the other fail. These tests assert both halves — the
+// judgement, and that the command line holds only the name.
+
+/// A row whose manifest declares bounds, for `-Qi`.
+const BOUNDED_ROW: &str = r#"{
+  "installed": {
+    "bounded-app": {
+      "manifest": {
+        "pkgname": "bounded-app",
+        "appname": "bounded-app",
+        "source": "feed",
+        "pkgmgr": "apk",
+        "base": ["luci-base>=1.2"],
+        "app": ["luci-app-demo>=1.0", "plain-dep"]
+      },
+      "pkgfile": "apk",
+      "files": [],
+      "dirs": [],
+      "installed_at": 4
+    }
+  }
+}"#;
+
+fn apk_stub_installed(version: &str) -> String {
+  APK_STUB_WITH_INSTALLED.replace("@INSTALLED@", version)
+}
+
+fn opkg_stub_installed(version: &str) -> String {
+  OPKG_STUB_WITH_INSTALLED.replace("@INSTALLED@", version)
+}
+
+#[test]
+fn a_satisfied_bound_installs_the_name_and_nothing_else() {
+  // 1.1 installed, `>=1.0` and `>1.0` both hold. The request handed to apk is
+  // the name: this is the regression that keeps the bound on pica's side.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, &apk_stub_installed("1.1"));
+  let artifact = sandbox.container_artifact(
+    "bound-apk",
+    "apk",
+    "base = base-dep>=1.0\napp = app-dep>1.0\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds.len(), 2, "one request per phase: {calls}");
+  assert_eq!(adds[0], vec!["base-dep".to_string()], "the name, not the bound: {calls}");
+  assert_eq!(adds[1], vec!["app-dep".to_string()], "the name, not the bound: {calls}");
+  assert!(!calls.contains('>'), "no bound may reach the backend: {calls}");
+  assert!(!calls.contains('<'), "no bound may reach the backend: {calls}");
+}
+
+#[test]
+fn an_installed_version_that_misses_the_bound_stops_the_install() {
+  // 1.1 installed, `>=2.0` asked for. The message has to carry both numbers:
+  // "does not satisfy" alone leaves the reader with nothing to compare.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, &apk_stub_installed("1.1"));
+  let artifact =
+    sandbox.container_artifact("bound-apk", "apk", "base = base-dep>=2.0\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact, "--feed-policy", "feed-first"])
+    .failure()
+    .stderr(contains("base-dep>=2.0"))
+    .stderr(contains("1.1"));
+
+  assert!(!sandbox.calls().contains("apk add"), "nothing may be installed: {}", sandbox.calls());
+}
+
+#[test]
+fn opkg_is_asked_for_the_name_too() {
+  // The same bound under the other backend, read from `opkg status`. `opkg
+  // install base-dep>=1.0` would be a package called `base-dep>=1.0`.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, &opkg_stub_installed("1.1"), APK_STUB);
+  let artifact =
+    sandbox.container_artifact("bound-opkg", "opkg", "base = base-dep>=1.0\n", &["demo.ipk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["--pkgmgr", "opkg", "-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let calls = sandbox.calls();
+  assert!(calls.contains("opkg install base-dep"), "the name, not the bound: {calls}");
+  assert!(!calls.contains('>'), "no bound may reach the backend: {calls}");
+  assert!(!calls.contains("demo.ipk"), "the feeds were the source: {calls}");
+}
+
+#[test]
+fn a_bound_on_a_dependency_that_is_not_installed_yet_is_recorded_not_enforced() {
+  // The default opkg stub never says "installed", so the precheck has no
+  // version to judge. Refusing here would reject every first install; the report
+  // is where the assertion goes instead, so an audit can still see it.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact =
+    sandbox.container_artifact("bound-opkg", "opkg", "base = base-dep>=1.0\n", &["demo.ipk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["--pkgmgr", "opkg", "-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let report: serde_json::Value = serde_json::from_str(
+    &fs::read_to_string(sandbox.state_dir().join("install-report.json"))
+      .expect("the install writes a report"),
+  )
+  .expect("report is json");
+  let base = &report["reports"]["bound-opkg"]["precheck"]["base"][0];
+  assert_eq!(base["name"], "base-dep");
+  assert_eq!(base["constraint"], ">=1.0", "the bound is kept for auditing: {base}");
+}
+
+#[test]
+fn qi_shows_a_bound_as_it_was_written() {
+  let sandbox = Sandbox::new(BOUNDED_ROW);
+
+  let assert = sandbox.run(&["-Qi", "bounded-app"]).success();
+  let stdout = stdout_of(&assert);
+
+  assert_eq!(field(&stdout, "Requires"), "base:luci-base>=1.2 app:luci-app-demo>=1.0");
+}
+
+/// An opkg that only starts reporting `base-dep` as installed once an install
+/// has run — the shape a first install has, and the reason the precheck cannot
+/// judge the bound yet.
+const OPKG_STUB_AFTER_INSTALL: &str = r#"#!/bin/sh
+printf 'opkg %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  status)
+    if grep -q '^opkg install' "$PICA_STUB_LOG"; then
+      printf 'Package: %s\nStatus: install user installed\nVersion: 1.1\n' "$2"
+    fi
+    ;;
+  info) printf 'Package: %s\nVersion: 1.0.0\n' "$2" ;;
+  print-architecture) printf 'all 100\n' ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn a_bound_the_backend_breaks_while_installing_is_reported_not_undone() {
+  // The precheck hands `base-dep` over as a name because nothing had installed
+  // it yet; opkg then installs 1.1 while the artifact asked for `>=2.0`. The
+  // recheck reports that mismatch — and lets the install stand, because undo
+  // would be pica overruling the backend's version choice.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB_AFTER_INSTALL, APK_STUB);
+  let artifact =
+    sandbox.container_artifact("bound-opkg", "opkg", "base = base-dep>=2.0\n", &["demo.ipk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert =
+    sandbox.run(&["--pkgmgr", "opkg", "-U", artifact, "--feed-policy", "feed-first"]).success();
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+  assert!(
+    stderr.contains("bound-opkg requires base:base-dep>=2.0, but 1.1 is installed"),
+    "the warning names both versions: {stderr}"
+  );
 }

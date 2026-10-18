@@ -1,7 +1,9 @@
 use super::feed::{
   DependencySource, dependency_source, install_pkgs_dir, pkg_list_diff_added, reorder_app_list,
 };
-use super::precheck::{build_precheck_report, summarize_missing_precheck, validate_package};
+use super::precheck::{
+  DeclaredDeps, build_precheck_report, summarize_missing_precheck, validate_package,
+};
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
   E_RUNTIME, E_VERSION_INCOMPATIBLE, ensure_dirs, resolve_lang,
@@ -11,6 +13,7 @@ use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
 use crate::system::{TargetRoot, run_hook, run_tar_extract};
 use pica_pkg_core::PICA_VERSION;
+use pica_pkg_core::constraint;
 use pica_pkg_core::io::make_temp_dir;
 use pica_pkg_core::io::{PayloadInstall, install_payload, remove_payload};
 use pica_pkg_core::manifest::Manifest;
@@ -70,13 +73,13 @@ pub(super) struct ScriptConfig {
 
 /// The outcome of the dependency precheck (step 3).
 ///
-/// It carries the app list as well, because step 5 needs exactly the list that
-/// was just reported, and recomputing it could disagree with the report.
+/// It carries the parsed declarations as well, because step 5 needs exactly the
+/// list that was just reported, and recomputing it could disagree with the
+/// report. The bounds live on in `bound` — but only for the recheck after step
+/// 5: a backend is asked for `constraint::names`, never for the declaration.
 struct DependencyPrecheck {
   report: Value,
-  kmod_list: Vec<String>,
-  base_list: Vec<String>,
-  app_list: Vec<String>,
+  deps: DeclaredDeps,
 }
 
 /// Everything one artifact install needs.
@@ -413,16 +416,13 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   if !installs_declared_dependencies(ctx.pkgmgr) {
     return Ok(DependencyPrecheck {
       report: json!({"kmod": [], "base": [], "app": []}),
-      kmod_list: Vec::new(),
-      base_list: Vec::new(),
-      app_list,
+      deps: DeclaredDeps { kmod: Vec::new(), base: Vec::new(), app: Vec::new() },
     });
   }
 
   app.log_info(format!("Resolving {} dependencies and app list...", ctx.pkgmgr));
 
-  let kmod_list = non_empty(ctx.manifest.get_array_for("kmod", ctx.pkgmgr));
-  let base_list = non_empty(ctx.manifest.get_array_for("base", ctx.pkgmgr));
+  let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &app_list)?;
 
   let package_manager = app.package_manager()?;
   // The report below calls a dependency missing when the backend's index does
@@ -431,7 +431,7 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   // were missing and the install would be refused for them.
   package_manager.update_index()?;
 
-  let report = build_precheck_report(app, ctx.manifest, &ctx.tmpdir.join(PKGS), &app_list)?;
+  let report = build_precheck_report(app, ctx.manifest, &ctx.tmpdir.join(PKGS), &deps)?;
   let missing = summarize_missing_precheck(&report);
   if !missing.is_empty() {
     app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));
@@ -441,7 +441,7 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
     ));
   }
 
-  Ok(DependencyPrecheck { report, kmod_list, base_list, app_list })
+  Ok(DependencyPrecheck { report, deps })
 }
 
 /// Step 5: installs whatever the artifact's dependencies need, and nothing when
@@ -485,15 +485,21 @@ fn install_dependency_containers(
   // something an application artifact can carry (see `build_precheck_report`).
   // One request for the missing ones, so the backend sees the set at once.
   let package_manager = app.package_manager()?;
-  let missing_kmods: Vec<String> =
-    precheck.kmod_list.iter().filter(|dep| !package_manager.is_installed(dep)).cloned().collect();
+  let missing_kmods: Vec<String> = constraint::names(&precheck.deps.kmod)
+    .into_iter()
+    .filter(|dep| !package_manager.is_installed(dep))
+    .collect();
   package_manager.install("kmod", &missing_kmods)?;
 
   // `base` and `app` are one decision, taken before either is installed. Two
   // decisions — one per phase, both looking at the same `pkgs/` — is what let the
-  // same container batch be handed to the backend twice.
-  let declared: Vec<String> =
-    precheck.base_list.iter().chain(&precheck.app_list).cloned().collect();
+  // same container batch be handed to the backend twice. Only the names go into
+  // that decision and into the requests below: the bounds are pica's to check,
+  // and opkg would read `libfoo>=1.2` as a package called that.
+  let declared: Vec<String> = constraint::names(&precheck.deps.base)
+    .into_iter()
+    .chain(constraint::names(&precheck.deps.app))
+    .collect();
   let source = dependency_source(app, &declared, pkgs_dir.is_dir())?;
   let Some(source) = source else {
     return Ok(());
@@ -505,9 +511,9 @@ fn install_dependency_containers(
     // one request, so a name in a phase can depend on a sibling of the same phase.
     DependencySource::Feeds => {
       let package_manager = app.package_manager()?;
-      package_manager.install("base", &precheck.base_list)?;
+      package_manager.install("base", &constraint::names(&precheck.deps.base))?;
       let snap_before_app = package_manager.snapshot_installed();
-      package_manager.install("app", &precheck.app_list)?;
+      package_manager.install("app", &constraint::names(&precheck.deps.app))?;
       let snap_after_app = app.package_manager()?.snapshot_installed();
       tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
     }
@@ -520,6 +526,24 @@ fn install_dependency_containers(
   }
 
   Ok(())
+}
+
+/// Re-checks the artifact's bounds once the backend has installed its part.
+///
+/// The precheck can only refuse a bound the system already breaks: a dependency
+/// that was not installed then is expected to arrive at the right version, and
+/// the backend may still install an older one — a pinned feed, or a container
+/// that carries its own copy. The mismatch is reported rather than undone: the
+/// containers are already on disk, and pica does not overrule the backend's
+/// choice of version by downgrading it.
+fn recheck_constraints(app: &mut App, ctx: &InstallContext<'_>, precheck: &DependencyPrecheck) {
+  for (group, constraints) in
+    [("kmod", &precheck.deps.kmod), ("base", &precheck.deps.base), ("app", &precheck.deps.app)]
+  {
+    for message in crate::constraints::unmet(app, ctx.pkgname, group, constraints) {
+      app.log_warn(message);
+    }
+  }
 }
 
 /// Steps 4 to 8: the part of an install that changes the system.
@@ -540,6 +564,9 @@ fn run_install(
 
   // 5. Dependency containers.
   install_dependency_containers(app, ctx, precheck, tx)?;
+
+  // 5b. The bounds the precheck could not judge yet.
+  recheck_constraints(app, ctx, precheck);
 
   // 8. What this install added, diffed against the snapshot from step 4.
   if let Some(before) = &tx.tx_before {
