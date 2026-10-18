@@ -256,6 +256,13 @@ fn walk_payload(
       if let Some(parent) = to.parent() {
         ensure_dir(parent)?;
       }
+      // A file that is already there is unlinked first rather than written
+      // over. Writing over one the kernel still holds open fails with
+      // ETXTBSY — a running daemon's binary is exactly that — and unlinking
+      // first is also what lets a package replace its own executable.
+      if to.symlink_metadata().is_ok() {
+        remove_existing(&to)?;
+      }
       fs::copy(&from, &to)?;
       *size += metadata.len();
       files.push(to);
@@ -263,6 +270,26 @@ fn walk_payload(
   }
 
   Ok(())
+}
+
+/// Removes whatever is at `path`, whether it is a file, a symlink or a
+/// directory left by an earlier package.
+///
+/// A directory is only removed when it is empty: a payload file can legitimately
+/// replace something an earlier install put there, but nothing this walk
+/// touches owns a directory that has contents of its own.
+fn remove_existing(path: &Path) -> PicaResult<()> {
+  match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.is_dir() => match fs::remove_dir(path) {
+      Ok(()) => Ok(()),
+      // Something is still inside it, and this walk has no claim on it.
+      Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+      Err(err) => Err(PicaError::from(err)),
+    },
+    Ok(_) => Ok(fs::remove_file(path)?),
+    // Already gone, which is the state the caller asked for.
+    Err(_) => Ok(()),
+  }
 }
 
 /// Undoes a recorded payload install. Directories are removed only when empty,
@@ -346,6 +373,47 @@ mod tests {
   use super::{PayloadInstall, install_payload, lexical_normalize, make_temp_dir, remove_payload};
   use std::fs;
   use std::path::{Path, PathBuf};
+
+  #[test]
+  fn an_executable_is_replaced_rather_than_written_over() {
+    // Writing over a file the kernel still holds open fails with ETXTBSY, and
+    // a running daemon's binary is exactly that. A package that ships its own
+    // executable has to be able to replace the one a previous install left.
+    let dir = make_temp_dir("pica-test").expect("temp dir");
+    let source = dir.join("payload");
+    let target = dir.join("target");
+    fs::create_dir_all(source.join("usr/sbin")).expect("mkdir payload");
+    fs::create_dir_all(target.join("usr/sbin")).expect("mkdir target");
+
+    fs::write(source.join("usr/sbin/daemon"), "new build").expect("write payload file");
+    fs::write(target.join("usr/sbin/daemon"), "old build").expect("write an existing file");
+
+    let installed = install_payload(&source, &target).expect("install over an existing file");
+    assert_eq!(
+      fs::read_to_string(target.join("usr/sbin/daemon")).expect("read"),
+      "new build",
+      "the file the payload carries must be what is there afterwards"
+    );
+    assert_eq!(installed.files.len(), 1);
+  }
+
+  #[test]
+  fn a_directory_the_payload_replaces_is_left_alone_when_it_holds_anything() {
+    let dir = make_temp_dir("pica-test").expect("temp dir");
+    let source = dir.join("payload");
+    let target = dir.join("target");
+    fs::create_dir_all(source.join("opt")).expect("mkdir payload");
+    fs::create_dir_all(target.join("opt/kept")).expect("mkdir target");
+    fs::write(source.join("opt/app"), "a file where a directory was").expect("write payload");
+    fs::write(target.join("opt/kept/other"), "not ours").expect("write a bystander");
+
+    install_payload(&source, &target).expect("install");
+    assert!(
+      target.join("opt/kept/other").is_file(),
+      "this walk has no claim on what an earlier install left inside that directory"
+    );
+    assert!(target.join("opt/app").is_file(), "the payload's own file is still laid down");
+  }
 
   #[test]
   fn every_temporary_directory_is_a_new_one() {
