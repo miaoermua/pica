@@ -1079,6 +1079,43 @@ mod tests {
   }
 
   #[test]
+  fn an_empty_pica_scope_lets_a_pica_target_build() {
+    // The other way to keep pica out: declare the dependency normally, then
+    // shadow it for pica with an empty value. `get_array_for(key, "pica")`
+    // returns `[""]`, and the non-goal check drops empty entries.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    build_with_manifest(
+      &root,
+      &format!("{BASE_MANIFEST}targets = opkg, pica\nbase = luci-base\nbase@pica =\n"),
+    )
+    .expect("an empty pica scope must satisfy the pica non-goal check");
+
+    assert!(artifact(&root, "opkg").is_file());
+    assert!(artifact(&root, "pica").is_file());
+  }
+
+  #[test]
+  fn a_pica_scoped_dependency_is_still_refused() {
+    // The scope applies to pica too: it is not a way to sneak a dependency past
+    // the non-goal check, only a way to say "pica installs none of these".
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
+
+    let err = build_with_manifest(
+      &root,
+      &format!("{BASE_MANIFEST}targets = pica\nbase@pica = luci-base\n"),
+    )
+    .expect_err("a pica-scoped dependency is still a dependency pica cannot resolve");
+    assert!(err.contains("cannot resolve dependencies"), "{err}");
+  }
+
+  #[test]
   fn pkgs_dir_for_an_unselected_backend_fails() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();

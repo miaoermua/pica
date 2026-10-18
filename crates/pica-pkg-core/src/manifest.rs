@@ -328,6 +328,30 @@ mod tests {
   }
 
   #[test]
+  fn a_scoped_key_works_for_every_backend() {
+    // `@` is the only separator and the name after it is concatenated, never
+    // validated, so opkg/apk/pica are three equal spellings of the same rule.
+    let manifest = Manifest::from_text(
+      r"
+        base = shared
+        base@opkg = opkg-only
+        base@apk = apk-only
+        base@pica = pica-only
+        kmod = tun
+        kmod@apk = tun-apk
+        ",
+    )
+    .expect("parse manifest");
+
+    assert_eq!(manifest.get_array_for("base", "opkg"), vec!["opkg-only"]);
+    assert_eq!(manifest.get_array_for("base", "apk"), vec!["apk-only"]);
+    assert_eq!(manifest.get_array_for("base", "pica"), vec!["pica-only"]);
+    // A backend without its own annotation still falls back to the plain key.
+    assert_eq!(manifest.get_array_for("kmod", "pica"), vec!["tun"]);
+    assert_eq!(manifest.get_array_for("kmod", "opkg"), vec!["tun"]);
+  }
+
+  #[test]
   fn targets_accepts_repeated_and_comma_forms() {
     let repeated = Manifest::from_text("targets = opkg\ntargets = apk\n").expect("parse");
     assert_eq!(repeated.targets(), vec!["opkg", "apk"]);
