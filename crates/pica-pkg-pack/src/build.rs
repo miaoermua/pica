@@ -239,7 +239,7 @@ fn check_pica_declares_no_dependencies(
     if !declared.is_empty() {
       return Err(PicaError::msg(format!(
         "`{key}` declares {} but the pica backend cannot resolve dependencies; \
-         build it with `targets = opkg` or `targets = apk`, or declare the dependency per backend (`{key}.opkg = ...`)",
+         build it with `targets = opkg` or `targets = apk`, or declare the dependency per backend (`{key}@opkg = ...`)",
         declared.join(" ")
       )));
     }
@@ -1044,7 +1044,10 @@ mod tests {
         .expect_err("pica cannot resolve dependencies");
     assert!(err.contains("cannot resolve dependencies"), "{err}");
     assert!(err.contains("targets = opkg"), "the message must suggest opkg/apk: {err}");
-    assert!(err.contains("base.opkg"), "the message must offer the scoped form: {err}");
+    assert!(err.contains("base@opkg"), "the message must offer the scoped form: {err}");
+    // `@` is the only per-backend separator (`BACKEND_SCOPE`); a dotted key is
+    // never looked up, so suggesting one would send the reader to a dead end.
+    assert!(!err.contains("base.opkg"), "the scoped form is not dot-separated: {err}");
   }
 
   #[test]
@@ -1059,11 +1062,20 @@ mod tests {
 
     build_with_manifest(
       &root,
-      &format!("{BASE_MANIFEST}targets = opkg, pica\nbase.opkg = luci-base\n"),
+      &format!("{BASE_MANIFEST}targets = opkg, pica\nbase@opkg = luci-base\n"),
     )
     .expect("a dependency that only opkg installs must not block the pica target");
 
     assert!(artifact(&root, "pica").is_file());
+
+    let opkg_manifest = artifact_file(&artifact(&root, "opkg"), "manifest");
+    let opkg_manifest =
+      pica_pkg_core::manifest::Manifest::from_text(&opkg_manifest).expect("parse opkg manifest");
+    assert_eq!(
+      opkg_manifest.get_array_for("base", "opkg"),
+      ["luci-base"],
+      "the opkg artifact must carry the scoped dependency it installs"
+    );
   }
 
   #[test]
