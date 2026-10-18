@@ -97,6 +97,17 @@ pica --pkgmgr pica -U /tmp/miaoer-app-0.2.8-1-all-pica.pkg.tar.gz
 
 > 安装若中途失败，Pica 会回滚已装的依赖与已铺放的文件；若回滚也无法完成，会列出残留路径供手动清理。
 
+### manifest 里的 `@` 与命令行里的 `@` 不是一回事
+
+manifest 里的 `<key>@<backend>` 是**后端限定**（`backend` 取 `opkg` / `apk` / `pica`），由 `pica-pack` 打包时消费，例如 `base@apk = <该依赖在 apk 源里的名字>`。它表示“这个后端用这一组值”，与命令行选后端无关。
+
+命令行选择器里的 `@` 是另一个含义：`appname@branch`。所以 `pica -U demo@apk` 是“appname = demo、branch = apk”，**不是**“用 apk 后端安装”。要选后端请显式写 `--pkgmgr apk`：
+
+```bash
+pica --pkgmgr apk -U demo        # 用 apk 后端装 demo
+pica -U demo@apk                 # 装 demo 的 apk 分支
+```
+
 ### apk 后端安装本地包
 
 `pkgs/` 里的 `.apk` 是本地文件而非仓库软件包，Pica 会以本地文件的方式交给 apk：

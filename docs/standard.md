@@ -288,7 +288,7 @@ pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源�
 - `key = value` 一行一个字段
 - 支持 `#` 注释
 - 支持重复 key（表示数组）
-- 支持后端覆盖 key：`<key>@<backend>`，存在时优先于 `<key>`
+- 支持后端覆盖 key：`<key>@<backend>`，`<backend>` 取 `opkg` / `apk` / `pica` 之一；该键存在时，这个后端只用它、不再看 `<key>`（整体覆盖，见“与安装相关的扩展字段”）
 
 ### 字段类型规则
 
@@ -362,7 +362,8 @@ base = busybox
 # A bound is checked by pica, never passed to the backend (see below)
 # base = luci-base>=1.2
 # kmod = kmod-tun
-# base@apk = busybox-apk
+# 两个后端名字不同时才需要这一行；名字通常相同。
+# base@apk = <该依赖在 apk 源里的名字>
 
 # Lifecycle scripts (optional, paths inside scripts/)
 script_install = scripts/install
@@ -415,10 +416,11 @@ app = <native package name>
 base = <native package name>
 kmod = <native package name>
 
-# Backend override (repeatable); wins over the plain key when present
-app@apk = <native package name>
-base@apk = <native package name>
-kmod@apk = <native package name>
+# Backend override (repeatable): <key>@<backend>, backend = opkg | apk | pica
+# The annotated key replaces the plain key wholesale for that backend.
+# All three backends follow the same rule; only the name after `@` changes.
+app@apk = <该依赖在 apk 源里的名字>
+base@opkg = <该依赖在 opkg 源里的名字>
 
 # Optional: i18n template for app packages
 # The {lang} placeholder is resolved from pica config (default: zh-cn).
@@ -449,10 +451,13 @@ luci = lua1
 约定：
 
 - `app/base/kmod` 定义“安装清单”，pica 安装时遍历这些字段决定需要安装的原生包。
-- `<key>@<backend>` 是该后端的**整体覆盖**，不是追加：只要出现了 `<key>@<backend>`，该后端就只用带注解的那些值，未带注解的 `<key>` 全部忽略；其他后端仍用 `<key>`。
-  - `base = luci-base` + `base@apk = luci-base-apk`：`apk` 装 `luci-base-apk`，`opkg` 装 `luci-base`。
-  - `app@apk =`（空值）表示该后端不安装任何 `app`。
+- `<key>@<backend>` 是该后端的**整体覆盖**，不是追加：只要出现了 `<key>@<backend>`，该后端就只用带注解的那些值，未带注解的 `<key>` 全部忽略；其他后端仍用 `<key>`。`<backend>` 取 `opkg` / `apk` / `pica` 之一，三者规则相同——解析器只把名字拼成 `{key}@{backend}` 去查，不校验那个名字，而查的时候用的永远是**当前产物自己的** `pkgmgr`。
+  - 两个后端名字不同时：`base = <依赖名>` + `base@apk = <该依赖在 apk 源里的名字>`。名字通常相同，只有确实不同才需要写这一行。
+  - 只有 opkg 需要它时：只写 `base@opkg = <该依赖在 opkg 源里的名字>`，不写裸 `base`（见下面的选型指导）。
+- `<key>@<backend> =`（空值）表示该后端这组一个都不装。空值之所以有意义，是因为读取侧把它当成“没有依赖”而不是“一个名字为空的依赖”：`get_array_for` 对存在但为空的键返回 `[""]`，而 `constraint::parse_all` 会跳过空项——跳过这一步，空值就成了非法声明。
 - 解析顺序为 `<key>@<backend>` → `<key>` → 空。
+- 选型：**只有某个后端该装这条依赖** → 不写裸 key，只写 `<key>@<那个后端>`；**某后端不该装、其他后端照旧** → 写裸 key，再加 `<key>@<那个后端> =`（空）遮蔽。
+- 这两种写法都能在 `targets` 含 `pica` 时通过构建检查：`pica-pack` 只读 `get_array_for(key, "pica")`。前者没有裸 key 可回落，得到空列表；后者读到空值，被空项过滤掉。两者都不会触发“pica 不能声明依赖”的报错。
 - `app_i18n` 允许包含 `{lang}` 占位符，pica 根据配置 `i18n` 选择实际 i18n 包名（当前仅 `zh-cn` 时参与安装/卸载）。
 - `url` 用于记录程序来源（建议直接填仓库/项目地址，如 GitHub URL）。
 - `luci_url` 用于记录 LuCI 插件来源（可选；仅 LuCI 包建议填写）。
@@ -537,7 +542,7 @@ luci-i18n-myapp-zh-cn # i18n
 
 - `pkgname` 用“应用名”做 pica 包唯一标识。
 - 安装清单用 `app = ...`（以及可选 `app_i18n = ...`）列出应用子包。
-- 两个后端包名不同时，用 `<key>@apk` 覆盖，例如 `base = luci-base` 配 `base@apk = luci-base-apk`。
+- 两个后端包名不同时，用 `<key>@<backend>` 覆盖，例如 `base = <依赖名>` 配 `base@apk = <该依赖在 apk 源里的名字>`。两个后端名字通常相同，只有确实不同才需要写这一行。
 - 卸载时 pica 按 `app` + `app_i18n` 映射处理（当前仅 `i18n=zh-cn` 时处理 i18n 包）。
 
 ## scripts/.env 预留
@@ -666,7 +671,7 @@ app_i18n = luci-i18n-example-{lang}
 base = luci-base
 base = rpcd
 base = ca-bundle
-base@apk = luci-base-apk
+# base@apk = <该依赖在 apk 源里的名字>   # 仅当 apk 侧名字不同
 kmod = kmod-tun
 
 # Lifecycle scripts (optional)
