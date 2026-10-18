@@ -381,15 +381,16 @@ fn foreign_container(pkgfile: &Path) -> Option<String> {
 /// Whether the selected backend hands its dependency lists to something that
 /// installs them.
 ///
-/// The question is deliberately "will someone else install these?" and not "is
-/// this a real backend?", because owning files and solving dependencies are two
-/// separate capabilities: `pica` has the first without the second, while
-/// `opkg`/`apk` pass the second on to the system rather than doing it in Pica.
+/// The question is concretely "does this backend have a system package manager
+/// to ask?". `pica` assumes none exists on the host — it unpacks its own
+/// containers and has nobody to hand a dependency list to — so the answer is
+/// `false` there by construction, not because a solver is missing. Owning files
+/// and having dependencies installed elsewhere stay separate questions, but only
+/// the first is a property of the artifact.
 /// Both call sites that ask it — the step 3 gate and the D3 check in
 /// `validate_package` — must agree, so the predicate lives in one place.
 pub(super) fn installs_declared_dependencies(pkgmgr: &str) -> bool {
-  PackageManagerKind::parse(pkgmgr)
-    .is_some_and(|kind| kind.requires_system_binary() || kind.can_resolve_dependencies())
+  PackageManagerKind::parse(pkgmgr).is_some_and(PackageManagerKind::requires_system_binary)
 }
 
 fn non_empty(items: Vec<String>) -> Vec<String> {

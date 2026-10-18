@@ -12,10 +12,11 @@ pub use opkg::OpkgBackend;
 /// files": `opkg` and `apk` hand that to a system package manager, while `pica`
 /// keeps it and unpacks any `pkgs/` container itself.
 ///
-/// The two capabilities a backend may have are deliberately separate questions
-/// ([`Self::requires_system_binary`] and [`Self::can_resolve_dependencies`]),
-/// because `pica` currently owns its files without being able to solve
-/// dependencies.
+/// The one capability this enum reports is [`Self::requires_system_binary`]:
+/// whether the backend has a system package manager to ask. That is a different
+/// question from who installs declared dependencies — `pica` owns files but has
+/// nobody to ask, while `opkg`/`apk` pass the request on. Dependency resolution
+/// is not a backend capability in pica; it is a non-goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManagerKind {
   Opkg,
@@ -65,21 +66,6 @@ impl PackageManagerKind {
   #[must_use]
   pub fn requires_system_binary(self) -> bool {
     matches!(self, Self::Opkg | Self::Apk)
-  }
-
-  /// Whether the backend can turn declared dependencies into installed ones.
-  ///
-  /// `opkg` and `apk` delegate that to the system, which is why they answer
-  /// `false` here: they *pass the request on* rather than resolving it. `pica`
-  /// unpacks its containers but has no solver yet, so this is `false` for all
-  /// three today. It exists so the "can anyone satisfy these dependencies" gate
-  /// has a single place to widen once the solver milestone lands.
-  // The answer does not depend on which backend is asked yet: every backend is
-  // `false` until a solver exists.
-  #[allow(clippy::unused_self)]
-  #[must_use]
-  pub fn can_resolve_dependencies(self) -> bool {
-    false
   }
 }
 
@@ -241,14 +227,5 @@ mod tests {
     assert!(PackageManagerKind::Opkg.requires_system_binary());
     assert!(PackageManagerKind::Apk.requires_system_binary());
     assert!(!PackageManagerKind::Pica.requires_system_binary());
-  }
-
-  #[test]
-  fn no_backend_resolves_dependencies_yet() {
-    // `opkg`/`apk` forward the list to the system instead of solving it, and
-    // `pica` has no solver; the three answers are the same on purpose.
-    for kind in [PackageManagerKind::Opkg, PackageManagerKind::Apk, PackageManagerKind::Pica] {
-      assert!(!kind.can_resolve_dependencies(), "{kind:?}");
-    }
   }
 }
