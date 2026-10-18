@@ -12,6 +12,11 @@ Rust workspace for pica migration.
 - Minimize dependencies for OpenWrt footprint.
 - Improve maintainability, error handling, and testability.
 
+## Non-goals
+
+- Writing into `opkg`/`apk`'s installed database, or solving dependencies for them.
+- Parsing backend container formats (`.ipk`/`.apk`); they are handed to the backend that installs them. The one exception is `pica-pack` measuring a container's payload for `size`.
+
 ## Workspace layout
 
 ```text
@@ -26,13 +31,15 @@ Rust workspace for pica migration.
 
 ### `pica-pack`
 
-- `build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|none|opkg,apk]`
+- `build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|pica|opkg,apk]`
 - Build targets from the manifest `targets` field, overridable with `--pkgmgr`
-- One output directory per backend: `<outdir>/opkg/`, `<outdir>/apk/`, `<outdir>/none/`
-- Backend-suffixed filenames (`-apk` / `-none`), `platform` segment omitted when `platform = all`
-- Payload layout: `scripts/` (lifecycle), `root/` (path-mirrored), `pkgs/<backend>/[<platform>/<arch>/]`
+- One output directory per backend: `<outdir>/opkg/`, `<outdir>/apk/`, `<outdir>/pica/`
+- Backend-suffixed filenames (`-apk` / `-pica`), `platform` segment omitted when `platform = all`
+- Payload layout: `scripts/` (lifecycle), `root/` (path-mirrored), `pkgs/<backend>/[<platform>/<arch>/]` for `opkg`/`apk` only
+- A `pica` target accepts `scripts/` and `root/` and refuses `pkgs/pica/`: expanding a container into `root/` would take file ownership away from the backend's database and drop its dependency solving
 - Matrix build per backend for `pkgs/<backend>/<platform>/<arch>`
 - Build manifest rewrite (`builddate/size/platform/arch/pkgver/pkgrel/pkgmgr` injection)
+- `size` counted from what a device installs: `root/` plus each container's unpacked payload for `opkg`/`apk`; a container that cannot be unpacked (apk-tools 3.x ADB) is reported as unmeasured rather than counted as zero
 - Per-backend `repo.json` (schema 2) and `SHA256SUMS`
 - Archive creation via system `tar`
 
@@ -43,7 +50,7 @@ Rust workspace for pica migration.
 - `-So`, `-Si`, `-Sp`
 - `-U`, `-R`, `-Su`, `-Syu`
 - Install precheck/report flow (`install-report.json`)
-- Backends: `opkg`, `apk`, and Pica-native `none` (`--pkgmgr` > manifest > config > auto-detect)
+- Backends: `opkg`, `apk`, and the Pica-native `pica` (`--pkgmgr` > manifest > config > auto-detect)
 - Lifecycle scripts and env persistence/removal
 - `--json`, `--json-errors`, `--non-interactive`, `--feed-policy`, `--pkgmgr`
 - File lock fallback (`db.lck.d`) with RAII release

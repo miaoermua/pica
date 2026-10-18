@@ -18,7 +18,9 @@
 //! on disk is not fetched again, because `opkg update` is the expensive step on
 //! the routers this runs on (`docs/developer.md`).
 
-use crate::app::{CliError, CliResult, E_INDEX_UNAVAILABLE, E_MISSING_COMMAND, E_RUNTIME};
+use crate::app::{
+  CliError, CliResult, E_INDEX_UNAVAILABLE, E_LOCK_BUSY, E_MISSING_COMMAND, E_RUNTIME,
+};
 use crate::system::stderr_or_stdout;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -77,6 +79,15 @@ pub(crate) fn ensure_index(source: &dyn IndexSource) -> CliResult<()> {
   }
 
   let failure = source.refresh().err();
+
+  // A lock held by a live process is not a missing index that `ensure_index`
+  // can paper over by building an index: opkg refused to run at all, so the
+  // more specific lock error is what the caller must see instead of
+  // `E_INDEX_UNAVAILABLE`.
+  let lock_busy = failure.as_ref().is_some_and(|err| err.code == E_LOCK_BUSY);
+  if lock_busy {
+    return Err(failure.unwrap());
+  }
 
   let missing = source.missing_indexes()?;
   if missing.is_empty() {

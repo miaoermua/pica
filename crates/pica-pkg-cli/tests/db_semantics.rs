@@ -235,10 +235,11 @@ impl Sandbox {
     serde_json::from_str(&raw).expect("parse db.json")
   }
 
-  /// Builds a minimal artifact whose only payload is `pkgs/<declared>/`, which
-  /// a `pica` install ignores because it reads `pkgs/pica/` only. That keeps
-  /// install tests from writing to the host file system, since `root/` and
-  /// `scripts/` are deployed at their real absolute paths.
+  /// Builds a minimal artifact whose only payload is `pkgs/<declared>/`.
+  ///
+  /// A system backend hands that directory to its own package manager, which is
+  /// a stub in the sandbox — so nothing is written at a real path. `root/` and
+  /// `scripts/` are deployed at their absolute paths and would touch the host.
   fn artifact(&self, pkgname: &str, declared: &str) -> PathBuf {
     let src = self.dir.path().join(format!("src-{pkgname}"));
     fs::create_dir_all(src.join("pkgs").join(declared)).expect("create pkgdir");
@@ -264,9 +265,8 @@ impl Sandbox {
     out
   }
 
-  /// A `root/`-only artifact, which is the shape a `pica`-backend install takes:
-  /// `pica-pack` expands any container into `root/` at build time, so the device
-  /// never sees a `pkgs/` it would have to unpack itself.
+  /// A `root/`-only artifact, which is the only shape a `pica`-backend install
+  /// takes: a `pica` artifact ships `root/` and `scripts/`, never a container.
   ///
   /// The payload goes under `tmp/` because this sandbox redirects the database
   /// but not the target root, so a `root/etc/...` would try to write to the

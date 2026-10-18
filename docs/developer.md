@@ -48,13 +48,15 @@ cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|p
 manifest                           必需，key = value
 scripts/                           可选，生命周期脚本 install/update/remove/.env
 root/                              可选，按路径镜像到目标根文件系统
-pkgs/<backend>/                    可选，该后端的系统包
+pkgs/<backend>/                    可选，交给 opkg/apk 安装的容器（backend 不含 pica）
 pkgs/<backend>/<platform>/<arch>/  可选，变体矩阵写法
 LICENSE                            可选
 ```
 
 构建目标来自 manifest 里的 `targets`（可重复或逗号分隔），也可用 `--pkgmgr` 覆盖，默认 `opkg`。
 每个 `<platform>/<arch>` 组合产出一个归档，`pkgs/` 会被拍平成该组合的内容。
+
+`pica` 目标只收 `scripts/` 与 `root/`：`pkgs/pica/` 会让构建直接失败，因为 pica 不读容器格式——展开容器会把文件的所有权从后端数据库里抢走，也丢掉后端的依赖求解（理由见 `standard.md` 的「`pica` 后端」一节）。`pica-pack` 仍会读 `.ipk` / legacy `.apk` 统计 `size`，读不出来（apk-tools 3.x 的 ADB）只告警并跳过。
 
 产物命名与输出目录：
 
@@ -77,7 +79,7 @@ platform = all 时省略 platform 段
 
 - **基础设施**：`sh` 提供主控与生命周期解析，需保证能够正常调用 BusyBox applet。
 - **环境强制依赖**：原生解包工具 `tar`（JSON 解析、状态存储与校验均由 Rust 侧实现，不再依赖 `jq`）。
-- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，`opkg` / `apk` 后端通过调用系统包管理器驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = pica` 时由 Pica 自行解包 `pkgs/` 并部署 `root/`、执行生命周期脚本。
+- **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，`opkg` / `apk` 后端通过调用系统包管理器驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = pica` 时由 Pica 部署 `root/`、执行生命周期脚本；这类归档不携带 `pkgs/`，带了会在写入任何文件之前被拒绝。
 - **公网连接支持优先级**：`uclient-fetch` -> `wget` -> `curl`。
 
 ### 状态目录（VFS Layout）

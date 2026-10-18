@@ -1,7 +1,8 @@
 use crate::archive::{compute_sha256, run_tar_create, unpacked_size, write_sha256sum_entry};
 use crate::backend::{BuildBackend, parse_targets};
-use crate::container::{PayloadRoot, is_adb_container, unpack_container};
+use crate::container::{is_adb_container, unpack_container};
 use crate::matrix::{collect_archs, collect_platforms, has_platform_arch_matrix};
+use crate::payload::stage_root;
 use crate::rewrite::{BuiltFields, rewrite_manifest_for_build};
 use crate::{msg, msg2};
 use pica_pkg_core::error::{PicaError, PicaResult};
@@ -78,12 +79,35 @@ pub(crate) fn main_build(
   }
 
   let pkgs_dir = pkgdir.join(PKGS);
+  check_pica_ships_no_containers(&pkgs_dir)?;
   check_unbuilt_backends(&pkgs_dir, &backends)?;
   check_pica_declares_no_dependencies(&manifest, &backends)?;
 
   if !has_payload(pkgdir, &pkgs_dir, &backends) {
+    let mut wanted = vec![format!("{SCRIPTS}/"), format!("{ROOT}/")];
+    wanted.extend(
+      backends
+        .iter()
+        .filter(|backend| backend.expects_containers())
+        .map(|backend| format!("{PKGS}/{}/", backend.as_str())),
+    );
     return Err(PicaError::msg(format!(
-      "package would be empty: provide at least one of {SCRIPTS}/, {ROOT}/ or {PKGS}/<backend>/"
+      "package would be empty: provide at least one of {}",
+      wanted.join(", ")
+    )));
+  }
+
+  // A pica artifact has no containers to fall back on, so a pkgdir that only
+  // carries another backend's `pkgs/` would produce an artifact that installs
+  // nothing — the device's precheck refuses those.
+  if backends.contains(&BuildBackend::Pica)
+    && !pkgdir.join(SCRIPTS).is_dir()
+    && !pkgdir.join(ROOT).is_dir()
+  {
+    return Err(PicaError::msg(format!(
+      "pica artifact would be empty: a pica artifact ships only {SCRIPTS}/ and {ROOT}/. \
+       Provide one of them, or build with `targets = opkg` or `targets = apk` so the device's \
+       package manager installs the containers"
     )));
   }
 
@@ -137,9 +161,10 @@ pub(crate) fn main_build(
   Ok(())
 }
 
-/// `pkgs/<backend>/` counts as payload for every backend that ships containers,
-/// `pica` included: it is the containers, not `root/`, that make such a package
-/// worth installing.
+/// `pkgs/<backend>/` counts as payload only for the backends that ship
+/// containers: it is the containers, not `root/`, that make such a package worth
+/// installing. `scripts/` and `root/` count for every backend, and are all a
+/// `pica` artifact has.
 fn has_payload(pkgdir: &Path, pkgs_dir: &Path, backends: &[BuildBackend]) -> bool {
   if pkgdir.join(SCRIPTS).is_dir() || pkgdir.join(ROOT).is_dir() {
     return true;
@@ -147,6 +172,27 @@ fn has_payload(pkgdir: &Path, pkgs_dir: &Path, backends: &[BuildBackend]) -> boo
   backends
     .iter()
     .any(|backend| backend.expects_containers() && pkgs_dir.join(backend.as_str()).is_dir())
+}
+
+/// A `pica` artifact takes no containers, so `pkgs/pica/` is refused whether or
+/// not `pica` is in `targets`.
+///
+/// Expanding a container into `root/` at build time would make pica the owner of
+/// files the backend's database already owns — two databases disagreeing about
+/// the same path — and would drop the backend's own dependency solving. A
+/// package that needs those files is built for the backend that installs them.
+fn check_pica_ships_no_containers(pkgs_dir: &Path) -> PicaResult<()> {
+  let dir = pkgs_dir.join(BuildBackend::Pica.as_str());
+  if !dir.is_dir() {
+    return Ok(());
+  }
+  Err(PicaError::msg(format!(
+    "{PKGS}/{}/ is not a pica input: a pica artifact ships only {SCRIPTS}/ and {ROOT}/. \
+     Build it with `targets = opkg` or `targets = apk` so the device's own package manager \
+     installs the containers and keeps its database, or extract them into {ROOT}/ in CI and \
+     pack that",
+    BuildBackend::Pica.as_str()
+  )))
 }
 
 /// A pkgdir that ships `pkgs/apk/` but declares only `targets = opkg` is almost
@@ -254,53 +300,24 @@ fn stage_and_pack(req: &BuildRequest<'_>, tmpdir: &Path, pkgfile: &str) -> PicaR
   }
 
   // `root/` is assembled before the manifest is written, because the size the
-  // manifest records is the size of what a device will deploy — and for a `pica`
-  // artifact part of that comes out of the containers, so it is not known until
-  // they have been expanded.
+  // manifest records is the size of what a device will deploy.
   let root_src = req.pkgdir.join(ROOT);
-  let mut payload = PayloadRoot::new(tmpdir.join(ROOT));
+  stage_root(&root_src, &tmpdir.join(ROOT))?;
 
-  // A `pica`-backend artifact has to be self-contained: the device only ever
-  // copies files, so any container it ships is expanded here at build time and
-  // its payload becomes part of `root/`. `opkg`/`apk` artifacts keep `pkgs/`
-  // and let the system package manager install it, which is the only way those
-  // formats get their dependencies handled.
+  // An `opkg`/`apk` artifact hands its containers to the system package manager,
+  // which is the only way those formats get their database and dependencies
+  // handled. A `pica` artifact carries none: `check_pica_ships_no_containers`
+  // refused the input, so there is nothing to stage.
   if req.backend.expects_containers() {
-    let pkgs_src = req.pkgdir.join(PKGS);
-    if req.backend == BuildBackend::Pica {
-      // Only this backend's own containers: `pkgs/<backend>/` holds what the
-      // device's package manager would install, and another backend's containers
-      // are none of this artifact's business.
-      let names = payload.merge_containers(&pkgs_src.join(req.backend.as_str()))?;
-      if !names.is_empty() {
-        msg2(format!("Expanded {} container(s): {}", names.len(), names.join(" ")));
-      }
-    } else {
-      stage_packages(req, &tmpdir.join(PKGS))?;
-    }
+    stage_packages(req, &tmpdir.join(PKGS))?;
   }
 
-  // Last, so that the maintainer's own file is what ends up in the artifact when
-  // a container carries the same path: `root/` is where a package says what it
-  // meant, and a container's copy is the thing being corrected. Two containers
-  // disputing one path is a different matter, and the merge refuses it.
-  payload.merge_overlay(&root_src)?;
-  if root_src.is_dir() {
-    // An empty `root/` is still a directory the package asked to ship.
-    ensure_dir(payload.root())?;
-  }
+  // What a container installs only becomes known once it is unpacked, hence
+  // after the artifact's contents are assembled. A `pica` artifact has no
+  // containers, so its `root/` is the whole payload.
+  let containers = measure_containers(&tmpdir.join(PKGS))?;
 
-  // The containers an `opkg`/`apk` artifact ships are installed by the system
-  // package manager, so they are part of what the package costs on a device —
-  // and, as for a `pica` artifact's own containers, they only say how much once
-  // they have been unpacked. A `pica` artifact expanded its containers into
-  // `root/` above, so its `root/` is the whole payload already.
-  let containers = match req.backend {
-    BuildBackend::Pica => ContainerPayload::default(),
-    _ => measure_containers(&tmpdir.join(PKGS))?,
-  };
-
-  let install_size = unpacked_size(payload.root()) + containers.bytes;
+  let install_size = unpacked_size(&tmpdir.join(ROOT)) + containers.bytes;
   msg2(format!("Install size: {install_size} bytes"));
   if !containers.counted.is_empty() {
     msg2(format!(
@@ -716,24 +733,6 @@ mod tests {
   }
 
   #[test]
-  fn pica_keeps_both_container_formats() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let source = tmp.path().join("pica");
-    fs::create_dir_all(&source).expect("mkdir nested");
-    fs::write(source.join("one.apk"), b"apk").expect("write apk");
-    fs::write(source.join("two.ipk"), b"ipk").expect("write ipk");
-    fs::write(source.join("notes.txt"), b"text").expect("write stray file");
-
-    let dst = tmp.path().join("out");
-    let copied =
-      copy_packages_flat(&source, &dst, BuildBackend::Pica.package_extensions()).expect("copy");
-    assert_eq!(copied, 2, "pica unpacks both formats itself");
-    assert!(dst.join("one.apk").is_file());
-    assert!(dst.join("two.ipk").is_file());
-    assert!(!dst.join("notes.txt").exists());
-  }
-
-  #[test]
   fn duplicate_package_names_are_rejected() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let a = tmp.path().join("a");
@@ -898,103 +897,47 @@ mod tests {
   }
 
   #[test]
-  fn a_pica_target_expands_its_containers_into_root() {
+  fn a_pica_target_refuses_containers() {
+    // A `pica` artifact carries files, not containers. Expanding one into
+    // `root/` would make pica the owner of files the backend's database already
+    // owns and drop that backend's dependency solving, so the build says what to
+    // do instead of guessing.
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();
-    let staging = root.join("payload/etc/demo");
-    fs::create_dir_all(&staging).expect("mkdir payload");
-    fs::write(staging.join("from-container"), "container\n").expect("write payload");
+    fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
+    fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
     let container = make_ipk(&root, "demo-lib", &[("etc/demo/from-container", "container\n")]);
     fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
     fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
 
-    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
-
-    let entries = artifact_entries(&artifact(&root, "pica"));
-    assert!(
-      entries.contains("root/etc/demo/from-container"),
-      "the container's payload belongs in root/ so the device only copies files: {entries}"
-    );
-    assert!(
-      !entries.lines().any(|entry| entry.starts_with("pkgs/")),
-      "a pica artifact must not ship containers: {entries}"
-    );
-  }
-
-  #[test]
-  fn a_pica_target_merges_containers_with_the_overlay() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    let container = make_ipk(&root, "demo-lib", &[("etc/demo/shared", "container\n")]);
-    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
-    fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
-    fs::create_dir_all(root.join("root/etc/demo")).expect("mkdir root");
-    fs::write(root.join("root/etc/demo/shared"), "overlay\n").expect("write config");
-    fs::write(root.join("root/etc/demo/only-root"), "root\n").expect("write config");
-
-    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
-
-    let built = artifact(&root, "pica");
-    let entries = artifact_entries(&built);
-    assert!(entries.contains("root/etc/demo/only-root"), "{entries}");
-    assert!(
-      entries.contains("root/etc/demo/shared"),
-      "root/ wins a path the container also provides, so the merge is not a conflict: {entries}"
-    );
-    assert_eq!(
-      artifact_file(&built, "root/etc/demo/shared"),
-      "overlay\n",
-      "root/ winning has to mean its contents, not just a file with that name"
-    );
-  }
-
-  #[test]
-  fn two_containers_providing_one_file_fail_the_build() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    let a = make_ipk(&root, "demo-a", &[("etc/demo.conf", "from-a\n")]);
-    let b = make_ipk(&root, "demo-b", &[("etc/demo.conf", "from-b\n")]);
-    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
-    fs::copy(&a, root.join("pkgs/pica/demo-a.ipk")).expect("stage a");
-    fs::copy(&b, root.join("pkgs/pica/demo-b.ipk")).expect("stage b");
-
     let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n"))
-      .expect_err("two containers may not claim one path");
-    assert!(err.contains("demo-a") && err.contains("demo-b"), "{err}");
-    assert!(err.contains("etc/demo.conf"), "{err}");
-
-    // The refusal happens while the payload is assembled, so nothing is written.
-    let written: Vec<String> = fs::read_dir(root.join("out/pica"))
-      .map(|entries| {
-        entries.flatten().map(|entry| entry.file_name().to_string_lossy().into()).collect()
-      })
-      .unwrap_or_default();
-    assert!(written.is_empty(), "a refused build must leave no artifact: {written:?}");
+      .expect_err("pkgs/pica/ is not a pica input");
+    assert!(err.contains("pkgs/pica/ is not a pica input"), "{err}");
+    assert!(
+      err.contains("targets = opkg") && err.contains("targets = apk"),
+      "the error must name the backends that do install the container: {err}"
+    );
+    assert!(
+      err.contains("extract them into root/"),
+      "the error must also name the build-side way out: {err}"
+    );
+    assert!(!root.join("out").exists(), "a refused build must write nothing");
   }
 
   #[test]
-  fn the_reported_size_is_what_the_containers_brought() {
-    // The package ships only `pkgs/pica/`: everything it installs comes out of
-    // the container, so a size taken before the merge would report zero.
+  fn a_pica_artifact_without_root_or_scripts_is_refused() {
+    // `pkgs/opkg/` gives the opkg artifact something to ship, but the pica one
+    // would be a manifest with no files at all — which the device's precheck
+    // calls an empty package, so the build calls it that too.
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();
     let container = make_ipk(&root, "demo-lib", &[("usr/lib/libdemo.so", "0123456789")]);
-    fs::create_dir_all(root.join("pkgs/pica")).expect("mkdir pkgs");
-    fs::copy(&container, root.join("pkgs/pica/demo-lib.ipk")).expect("stage container");
+    fs::create_dir_all(root.join("pkgs/opkg")).expect("mkdir pkgs");
+    fs::copy(&container, root.join("pkgs/opkg/demo-lib.ipk")).expect("stage container");
 
-    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\n")).expect("build");
-
-    let built = artifact(&root, "pica");
-    assert_eq!(artifact_file(&built, "root/usr/lib/libdemo.so"), "0123456789");
-    assert!(
-      artifact_file(&built, "manifest").contains("size = 10"),
-      "the artifact manifest must describe the payload the device will deploy:\n{}",
-      artifact_file(&built, "manifest")
-    );
-
-    let index = fs::read_to_string(root.join("out/pica/repo.json")).expect("read index");
-    let parsed = parse_repo_json(&index).expect("valid index");
-    assert_eq!(parsed.packages[0].size, Some(10), "the index advertises the same number");
+    let err = build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = opkg,pica\n"))
+      .expect_err("a pica artifact needs scripts/ or root/");
+    assert!(err.contains("pica artifact would be empty"), "{err}");
   }
 
   #[test]

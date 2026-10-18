@@ -93,7 +93,7 @@ pica --pkgmgr pica -U /tmp/miaoer-app-0.2.8-1-all-pica.pkg.tar.gz
 ```
 
 - `opkg` / `apk`：把包内 `pkgs/` 交给对应的系统包管理器安装。
-- `pica`：Pica 自己解包 `pkgs/` 中的 `.ipk` / `.apk`，不依赖系统包管理器。
+- `pica`：Pica 自己铺放 `root/` 里的文件、执行生命周期脚本，不做依赖求解。这类包不带 `pkgs/`——pica 不解析容器格式，带了的归档会被直接拒绝。
 
 > 安装若中途失败，Pica 会回滚已装的依赖与已铺放的文件；若回滚也无法完成，会列出残留路径供手动清理。
 

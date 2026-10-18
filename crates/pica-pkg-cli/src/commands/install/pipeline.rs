@@ -454,10 +454,10 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
 /// `base`-then-`app` order, or one request holding the whole container batch.
 ///
 /// The `pica` backend has no feeds and no solver, so it is given no dependency
-/// work at all: `pica-pack` expanded any container into `root/` at build time,
-/// and `deploy_payload` lays those files down like any other payload. A
-/// `pica`-backend artifact that still carries `pkgs/` was built by a packer that
-/// predates that rule, and is refused rather than half-installed.
+/// work at all: its artifact ships `root/` and `scripts/`, and `deploy_payload`
+/// lays those files down. A `pica` artifact carrying `pkgs/` is refused instead
+/// of half-installed: pica does not read container formats, so it could neither
+/// install the container nor account for the files inside it.
 fn install_dependency_containers(
   app: &mut App,
   ctx: &InstallContext<'_>,
@@ -471,9 +471,10 @@ fn install_dependency_containers(
       return Err(CliError::new(
         E_PACKAGE_INVALID,
         format!(
-          "a pica-backend artifact must not carry {PKGS}/: pica-pack expands containers \
-           into root/ at build time. Rebuild it, or build with `targets = apk` to let \
-           the device's own package manager install them"
+          "a pica-backend artifact must not carry {PKGS}/: a pica artifact ships {ROOT}/ \
+           and scripts/, and pica does not hand containers to opkg or apk. Rebuild it with \
+           `targets = opkg` or `targets = apk` so the device's package manager installs \
+           them, or extract them into {ROOT}/ before packing"
         ),
       ));
     }
@@ -532,7 +533,7 @@ fn run_install(
   tx: &mut InstallTransaction,
 ) -> CliResult<()> {
   // 4. Snapshot before anything is installed. Only a system backend has a
-  //    database to snapshot; `pica` records the containers it unpacks instead.
+  //    database to snapshot; `pica` keeps its own record of the paths it wrote.
   if app.backend().requires_system_binary() {
     tx.tx_before = Some(app.package_manager()?.snapshot_installed());
   }
@@ -762,8 +763,6 @@ struct InstallTransaction {
   /// as one request covering `base` and `app` at once, so it appears in
   /// `tx_added` only.
   app_added: Vec<String>,
-  /// Containers Pica unpacked itself, by package name.
-  pkgs: Vec<String>,
   /// Paths deployed, in deployment order so removal can replay them backwards.
   payload_records: Vec<PayloadInstall>,
   /// Labels of the hooks that ran, in the order they ran.
@@ -776,7 +775,6 @@ impl InstallTransaction {
       tx_before: None,
       tx_added: Vec::new(),
       app_added: Vec::new(),
-      pkgs: Vec::new(),
       payload_records: Vec::new(),
       executed_hooks: Vec::new(),
     }
@@ -786,19 +784,15 @@ impl InstallTransaction {
     self.payload_records.push(payload);
   }
 
-  /// Records a container `pica` unpacked.
-  ///
-  /// Its files join the payload history like any other deployed path, and its
-  /// name is the container's contribution to "packages this install added" —
   fn record_hook(&mut self, label: &str) {
     self.executed_hooks.push(label.to_string());
   }
 
   /// Every path this install created, as one payload.
   ///
-  /// Container payloads come first and `root/` last, which keeps parents before
-  /// children: `remove_payload` walks directories in reverse and only removes
-  /// the ones that ended up empty.
+  /// `root/` is deployed first and the kept scripts after it, so parents come
+  /// before children: `remove_payload` walks directories in reverse and only
+  /// removes the ones that ended up empty.
   fn merged_payload(&self) -> PayloadInstall {
     let mut merged = PayloadInstall::default();
     for record in &self.payload_records {
@@ -869,7 +863,6 @@ impl InstallTransaction {
     }
     self.tx_added.clear();
     self.app_added.clear();
-    self.pkgs.clear();
 
     leftovers
   }
@@ -940,11 +933,6 @@ fn record_installation(
   // package manager that never touched this install, as happens with
   // `--pkgmgr pica` over an `opkg` artifact.
   manifest_stored["pkgmgr"] = json!(app.backend().as_str());
-  if !tx.pkgs.is_empty() {
-    // Containers `pica` unpacked itself, by name. `-Qi` can show them and a
-    // reinstall can tell they were already on this system.
-    manifest_stored["installed_pkgs"] = json!(tx.pkgs);
-  }
   if manifest_stored.get("url").is_none() {
     let origin = manifest_stored.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
     manifest_stored["url"] = json!(origin);
@@ -1162,9 +1150,9 @@ arch = all
 
     /// The same install without a `pkgs/` entry.
     ///
-    /// A `pica`-backend artifact is built by `pica-pack`, which expands any
-    /// container into `root/`, so a pica install never has containers to lay
-    /// down. Rollback tests want the payload path, not the container path.
+    /// A `pica`-backend artifact ships only `root/` and `scripts/` — the packer
+    /// refuses containers — so a pica install never has one to lay down.
+    /// Rollback tests want the payload path, not the container path.
     fn install_without_containers(
       &mut self,
       manifest: &str,
@@ -1191,10 +1179,9 @@ arch = all
 
   #[test]
   fn a_pica_artifact_must_not_carry_containers() {
-    // pica-pack expands pkgs/ into root/ at build time, so an artifact that
-    // still has containers came from a packer that predates that rule. Laying
-    // some of it down and then failing would leave the device inconsistent, so
-    // the install is refused before anything is written.
+    // pica does not read container formats: it could neither install one nor
+    // account for the files inside it, so an artifact that carries `pkgs/` is
+    // refused before anything is written rather than half-installed.
     let mut fixture = PicaFixture::new();
 
     let err = fixture
@@ -1247,7 +1234,9 @@ arch = all
   }
 
   #[test]
-  fn a_broken_container_leaves_the_system_untouched() {
+  fn a_container_in_a_pica_artifact_is_refused_before_anything_is_written() {
+    // pica never opens a container, so it cannot tell a broken one from a sound
+    // one — the artifact is refused on its shape alone.
     let mut fixture = PicaFixture::new();
     let broken = fixture.work_path.join("broken.ipk");
     write_file(&broken, "this is not a container\n");
@@ -1264,7 +1253,12 @@ arch = all
     )
     .expect_err("step 5 fails");
 
-    assert!(err.message.contains("tar"), "{}", err.message);
+    assert!(err.message.contains("must not carry pkgs/"), "{}", err.message);
+    assert!(
+      err.message.contains("targets = opkg") && err.message.contains("targets = apk"),
+      "the error must name the backends that do install it: {}",
+      err.message
+    );
     assert!(
       !fixture.path("etc/demo.conf").exists(),
       "the payload must not run after the container step failed"
@@ -1460,6 +1454,10 @@ arch = all
 
     assert_eq!(fs::read_to_string(fixture.path("etc/demo.conf")).expect("overlay"), "overlay\n");
     let record = db_record(&fixture.app, "demo").expect("recorded");
-    assert!(record["manifest"].get("installed_pkgs").is_none(), "{record}");
+    assert_eq!(
+      record["files"].as_array().map(Vec::len),
+      Some(1),
+      "the record holds the file the artifact deployed: {record}"
+    );
   }
 }

@@ -469,8 +469,8 @@ pub(crate) fn conf_get_pkgmgr(conf_file: &Path) -> Option<String> {
 ///
 /// apk-tools 3.x, which `OpenWrt` 25.12 and later ship, refuses to install a
 /// package that no configured repository provides unless that flag is given.
-/// Pica unpacks its own `pkgs/apk/*.apk` and hands the files to `apk add`, so
-/// the default is `true`; `false` keeps the call to what apk 2.x accepted, for a
+/// Pica hands the `pkgs/apk/*.apk` files themselves to `apk add`, so the
+/// default is `true`; `false` keeps the call to what apk 2.x accepted, for a
 /// router whose apk build does not know the option.
 ///
 /// A missing key or `null` means the default. Anything other than `true`/`false`

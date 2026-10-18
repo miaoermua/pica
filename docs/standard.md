@@ -15,8 +15,16 @@
 - 当前唯一标准归档类型：`*.pkg.tar.gz`。
 - `pkgs/` 里可以放后端原生包（`.ipk` / `.apk`），它们不是 Pica 归档，只是随包分发给后端安装的载荷。
 - `pkgmgr` 是**包身份**的一部分：`opkg`、`apk`、`pica` 三种后端各自独立打包、独立索引、独立安装。
-- `opkg` / `apk` 把 `pkgs/` 交给系统包管理器安装；`pica` 由 Pica 自己解包 `pkgs/` 并部署 `root/`。
+- `opkg` / `apk` 把 `pkgs/` 交给系统包管理器安装；`pica` 的产物只有 `scripts/` 与 `root/`，不接受任何容器。
 - Pica 仅负责包分发、校验、生命周期脚本执行，不提供 Docker 管理服务。
+
+## 非目标
+
+明确不做的事，免得把“还没做”和“不该做”混为一谈：
+
+- **不写回 `opkg`/`apk` 的已安装数据库**：容器交给后端安装，装了什么、依赖是谁都由后端的数据库记账。Pica 的账本只记自己铺下的 `root/` 文件与它执行过的脚本，不替后端登记文件。
+- **不做依赖求解**：`app`/`base`/`kmod` 一律透传给后端（`opkg install` / `apk add`），由后端的仓库、版本与冲突规则决定装什么。Pica 只决定“走仓库还是走本地容器”和“一次交给后端多少目标”。
+- **不解析后端容器格式**：`.ipk`/`.apk` 不打开来安装、记账或求解依赖，格式对委托路径是透明的。唯一读它们的地方是 `pica-pack` 统计 `size`；读不出来（apk-tools 3.x 的 ADB）时只记为未计量并告警。
 
 ## 包格式（.pkg.tar.gz）
 
@@ -59,7 +67,7 @@
 
 - `scripts/`：生命周期脚本，**不进 PATH**。安装时复制到 `/usr/lib/pica/scripts/<pkgname>/`，`scripts/.env` 复制到 `/etc/pica/env.d/<pkgname>.env`。
 - `root/`：按目标路径镜像的载荷。`root/etc/init.d/demo` → `/etc/init.d/demo`，`root/usr/bin/demo` → `/usr/bin/demo`。
-- `pkgs/`：要交给系统包管理器安装的原生包，打包时按后端过滤后拍平存放（见下）。
+- `pkgs/`：要交给系统包管理器安装的原生包，打包时按后端过滤后拍平存放（见下）。`pica` 后端没有这一项。
 
 `scripts/` 中约定的文件名与 `manifest` 的对应关系：
 
@@ -79,23 +87,38 @@ pkgs/<backend>/<platform>/<arch>/*.<ipk|apk>
 pkgs/<backend>/*.<ipk|apk>          # 无变体时的简化写法
 ```
 
+`<backend>` 只能是 `opkg` 或 `apk`；`pkgs/pica/` 不是输入，见下节。
+
 打包器会把每个 `<platform>/<arch>` 组合单独生成一个 pica 包，并只保留该组合的 `pkgs/<backend>/` 内容；`scripts/` 与 `root/` 会原样打入每个变体包。
 
-### `pica` 后端的载荷合并规则
+### `pica` 后端：只有 `scripts/` 与 `root/`
 
-`targets = pica` 时，`pkgs/pica/` 里的容器会在打包阶段解包，与 `root/` 合并进同一个 `root/`（产物中不出现 `pkgs/`）。合并规则：
+`targets = pica` 时不接受容器。`pkgdir` 下的 `pkgs/pica/` 会让构建直接失败，报错给出两条出路：改用 `targets = opkg` / `targets = apk` 让设备端的包管理器安装，或在 CI 里先把容器抽成 `root/` 再重新打包。
 
-- **目录可以合并**：多个包都装进 `etc/init.d` 是常态，共享目录不算冲突。
-- **同一路径的文件/符号链接只能有一个提供者**：
-  - `root/` 覆盖容器：`root/etc/demo.conf` 的内容即产物内容，用来修补容器里的文件。
-  - 两个容器提供同一路径 → 构建失败，报错给出两个容器名与路径，并提示保留一份或改放进 `root/` 指定胜者。
-  - 同一路径的类型冲突（文件 ↔ 目录 ↔ 符号链接）→ 构建失败，与来源无关。
-- **符号链接原样保留**：打包阶段不跟随链接递归复制；链接目标必须落在 `root/` 内，越界（绝对路径或 `..` 爬出）直接构建失败，否则会把构建机上的文件带进产物。
-- **`size` 在解包完成之后统计**：只放 `pkgs/pica/`、不写 `root/` 的包，`size` 依然是解包后 `root/` 的总字节数（只计普通文件，符号链接与目录不计）。`apk`/`opkg` 后端不合并容器，但统计口径相同——容器照旧要解包才数得出，见下节。
+构建期不解包后端容器的理由：
+
+- **数据库归属**：容器里的文件本来由 `opkg`/`apk` 的数据库记账。把它们摊进 `root/`，同一个路径就有了两个主人——后端的已安装数据库和 Pica 的账本——卸载一边、升级另一边都会留下说不清的状态。
+- **依赖求解**：容器的依赖由 `opkg`/`apk` 求解。展开之后只剩下文件，依赖清单不再有执行者，装上去的东西是否完整取决于构建机当时的环境。
+- **格式**：`apk-tools` 3.x 的 ADB 容器不是 tar，Pica 不打算为展开而维护 `.ipk`/`.apk` 解析器；委托路径（把 `pkgs/<backend>/` 交给系统包管理器按路径安装）本来就不需要 Pica 理解容器格式，格式对它是透明的。
+
+所以 `pica` 产物的载荷只有 `root/`（加上不进 PATH 的 `scripts/`），`size` 就是 `root/` 里普通文件的总字节数。
+
+`root/` 的装配规则：
+
+- **符号链接原样保留**：打包阶段不跟随链接递归复制，产物里是链接本身，而不是它在构建机上指向的文件。
+- **链接目标必须落在 `root/` 内**：绝对路径或 `..` 爬出都直接构建失败。这条规则与设备侧安装期用的是同一个判定（`pica_pkg_core::io::symlink_escapes_root`），因此构建期接受的包不会在安装期因为同一个链接被拒。
+- **只有文件、目录与符号链接**：套接字、fifo、设备节点会让构建失败——设备侧只铺这些类型的条目。
+- **空 `root/` 也是 `root/`**：显式建一个空目录的包，产物里同样有 `root/`。
+
+### Pica 不解析后端容器格式
+
+Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交给对应后端，由后端的数据库和求解器负责其中的文件。唯一读容器的地方是 `pica-pack` 统计 `size`——按 tar 读 `.ipk` 的 `data` 成员、以及 legacy `.apk`（apk-tools 2.x 的三段 gzip）里的载荷，数完即丢弃，产物里不留痕迹。
+
+`apk-tools` 3.x 的 ADB 容器读不出来（签名块不是 gzip，tar 打不开）。此时构建照常成功、容器照常打进产物，只在构建输出里给出 `WARNING: not counted, pica cannot unpack them: <文件> (<原因>)`，`size` 只统计能统计的部分——宁可比真实值小并且说明，也不静默报 0。
 
 ### `apk`/`opkg` 后端：本地容器的安装参数与信任边界
 
-`pkgmgr = apk|opkg` 时，`pkgs/` 里的容器由系统包管理器安装。Pica 传给后端的是**解包后的本地文件路径**，而“按名字从仓库安装”是另一种请求，两者不加同一个参数：
+`pkgmgr = apk|opkg` 时，`pkgs/` 里的容器由系统包管理器安装。Pica 只把**归档解包后落在临时目录里的容器文件路径**交给后端，自己不打开它；“按名字从仓库安装”是另一种请求，两者不加同一个参数：
 
 | 请求 | 命令形态 | 信任来源 |
 | --- | --- | --- |
@@ -105,8 +128,7 @@ pkgs/<backend>/*.<ipk|apk>          # 无变体时的简化写法
 - **`--allow-untrusted`**：豁免 apk 对包签名的检查。Pica 归档里的 `.apk` 不一定由本机信任的密钥签名，所以要装就得放宽；请把它理解为“信任的是这个归档，而不是这个 `.apk` 的签名”。仓库包（按名字安装）永远不会带上这个参数。
 - **`--force-non-repository`**：apk-tools 3.x（OpenWrt 25.12 及以后）会拒绝安装不属于任何已配置仓库的软件包，本地文件因此需要显式允许；2.x 没有这个选项，传入未知选项会让命令直接失败，所以 Pica 先读 `apk --version` 的大版本号：**≥3 才加，2.x 不加，读不出来时按需要加处理**（读不出来时更可能遇上 3.x 的拒绝，而多传参数会以 `unrecognized option` 明确报错并提示改配置）。
 - 配置开关 `apk_force_non_repository`（默认 `true`）决定是否使用该参数；设为 `false` 时本地 apk 按 2.x 的形态安装。非布尔值（如 `"yes"`）会让命令直接报错，不会替你选一个值——这个开关决定的是“是否放宽一项检查”，拼写错误不该静默生效。
-- **`size` 是“装到设备上占多少字节”，不是“`root/` 里有多少字节”**：`pica` 后端的容器已经合并进 `root/`，所以 `size` 就是合并后 `root/` 的总字节数；`apk`/`opkg` 后端把 `pkgs/` 整个交给系统包管理器安装，所以 `size` 是 `root/` 加上 `pkgs/` 里**每个容器解包后**的载荷之和。只计普通文件，符号链接与目录不计；容器之间重复提供同一路径会各计一次（这类产物在设备上本来就由后端决定谁胜出）。
-- **算不出来的容器不会被当成 0**：pica 无法解包 apk-tools 3.x 的 ADB 容器，遇到这种容器时构建照常成功、容器照常打进产物，只在构建输出里给出 `WARNING: not counted, pica cannot unpack them: ...`——这时 `size` 只统计了能统计的部分，宁可比真实值小且说明，也不静默报 0。
+- **`size` 是“装到设备上占多少字节”，不是“归档文件有多大”**：`apk`/`opkg` 后端把 `pkgs/` 整个交给系统包管理器安装，所以 `size` 是 `root/` 加上 `pkgs/` 里**每个容器解包后**的载荷之和。只计普通文件，符号链接与目录不计；容器之间重复提供同一路径会各计一次（这类产物在设备上本来就由后端决定谁胜出）。`pica` 后端没有容器，`size` 就是 `root/` 的总字节数，见上节。
 
 ### `pkgs/` 是整包一次调度，不是按阶段调度
 
@@ -145,7 +167,7 @@ pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
   - `arch`
   - `filename`
   - `sha256`
-- `size` 必须是数字，表示安装到设备上的普通文件总字节数（`pica-pack` 构建时统计：`pica` 后端为合并后 `root/` 的载荷，`apk`/`opkg` 后端为 `root/` 加上容器解包后的载荷）
+- `size` 必须是数字，表示安装到设备上的普通文件总字节数（`pica-pack` 构建时统计：`pica` 后端为 `root/` 的载荷，`apk`/`opkg` 后端为 `root/` 加上容器解包后的载荷；算不出来的容器不计入并告警）
 - `csize` 必须是数字，表示归档文件的压缩后字节数
 - `sha256` 必须是 64 位十六进制字符串
 - `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），且必须以 `.pkg.tar.gz` 结尾
@@ -376,7 +398,7 @@ visibility = open
 约定：
 
 - `builddate`：可选；Unix 时间戳（秒）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动补全。
-- `size`：可选；字节数（bytes），口径见「`apk`/`opkg` 后端」一节（装到设备上的普通文件总字节数，含容器解包后的载荷）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动计算并补全。
+- `size`：可选；字节数（bytes），口径见「`pica` 后端」与「`apk`/`opkg` 后端」两节（装到设备上的普通文件总字节数：`pica` 为 `root/`，其余后端再加上容器解包后的载荷）。推荐不要在“源码 manifest”里手写，由 `pica-pack build` 在构建产物中自动计算并补全。
 
 校验文件（由 `pica-pack build` 自动生成，不写入 manifest）：
 
@@ -434,13 +456,13 @@ luci = lua1
 - `luci_url` 用于记录 LuCI 插件来源（可选；仅 LuCI 包建议填写）。
 - `luci_desc` 用于记录 LuCI 插件描述（与 `pkgdesc` 的通用程序描述分离）。
 - `pkgmgr = opkg|apk` 时：按 `app/base/kmod` 安装，按 `app` + `app_i18n`（`i18n=zh-cn`）卸载，`pkgs/` 中的原生包交给系统包管理器。
-- `pkgmgr = pica` 时：Pica 自己解包 `pkgs/` 中的 `.ipk` / `.apk` 并部署 `root/`、执行生命周期脚本，不解析依赖。
+- `pkgmgr = pica` 时：Pica 部署 `root/`、执行生命周期脚本，不解析依赖。产物里不该有 `pkgs/`——带了的归档在写入任何文件之前就被拒绝（`E_PACKAGE_INVALID`），因为 pica 不读容器格式，既装不了它，也无法为里面的文件记账。
 - `root/` 按路径镜像部署到真实根文件系统，安装的文件与目录会被记录，卸载时逐条回滚。
 - `script_install/script_update/script_remove` 是生命周期脚本（包内路径，一般在 `scripts/` 下），应按 POSIX `sh` 语法编写。
 - 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不依赖 `bash`。
 - 生命周期脚本保留策略（默认）：`script_remove` 保留；`script_install/script_update` 执行后不保留。
 - 如果包内无任何生命周期脚本，视为无生命周期包：安装/升级/卸载均不会触发脚本执行。
-- 脚本、`root/` 内文件、`pkgs/` 三者至少提供其一，否则构建与安装都会以“空包”拒绝。
+- 载荷至少提供其一，否则构建与安装都会以“空包”拒绝：对每个后端而言，`scripts/` 与 `root/` 都算；`pkgs/<backend>/` 只对 `opkg`/`apk` 算。所以一个只放 `pkgs/opkg/` 的 `pkgdir` 能产出 opkg 包，但同一份 `targets` 里的 `pica` 产物会因为没有任何文件而被拒绝。
 - 可在 `scripts/.env` 中声明保留策略：`PICA_KEEP_SCRIPT_INSTALL/PICA_KEEP_SCRIPT_UPDATE/PICA_KEEP_SCRIPT_REMOVE/PICA_KEEP_SCRIPT_ALL`（布尔值）。
 - 每次命令事务结束都会打印 `正在清理 pica 缓存`，并清理 `/var/lib/pica/cache/pkgs/` 目录内容。
 

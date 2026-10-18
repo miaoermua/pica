@@ -3,6 +3,7 @@ mod backend;
 mod build;
 mod container;
 mod matrix;
+mod payload;
 mod rewrite;
 
 use build::main_build;
@@ -20,7 +21,8 @@ fn usage() {
        manifest                         required, key = value (see docs/standard.md)\n  \
        scripts/                         optional, lifecycle scripts (install/update/remove/.env)\n  \
        root/                            optional, files mirrored onto the target rootfs\n  \
-       pkgs/<backend>/                  optional, containers for that backend; pica unpacks them itself\n  \
+       pkgs/opkg/ | pkgs/apk/           optional, containers the target's own package manager\n  \
+                                       installs; never accepted under pkgs/pica/\n  \
        pkgs/<backend>/<platform>/<arch>/  optional matrix layout\n  \
        LICENSE                          optional\n\
      \n\
