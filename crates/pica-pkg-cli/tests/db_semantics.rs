@@ -1341,6 +1341,11 @@ fn an_unavailable_optional_dependency_is_skipped_with_a_warning() {
     optional_outcomes(&sandbox, "opt-apk"),
     vec![("absent-dep".to_string(), "unavailable".to_string())]
   );
+
+  // The report keeps the reason the warning gave; `unavailable` alone would not
+  // say whether the feeds were read and lacked the name, or could not be read.
+  let entry = optional_entry(&sandbox, "opt-apk", "absent-dep");
+  assert_eq!(entry["reason"], "not available from the feeds", "{entry}");
 }
 
 #[test]
@@ -1512,4 +1517,7 @@ fn a_pica_artifact_may_declare_optional_dependencies_it_cannot_install() {
     optional_outcomes(&sandbox, "opt-pica"),
     vec![("opt-app".to_string(), "unavailable".to_string())]
   );
+
+  let entry = optional_entry(&sandbox, "opt-pica", "opt-app");
+  assert_eq!(entry["reason"], "pkgmgr=pica cannot install dependencies", "{entry}");
 }

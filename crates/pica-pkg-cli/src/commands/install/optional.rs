@@ -188,6 +188,13 @@ impl Plan {
         if let Some(requirement) = &item.requirement {
           entry["constraint"] = json!(requirement);
         }
+        // `unavailable` says nothing about why, and "the feeds could not be
+        // read" is a different answer from "the feeds do not have it". The text
+        // is the `&'static str` the warning and the selector already print, so
+        // the two cannot describe the same item differently.
+        if let Availability::Unavailable(reason) = item.availability {
+          entry["reason"] = json!(reason);
+        }
         // `installed_before` alone would hide that the version pica found is not
         // the version the artifact asked for.
         if item.bound_unmet {
@@ -529,6 +536,7 @@ fn newest_offer(candidates: Vec<FeedCandidate>) -> Option<FeedCandidate> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use pica_pkg_core::constraint::Constraint;
 
   fn item(name: &str, availability: Availability) -> Item {
     Item {
@@ -740,6 +748,67 @@ mod tests {
       vec!["installed", "declined", "installed_before", "installed_with_pkgs", "unavailable"]
     );
     assert_eq!(plan.report("failed")[0]["outcome"], "failed");
+  }
+
+  #[test]
+  fn an_unavailable_item_records_the_same_reason_the_screen_shows() {
+    // "The feeds could not be read" and "the feeds do not have it" both end up
+    // as `unavailable`; only the reason tells them apart, so the report has to
+    // keep it and keep the two different.
+    let plan = Plan {
+      items: vec![
+        item("unread", Availability::Unavailable("the feeds could not be read")),
+        item("absent", Availability::Unavailable("not available from the feeds")),
+        item("present", Availability::Installed),
+      ],
+    };
+
+    let report = plan.report("installed");
+    let text = render("demo", &plan);
+    for name in ["unread", "absent"] {
+      let entry = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .expect("the item is reported");
+      let reason = entry["reason"].as_str().expect("an unavailable item has a reason");
+      assert!(text.contains(reason), "the screen says {reason}: {text}");
+    }
+    assert_ne!(report[0]["reason"], report[1]["reason"], "the two failures stay apart");
+    assert!(report[2].get("reason").is_none(), "installed items gain nothing: {}", report[2]);
+  }
+
+  #[test]
+  fn an_unreadable_index_is_a_different_answer_from_an_absent_package() {
+    // The precheck records `unknown` when it could not read the index and
+    // `missing` when the index said no. Both are unavailable, but they are not
+    // the same fact, so the reason keeps them apart.
+    let feeds = Some(DependencySource::Feeds);
+    assert_eq!(
+      availability("app", Some("unknown"), feeds),
+      Availability::Unavailable("the feeds could not be read")
+    );
+    assert_eq!(
+      availability("app", Some("missing"), feeds),
+      Availability::Unavailable("not available from the feeds")
+    );
+  }
+
+  #[test]
+  fn the_pica_path_states_its_reason_too() {
+    let deps = DeclaredDeps {
+      kmod: Vec::new(),
+      base: Vec::new(),
+      app: vec![Constraint::parse("opt-app?").expect("valid declaration")],
+    };
+    let reason = "pkgmgr=pica cannot install dependencies";
+    let plan = Plan::unavailable(&deps, reason);
+
+    let entry = &plan.report("installed")[0];
+    assert_eq!(entry["outcome"], "unavailable");
+    assert_eq!(entry["reason"], reason, "{entry}");
+    assert!(render("demo", &plan).contains(reason));
   }
 
   #[test]

@@ -535,7 +535,7 @@ kmod = kmod-tun>=0.1?
 - "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
 - 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。已装但版本不满足声明的约束时，`outcome` 仍是 `installed_before`（这次安装确实不会动它），但选择器会写明"已装版本不满足声明的约束（约束原文）"，报告条目带 `reason`——"装着的版本不对"与"装不上"是两件事。
 - 选择器里的两个尺寸都来自后端自己的源索引，且只描述**这个包本身**、不含它的依赖：`Download` 是下载的包文件大小（opkg 列表的 `Size`、apk 的 `file-size`），`Installed` 是解包后的大小（`Installed-Size` / `installed-size`）。取的是后端真正会装的那个版本（裸包名 = 源里最高版本），两个数字互不推导：源里没写、或写成 `0`（apk 的 ADB 容器就是这样），就显示 `Unknown`。已安装与随 `pkgs/` 一起装的可选项没有下载动作，不显示尺寸。
-- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，已装版本不满足约束时含 `reason`（原始措辞与 stderr 上那句一致），源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
+- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。`reason` 只在需要解释时出现，且与 stderr 上是同一个 `&'static str`：`unavailable` 条目带上"装不了"的具体原因（读不到索引 / 源里没有 / 这次安装没有依赖来源 / 随 `pkgs/` 打包但这次走源），已装版本不满足约束的 `installed_before` 条目带上"装着的版本不对"。其他条目既没有空串也没有 `null`。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
 - 选择器与提示一律走 stderr，stdout 只留命令结果，`--json` 不会被污染。
 
 ## arch（后端架构字段）
