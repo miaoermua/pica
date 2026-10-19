@@ -1,8 +1,8 @@
 use super::index::{self, IndexSource, run_refresh};
-use super::{PackageManager, PackageManagerKind, describe_targets};
+use super::{FeedCandidate, PackageManager, PackageManagerKind, describe_targets};
 use crate::app::{
-  CliError, CliResult, E_IO, E_LOCK_BUSY, E_MISSING_COMMAND, E_NO_SPACE, E_OPKG_INSTALL,
-  E_OPKG_REMOVE, E_RUNTIME,
+  CliError, CliResult, E_INDEX_UNAVAILABLE, E_IO, E_LOCK_BUSY, E_MISSING_COMMAND, E_NO_SPACE,
+  E_OPKG_INSTALL, E_OPKG_REMOVE, E_RUNTIME,
 };
 use crate::lock::pid_is_running;
 use crate::system::{run_command_capture_output, stderr_or_stdout};
@@ -63,6 +63,42 @@ impl OpkgIndex {
       .or_else(|| self.lists_dirs.first())
       .cloned()
       .unwrap_or_else(|| PathBuf::from(OPKG_LISTS_DIRS[0]))
+  }
+
+  /// Every version of `name` the feed lists hold.
+  ///
+  /// The list files are read rather than asking `opkg info`, because they are
+  /// the only place that holds feed data alone: `info` answers from the merged
+  /// table, where a package that is installed as well as offered has already
+  /// stopped distinguishing "what is on this device" from "what could replace
+  /// it" — and it is the second answer a version bound needs.
+  fn feed_candidates(&self, name: &str) -> CliResult<Vec<FeedCandidate>> {
+    let conf = read_opkg_conf(&self.conf_files)?;
+    let dir = self.lists_dir(&conf);
+    let mut candidates = Vec::new();
+    for feed in &conf.feeds {
+      let path = dir.join(feed);
+      let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // `index_ready` has already refused a host with a missing list, so this
+        // is a file that vanished in between: it contributes nothing, and the
+        // feeds that are there still answer.
+        Err(err) if err.kind() == ErrorKind::NotFound => continue,
+        Err(err) => {
+          return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
+        }
+      };
+      let Ok(text) = std::str::from_utf8(&bytes) else {
+        // Decoding garbage would invent entries, and saying "no candidates" from
+        // a file nobody could read is the one answer this may not give.
+        return Err(CliError::new(
+          E_INDEX_UNAVAILABLE,
+          format!("{} is not a text index, so its entries cannot be read", path.display()),
+        ));
+      };
+      candidates.extend(parse_opkg_lists(text, name));
+    }
+    Ok(candidates)
   }
 
   /// The lock files worth looking at: the one `opkg` named itself, which is
@@ -252,6 +288,65 @@ fn opkg_lists_package(stdout: &str, name: &str) -> bool {
   stdout.lines().any(|line| line.strip_prefix("Package:").map(str::trim) == Some(name))
 }
 
+/// One `Packages`-style paragraph, kept until the blank line ends it.
+#[derive(Default)]
+struct OpkgEntry {
+  package: Option<String>,
+  version: Option<String>,
+  download: Option<u64>,
+  installed: Option<u64>,
+}
+
+impl OpkgEntry {
+  /// The candidate this paragraph describes, when it is `name`'s.
+  ///
+  /// A zero size is dropped rather than reported: a feed that writes `0` is
+  /// saying it does not know, and "0 bytes" would read as a measurement.
+  fn candidate(&self, name: &str) -> Option<FeedCandidate> {
+    if self.package.as_deref() != Some(name) {
+      return None;
+    }
+    Some(FeedCandidate {
+      version: self.version.clone()?,
+      download: self.download.filter(|bytes| *bytes > 0),
+      installed: self.installed.filter(|bytes| *bytes > 0),
+    })
+  }
+}
+
+/// The entries in one feed list that describe `name`.
+///
+/// The format is one paragraph per package version: `Field: value` lines, ended
+/// by a blank line, with continuation lines (indented) belonging to the field
+/// above. `Size` is the package file to fetch, `Installed-Size` is what the
+/// unpacked package takes — the two figures a user is deciding between, and the
+/// reason they are read separately instead of inferring one from the other.
+fn parse_opkg_lists(text: &str, name: &str) -> Vec<FeedCandidate> {
+  let mut candidates = Vec::new();
+  let mut entry = OpkgEntry::default();
+  // The closing blank line is not guaranteed, so the loop adds one.
+  for line in text.lines().chain(std::iter::once("")) {
+    let line = line.trim_end();
+    if line.trim().is_empty() {
+      candidates.extend(entry.candidate(name));
+      entry = OpkgEntry::default();
+      continue;
+    }
+    let Some((key, value)) = line.split_once(':') else {
+      continue;
+    };
+    let value = value.trim();
+    match key {
+      "Package" => entry.package = Some(value.to_string()),
+      "Version" => entry.version = Some(value.to_string()),
+      "Size" => entry.download = value.parse().ok(),
+      "Installed-Size" => entry.installed = value.parse().ok(),
+      _ => {}
+    }
+  }
+  candidates
+}
+
 impl PackageManager for OpkgBackend {
   fn kind(&self) -> PackageManagerKind {
     PackageManagerKind::Opkg
@@ -287,6 +382,11 @@ impl PackageManager for OpkgBackend {
     // answer to give about one of them.
     index::index_ready(&Self::index())?;
     Ok(false)
+  }
+
+  fn feed_candidates(&self, name: &str) -> CliResult<Vec<FeedCandidate>> {
+    index::index_ready(&Self::index())?;
+    Self::index().feed_candidates(name)
   }
 
   fn is_installed(&self, name: &str) -> bool {
@@ -492,9 +592,11 @@ fn read_opkg_lock_pid(path: &Path) -> Option<u32> {
 mod tests {
   use super::{
     OpkgIndex, is_opkg_lock_error, list_owns_path, opkg_list_dir_has_files, opkg_lists_package,
-    parse_depends_field, parse_installed_list, parse_opkg_conf, read_opkg_lock_pid,
+    parse_depends_field, parse_installed_list, parse_opkg_conf, parse_opkg_lists,
+    read_opkg_lock_pid,
   };
   use crate::app::E_INDEX_UNAVAILABLE;
+  use crate::pkgmgr::FeedCandidate;
   use crate::pkgmgr::index::{self, IndexSource};
   use pretty_assertions::assert_eq;
   use std::fs;
@@ -524,6 +626,71 @@ mod tests {
     assert!(is_opkg_lock_error("Could not lock /var/lock/opkg.lock"));
     assert!(is_opkg_lock_error("Cannot lock package database"));
     assert!(!is_opkg_lock_error("wget: bad address"));
+  }
+
+  /// One feed list holding two versions of `luci-app-demo`, one of them without
+  /// a download size, and one unrelated package.
+  const FEED_LIST: &str = "\
+Package: luci-app-demo
+Version: 1.2.3-1
+Depends: libc
+Installed-Size: 40960
+Size: 8192
+ continuation: belongs to the description
+
+Package: luci-app-demo
+Version: 1.0.0-1
+Installed-Size: 20480
+
+Package: other
+Version: 9.9.9-1
+Size: 1
+Installed-Size: 2
+";
+
+  #[test]
+  fn feed_list_separates_download_from_installed_size() {
+    let candidates = parse_opkg_lists(FEED_LIST, "luci-app-demo");
+    assert_eq!(
+      candidates,
+      vec![
+        FeedCandidate {
+          version: "1.2.3-1".to_string(),
+          download: Some(8192),
+          installed: Some(40960),
+        },
+        FeedCandidate { version: "1.0.0-1".to_string(), download: None, installed: Some(20480) },
+      ],
+      "Size is the package file and Installed-Size the unpacked size: a feed that \
+       omits one may not be given the other"
+    );
+  }
+
+  #[test]
+  fn feed_list_without_sizes_has_no_numbers_to_report() {
+    let text = "Package: demo\nVersion: 1.0\n\n";
+    assert_eq!(
+      parse_opkg_lists(text, "demo"),
+      vec![FeedCandidate { version: "1.0".to_string(), download: None, installed: None }]
+    );
+  }
+
+  #[test]
+  fn a_zero_size_is_not_a_measurement() {
+    let text = "Package: demo\nVersion: 1.0\nSize: 0\nInstalled-Size: 0\n";
+    assert_eq!(
+      parse_opkg_lists(text, "demo"),
+      vec![FeedCandidate { version: "1.0".to_string(), download: None, installed: None }],
+      "a feed that writes 0 is saying it does not know"
+    );
+  }
+
+  #[test]
+  fn feed_list_keeps_versions_apart_and_ignores_other_packages() {
+    let candidates = parse_opkg_lists(FEED_LIST, "other");
+    assert_eq!(candidates.len(), 1, "only the paragraph named `other`: {candidates:?}");
+    assert_eq!(candidates[0].version, "9.9.9-1");
+    assert_eq!(parse_opkg_lists(FEED_LIST, "absent"), Vec::new());
   }
 
   #[test]

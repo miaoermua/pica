@@ -14,16 +14,17 @@
 //! - Whatever state an item is in, the installer must be able to tell it apart.
 //!   "Unavailable" is never silently turned into "declined", and a package that
 //!   was already installed is never installed a second time.
-//! - Nothing is guessed. Sizes come from the pica index when an entry with the
-//!   same name and backend exists; otherwise they are reported as unknown. The
+//! - Nothing is guessed. Sizes come from the feed that would serve the package,
+//!   for the version the backend would install; a feed that does not record a
+//!   figure leaves it unknown rather than filling it in from the other one. The
 //!   containers in `pkgs/` are one batch (see `feed::install_pkgs_dir`), so their
 //!   members are not selectable one by one.
 
 use super::feed::DependencySource;
 use super::precheck::DeclaredDeps;
 use crate::app::{App, OptionalDeps};
-use crate::state::read_json_file;
-use pica_pkg_core::constraint;
+use crate::pkgmgr::FeedCandidate;
+use pica_pkg_core::{constraint, version};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -169,6 +170,9 @@ impl Plan {
         if let Some(requirement) = &item.requirement {
           entry["constraint"] = json!(requirement);
         }
+        if let Some(size) = item.download {
+          entry["download_size"] = json!(size);
+        }
         if let Some(size) = item.installed_size {
           entry["installed_size"] = json!(size);
         }
@@ -183,36 +187,45 @@ impl Plan {
 /// Builds the plan from what the precheck already learned, then asks the user
 /// for a choice when the mode and the terminal allow it.
 pub(crate) fn plan(
-  app: &App,
+  app: &mut App,
   package: &str,
   deps: &DeclaredDeps,
   report: &Value,
   source: Option<DependencySource>,
 ) -> Plan {
-  let sizes = index_sizes(app);
   let mut items = Vec::new();
 
   for (group, constraints) in [("kmod", &deps.kmod), ("base", &deps.base), ("app", &deps.app)] {
     for dep in constraint::optional(constraints) {
       let status = status_of(report, group, &dep.name);
-      let availability = availability(group, status.as_deref(), source);
-      // Sizes are only promised for what can actually be installed: an item in
-      // `pkgs/` is not a feed download, and the index knows nothing about a
-      // package that is not there.
-      let size = match availability {
-        Availability::Available => sizes.get(&dep.name).copied(),
-        _ => None,
-      };
-
       items.push(Item {
         group,
         name: dep.name.clone(),
         requirement: if dep.has_bound() { Some(dep.requirement()) } else { None },
-        availability,
+        availability: availability(group, status.as_deref(), source),
         download: None,
-        installed_size: size,
+        installed_size: None,
         selected: false,
       });
+    }
+  }
+
+  // Sizes are only promised for what can actually be installed: a package
+  // already on the device has nothing to download, and one in `pkgs/` is not a
+  // feed file.
+  let names: Vec<&str> = items
+    .iter()
+    .filter(|item| item.availability == Availability::Available)
+    .map(|item| item.name.as_str())
+    .collect();
+  if !names.is_empty() {
+    let offers = feed_offers(app, &names);
+    for item in &mut items {
+      let Some(offer) = offers.get(&item.name) else {
+        continue;
+      };
+      item.download = offer.download;
+      item.installed_size = offer.installed;
     }
   }
 
@@ -313,9 +326,9 @@ pub(crate) fn render(package: &str, plan: &Plan) -> String {
     let _ = writeln!(out, "  [{}] {mark} {:<width$}  {detail}", index + 1, item.name);
   }
 
-  if plan.items.iter().any(|item| item.installed_size.is_some()) {
+  if plan.items.iter().any(|item| item.download.is_some() || item.installed_size.is_some()) {
     out.push_str(
-      "\nSizes are this package alone, estimated from the pica index; they exclude dependencies.\n",
+      "\nSizes are this package alone, as its feed records them; they exclude dependencies.\n",
     );
   }
   out
@@ -408,50 +421,45 @@ fn availability(
   }
 }
 
-/// Installed sizes for the packages the synced pica index knows about.
+/// The newest version of each offered package, with the sizes its feed recorded.
 ///
-/// Only entries with the same backend are used: an `apk` package's size says
-/// nothing about the `opkg` package of the same name. A recorded size of 0 is
-/// treated as unknown — the index records 0 for containers pica cannot unpack
-/// (see `docs/standard.md`), which is "not measured", not "empty".
+/// The newest is the one the backend would install: `opkg` and `apk` both pick
+/// the highest version when given a bare name, so any other version's figures
+/// would describe a package this install is not going to put on the device.
 ///
-/// The index is read once for the whole list, so a router with twenty
-/// optional dependencies does not start twenty collections.
-fn index_sizes(app: &App) -> HashMap<String, u64> {
-  let mut sizes = HashMap::new();
-  let Ok(index) = read_json_file(&app.paths.index_file) else {
-    return sizes;
-  };
-  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
-    return sizes;
-  };
+/// A feed figure is not an invoice: `download` is the package file and
+/// `installed` the unpacked size it declares, and either may be missing. They
+/// are reported separately and never derived from each other.
+fn feed_offers(app: &mut App, names: &[&str]) -> HashMap<String, FeedCandidate> {
+  let mut offers = HashMap::new();
+  let mut failure = None;
 
-  let backend = app.backend();
-  for repo in repos.values() {
-    let Some(packages) =
-      repo.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
-    else {
-      continue;
-    };
-
-    for pkg in packages {
-      if pkg.get("pkgmgr").and_then(Value::as_str) != Some(backend.as_str()) {
-        continue;
-      }
-      let Some(name) = pkg.get("pkgname").and_then(Value::as_str) else {
-        continue;
-      };
-      let size = match pkg.get("size") {
-        Some(Value::Number(number)) => number.as_u64(),
-        Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
-        _ => None,
-      };
-      if let Some(size) = size.filter(|size| *size > 0) {
-        sizes.entry(name.to_string()).or_insert(size);
+  if let Ok(package_manager) = app.package_manager() {
+    for name in names {
+      match package_manager.feed_candidates(name) {
+        Ok(candidates) => {
+          if let Some(newest) = newest_offer(candidates) {
+            offers.insert((*name).to_string(), newest);
+          }
+        }
+        Err(err) => failure = Some(err),
       }
     }
   }
-  sizes
+
+  if let Some(err) = failure {
+    // The figures are an extra, not a prerequisite: an index that stopped
+    // answering after the precheck leaves the install possible with the sizes
+    // unknown, which the selector already knows how to say.
+    app.log_warn(format!("optional dependency sizes are unknown: {}", err.message));
+  }
+  offers
+}
+
+/// The candidate a bare name installs: the highest version, by the same order
+/// the bound checks use.
+fn newest_offer(candidates: Vec<FeedCandidate>) -> Option<FeedCandidate> {
+  candidates.into_iter().max_by(|a, b| version::pkgver_cmp(&a.version, &b.version))
 }
 
 #[cfg(test)]
@@ -492,6 +500,56 @@ mod tests {
     let text = render("demo", &plan);
     assert!(text.contains("Installed: ~4.0 MiB (est.)"), "{text}");
     assert!(text.contains("exclude dependencies"), "{text}");
+  }
+
+  #[test]
+  fn both_feed_sizes_are_shown_and_kept_apart() {
+    let plan = Plan {
+      items: vec![Item {
+        download: Some(8192),
+        installed_size: Some(40960),
+        ..item("xray-core", Availability::Available)
+      }],
+    };
+    let text = render("demo", &plan);
+    assert!(text.contains("Download: 8.0 KiB"), "{text}");
+    assert!(text.contains("Installed: ~40.0 KiB (est.)"), "{text}");
+    assert!(text.contains("exclude dependencies"), "{text}");
+  }
+
+  #[test]
+  fn the_newest_offer_is_the_one_shown() {
+    // `1.10` is newer than `1.9`, which a string comparison would get wrong.
+    let candidates = vec![
+      FeedCandidate { version: "1.9-r1".to_string(), download: Some(100), installed: Some(1000) },
+      FeedCandidate { version: "1.10-r1".to_string(), download: Some(200), installed: Some(2000) },
+      FeedCandidate { version: "1.2-r1".to_string(), download: Some(50), installed: None },
+    ];
+    assert_eq!(
+      newest_offer(candidates),
+      Some(FeedCandidate {
+        version: "1.10-r1".to_string(),
+        download: Some(200),
+        installed: Some(2000),
+      }),
+      "the backend installs the highest version, so its figures are the ones to show"
+    );
+    assert_eq!(newest_offer(Vec::new()), None, "a feed with no version offers nothing");
+  }
+
+  #[test]
+  fn the_report_records_the_two_sizes_apart() {
+    let plan = Plan {
+      items: vec![Item {
+        selected: true,
+        download: Some(8192),
+        installed_size: Some(40960),
+        ..item("chosen", Availability::Available)
+      }],
+    };
+    let report = plan.report("installed");
+    assert_eq!(report[0]["download_size"], 8192);
+    assert_eq!(report[0]["installed_size"], 40960);
   }
 
   #[test]

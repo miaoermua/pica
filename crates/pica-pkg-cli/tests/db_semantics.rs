@@ -1114,14 +1114,26 @@ esac
 exit 0
 "#;
 
+/// An `apk` whose feed offers `opt-app` in two versions, with the sizes each
+/// one would cost. `1.10` is newer than `1.9`, so its figures are the ones the
+/// install should carry — a string comparison would pick `1.9` and understate
+/// both numbers.
+const APK_STUB_WITH_SIZES: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  info) exit 1 ;;
+  query) printf '[{"name":"opt-app","version":"1.9.0-r1","installed-size":1024,"file-size":512},
+                  {"name":"opt-app","version":"1.10.0-r1","installed-size":40960,"file-size":8192}]\n' ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
+esac
+exit 0
+"#;
+
 /// The `precheck.optional` entries of an install report, as `(name, outcome)`.
 fn optional_outcomes(sandbox: &Sandbox, pkgname: &str) -> Vec<(String, String)> {
-  let raw = fs::read_to_string(sandbox.state_dir().join("install-report.json"))
-    .expect("the install writes a report");
-  let report: serde_json::Value = serde_json::from_str(&raw).expect("report is json");
-  report["reports"][pkgname]["precheck"]["optional"]
-    .as_array()
-    .unwrap_or_else(|| panic!("no optional section for {pkgname}"))
+  optional_entries(sandbox, pkgname)
     .iter()
     .map(|entry| {
       (
@@ -1130,6 +1142,25 @@ fn optional_outcomes(sandbox: &Sandbox, pkgname: &str) -> Vec<(String, String)> 
       )
     })
     .collect()
+}
+
+/// The whole `precheck.optional` array of an install report.
+fn optional_entries(sandbox: &Sandbox, pkgname: &str) -> Vec<serde_json::Value> {
+  let raw = fs::read_to_string(sandbox.state_dir().join("install-report.json"))
+    .expect("the install writes a report");
+  let report: serde_json::Value = serde_json::from_str(&raw).expect("report is json");
+  report["reports"][pkgname]["precheck"]["optional"]
+    .as_array()
+    .unwrap_or_else(|| panic!("no optional section for {pkgname}"))
+    .clone()
+}
+
+/// One `precheck.optional` entry by package name.
+fn optional_entry(sandbox: &Sandbox, pkgname: &str, name: &str) -> serde_json::Value {
+  optional_entries(sandbox, pkgname)
+    .into_iter()
+    .find(|entry| entry["name"].as_str() == Some(name))
+    .unwrap_or_else(|| panic!("no optional entry for {name}"))
 }
 
 #[test]
@@ -1195,6 +1226,28 @@ fn with_optional_installs_the_optional_dependency_in_its_phase() {
     optional_outcomes(&sandbox, "opt-apk"),
     vec![("opt-app".to_string(), "installed".to_string())]
   );
+}
+
+#[test]
+fn the_newest_offer_supplies_the_sizes_the_report_keeps() {
+  // The two figures answer different questions — bytes over the air and bytes
+  // on the device — and come from the version `apk add` would actually pick.
+  // Reporting `1.9`'s numbers for a `1.10` install would understate both.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_SIZES);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "base = base-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+
+  let entry = optional_entry(&sandbox, "opt-apk", "opt-app");
+  assert_eq!(entry["outcome"], "installed");
+  assert_eq!(entry["download_size"], 8192, "the package file: {entry}");
+  assert_eq!(entry["installed_size"], 40960, "what it unpacks to: {entry}");
 }
 
 #[test]

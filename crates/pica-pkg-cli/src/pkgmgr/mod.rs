@@ -69,6 +69,26 @@ impl PackageManagerKind {
   }
 }
 
+/// One version of one package that a feed offers, with the sizes the feed
+/// recorded for it.
+///
+/// The two sizes are different figures and neither is guaranteed: `download` is
+/// the size of the package file the installer fetches, `installed` is what the
+/// unpacked package takes on the device. A backend that reports only one of
+/// them leaves the other `None` rather than filling it with the figure it has —
+/// an estimate that quietly swapped the two would be wrong in the direction the
+/// user is deciding about (bytes over the air).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedCandidate {
+  /// The version as the backend prints it, ordered by
+  /// [`pica_pkg_core::version::pkgver_cmp`] so the newest can be picked.
+  pub version: String,
+  /// Bytes to download. `opkg`'s `Size`, `apk`'s `file-size`.
+  pub download: Option<u64>,
+  /// Bytes installed. `opkg`'s `Installed-Size`, `apk`'s `installed-size`.
+  pub installed: Option<u64>,
+}
+
 pub trait PackageManager {
   fn kind(&self) -> PackageManagerKind;
 
@@ -87,6 +107,16 @@ pub trait PackageManager {
   /// "the feeds cannot be read", which no caller may treat as the first: a
   /// backend whose index was never fetched reports every package as missing.
   fn package_exists(&self, name: &str) -> CliResult<bool>;
+
+  /// Every version of `name` the feeds offer, oldest to newest, each with the
+  /// sizes that feed wrote down for it.
+  ///
+  /// `Ok(empty)` is the answer "the feeds do not have it". `Err` is the answer
+  /// "the feeds cannot be read", and the two may not be confused: an index that
+  /// was never fetched lists nothing, which is not the same as a package no feed
+  /// carries. Sizes are `None` when the backend does not report them — asking for
+  /// them costs nothing extra here, because they come from the same index entry.
+  fn feed_candidates(&self, name: &str) -> CliResult<Vec<FeedCandidate>>;
   fn is_installed(&self, name: &str) -> bool;
   fn installed_version(&self, name: &str) -> Option<String>;
   /// Installs `targets` — package names, or the paths of local package files —

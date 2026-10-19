@@ -2,7 +2,7 @@ use super::apk_repositories::{
   self, APK_ARCH, APK_REPOSITORIES, APK_REPOSITORIES_DIRS, Configuration, IndexFile,
 };
 use super::index::{self, IndexSource, run_refresh};
-use super::{PackageManager, PackageManagerKind, describe_targets};
+use super::{FeedCandidate, PackageManager, PackageManagerKind, describe_targets};
 use crate::app::{CliError, CliResult, E_MISSING_COMMAND, E_NO_SPACE, E_RUNTIME};
 use crate::system::stderr_or_stdout;
 use std::io::ErrorKind;
@@ -198,6 +198,18 @@ impl PackageManager for ApkBackend {
         format!("apk search --exact {name} was killed by a signal: {}", detail()),
       )),
     }
+  }
+
+  fn feed_candidates(&self, name: &str) -> CliResult<Vec<FeedCandidate>> {
+    index::index_ready(&Self::index())?;
+    // `apk query` is the only command that reports both figures, and only apk 3
+    // has it. An apk that cannot answer in that form still knows the versions,
+    // so the fallback keeps the offer visible and leaves the sizes unknown
+    // instead of borrowing one figure for the other.
+    if let Some(candidates) = query_candidates(name) {
+      return Ok(candidates);
+    }
+    search_candidates(name)
   }
 
   fn is_installed(&self, name: &str) -> bool {
@@ -468,13 +480,135 @@ fn apk_result_name(line: &str) -> Option<String> {
   valid_package_name(value).then(|| value.to_string())
 }
 
+/// What `apk query` reports for `name`, or `None` when this `apk` cannot answer
+/// in that form.
+///
+/// `--fields name,version,installed-size,file-size` with `--format json` gives
+/// one row per matching package. `file-size` is the package file (`APKINDEX`'s
+/// `S:`), `installed-size` the unpacked size (`I:`), both in bytes. apk omits a
+/// field it does not know and counts a written `0` as unknown; both become
+/// `None` here. Anything unexpected yields `None`: a shape pica does not
+/// understand may not be turned into a number.
+fn query_candidates(name: &str) -> Option<Vec<FeedCandidate>> {
+  let output = Command::new("apk")
+    .args([
+      "query",
+      "--available",
+      "--format",
+      "json",
+      "--fields",
+      "name,version,installed-size,file-size",
+      "--",
+      name,
+    ])
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  parse_apk_query(&String::from_utf8_lossy(&output.stdout), name)
+}
+
+/// The rows of an `apk query --format json` answer.
+fn parse_apk_query(text: &str, name: &str) -> Option<Vec<FeedCandidate>> {
+  let value: serde_json::Value = serde_json::from_str(text).ok()?;
+  let rows = match value {
+    serde_json::Value::Array(rows) => rows,
+    single @ serde_json::Value::Object(_) => vec![single],
+    _ => return None,
+  };
+  let mut candidates = Vec::new();
+  for row in rows {
+    let serde_json::Value::Object(fields) = row else {
+      return None;
+    };
+    let (found, version) = match (
+      fields.get("name").and_then(serde_json::Value::as_str),
+      fields.get("version").and_then(serde_json::Value::as_str),
+    ) {
+      (Some(found), Some(version)) => (found.to_string(), version.to_string()),
+      // A shape that keeps name and version in one string is what `apk search`
+      // prints, and reading it here costs nothing.
+      _ => split_installed_line(fields.get("package").and_then(serde_json::Value::as_str)?)?,
+    };
+    if found != name {
+      continue;
+    }
+    candidates.push(FeedCandidate {
+      version,
+      download: apk_size(&fields, "file-size"),
+      installed: apk_size(&fields, "installed-size"),
+    });
+  }
+  Some(candidates)
+}
+
+/// One size from an `apk query` row, in bytes.
+fn apk_size(fields: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u64> {
+  let underscored = key.replace('-', "_");
+  [key, underscored.as_str()].into_iter().find_map(|key| {
+    let bytes = match fields.get(key) {
+      Some(serde_json::Value::Number(number)) => number.as_u64(),
+      Some(serde_json::Value::String(text)) => text.parse().ok(),
+      _ => None,
+    };
+    bytes.filter(|bytes| *bytes > 0)
+  })
+}
+
+/// The versions `apk search` reports, without sizes.
+///
+/// This is the fallback for an `apk` that has no `query` command, and the
+/// version bounds are all it can serve: it prints `name-version` lines and says
+/// nothing about bytes.
+fn search_candidates(name: &str) -> CliResult<Vec<FeedCandidate>> {
+  let output = Command::new("apk").args(["search", "--exact", name]).output().map_err(|err| {
+    let (code, message) = if err.kind() == ErrorKind::NotFound {
+      (E_MISSING_COMMAND, "missing required command: apk".to_string())
+    } else {
+      (E_RUNTIME, format!("apk search --exact {name} failed: {err}"))
+    };
+    CliError::new(code, message)
+  })?;
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let candidates: Vec<FeedCandidate> = stdout
+    .lines()
+    .filter_map(split_installed_line)
+    .filter(|(found, _)| found == name)
+    .map(|(_, version)| FeedCandidate { version, download: None, installed: None })
+    .collect();
+
+  match output.status.code() {
+    // apk 3 exits 1 for a query that matched nothing; the releases that exit 0
+    // say the same with an empty list.
+    Some(0 | 1) => Ok(candidates),
+    Some(code) => Err(CliError::new(
+      E_RUNTIME,
+      format!(
+        "apk search --exact {name} failed (exit {code}): {}",
+        stderr_or_stdout(&output.stdout, &output.stderr)
+      ),
+    )),
+    None => Err(CliError::new(
+      E_RUNTIME,
+      format!(
+        "apk search --exact {name} was killed by a signal: {}",
+        stderr_or_stdout(&output.stdout, &output.stderr)
+      ),
+    )),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
     ApkIndex, IndexFile, accepts_force_non_repository, apk_major_version, apk_result_name,
-    install_command, is_local_apk_path, parse_package_version, split_installed_line,
+    install_command, is_local_apk_path, parse_apk_query, parse_package_version,
+    split_installed_line,
   };
   use crate::app::{E_INDEX_UNAVAILABLE, E_IO};
+  use crate::pkgmgr::FeedCandidate;
   use crate::pkgmgr::index::{self, IndexSource};
   use pretty_assertions::assert_eq;
   use std::fs;
@@ -525,6 +659,67 @@ mod tests {
 
   fn shell(script: String) -> Vec<String> {
     vec!["sh".to_string(), "-c".to_string(), script]
+  }
+
+  #[test]
+  fn apk_query_rows_carry_the_two_sizes_apart() {
+    // `file-size` is the package apk downloads, `installed-size` what it takes
+    // once unpacked: an offer that swapped them would overstate or understate
+    // the bytes over the air.
+    let rows = r#"[
+      {"name":"luci-app-demo","version":"1.2.3-r1","installed-size":40960,"file-size":8192},
+      {"name":"luci-app-demo","version":"1.0.0-r1","installed-size":20480}
+    ]"#;
+    assert_eq!(
+      parse_apk_query(rows, "luci-app-demo"),
+      Some(vec![
+        FeedCandidate {
+          version: "1.2.3-r1".to_string(),
+          download: Some(8192),
+          installed: Some(40960),
+        },
+        FeedCandidate { version: "1.0.0-r1".to_string(), download: None, installed: Some(20480) },
+      ])
+    );
+  }
+
+  #[test]
+  fn apk_query_rows_without_sizes_report_none() {
+    let rows = r#"[{"name":"demo","version":"1.0-r0"}]"#;
+    assert_eq!(
+      parse_apk_query(rows, "demo"),
+      Some(vec![FeedCandidate { version: "1.0-r0".to_string(), download: None, installed: None }])
+    );
+    // A written 0 is apk saying it does not know, not a measurement.
+    let zeros = r#"[{"name":"demo","version":"1.0-r0","installed-size":0,"file-size":0}]"#;
+    assert_eq!(
+      parse_apk_query(zeros, "demo"),
+      Some(vec![FeedCandidate { version: "1.0-r0".to_string(), download: None, installed: None }])
+    );
+  }
+
+  #[test]
+  fn apk_query_answers_only_for_the_name_asked_about() {
+    let rows = r#"[{"name":"provider","version":"2.0-r0","file-size":10}]"#;
+    assert_eq!(parse_apk_query(rows, "demo"), Some(Vec::new()));
+    // Strings are read the same way: apk may print numbers as strings.
+    let text = r#"[{"name":"demo","version":"1.0-r0","file-size":"1024"}]"#;
+    assert_eq!(
+      parse_apk_query(text, "demo"),
+      Some(vec![FeedCandidate {
+        version: "1.0-r0".to_string(),
+        download: Some(1024),
+        installed: None,
+      }])
+    );
+  }
+
+  #[test]
+  fn an_unreadable_apk_query_answer_is_not_a_number() {
+    // Old releases print `name-version` lines instead of JSON, and a failure
+    // prints its message: neither may become a size.
+    assert_eq!(parse_apk_query("demo-1.0-r0\n", "demo"), None);
+    assert_eq!(parse_apk_query("ERROR: unable to select packages:\n", "demo"), None);
   }
 
   #[test]

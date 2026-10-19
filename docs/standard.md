@@ -533,7 +533,8 @@ kmod = kmod-tun>=0.1?
 
 - "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
 - 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。
-- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
+- 选择器里的两个尺寸都来自后端自己的源索引，且只描述**这个包本身**、不含它的依赖：`Download` 是下载的包文件大小（opkg 列表的 `Size`、apk 的 `file-size`），`Installed` 是解包后的大小（`Installed-Size` / `installed-size`）。取的是后端真正会装的那个版本（裸包名 = 源里最高版本），两个数字互不推导：源里没写、或写成 `0`（apk 的 ADB 容器就是这样），就显示 `Unknown`。已安装与随 `pkgs/` 一起装的可选项没有下载动作，不显示尺寸。
+- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
 - 选择器与提示一律走 stderr，stdout 只留命令结果，`--json` 不会被污染。
 
 ## arch（后端架构字段）
@@ -577,6 +578,31 @@ luci-i18n-myapp-zh-cn # i18n
 - 安装清单用 `app = ...`（以及可选 `app_i18n = ...`）列出应用子包。
 - 两个后端包名不同时，用 `<key>@<backend>` 覆盖，例如 `base = <依赖名>` 配 `base@apk = <该依赖在 apk 源里的名字>`。两个后端名字通常相同，只有确实不同才需要写这一行。
 - 卸载时 pica 按 `app` + `app_i18n` 映射处理（当前仅 `i18n=zh-cn` 时处理 i18n 包）。
+
+## 包命名：`pkgname` 与 `appname`
+
+pica 用两个字段承载“名字”，职责不同，不能混用：
+
+- `appname`：纯上游应用名，是命令行的选择键。`Package::app_key()` 取 `appname`（为空时回落到 `pkgname`）；`pica -S <app>` 收集候选时只按 `appname` 匹配，与它来自哪个源、`pkgname` 是什么无关。
+- `pkgname`：这个包在 pica 源里的唯一身份，原样写进产物文件名（`pica-pack` 只要求它非空，不校验字符集）。区分“谁做的 / 什么形态”的后缀只加在 `pkgname` 上。
+
+按“谁做的、做成什么形态”选择 `pkgname`：
+
+| 情况 | `pkgname` | `appname` |
+| --- | --- | --- |
+| 上游官方支持 OpenWrt / LuCI | `demo` | `demo` |
+| OpenWrt 官方社区打包 | `demo` | `demo` |
+| 只有二进制可用（上游没有现成的 OpenWrt 打包，pica 只是把可执行文件铺上去） | `demo-bin` | `demo` |
+| 第三方个人做的 | `demo@<用户名>` | `demo` |
+| 第三方社区 / 组织做的 | `demo@<组织名>` | `demo` |
+
+约定：
+
+- **去掉 `luci-app-` 前缀**：LuCI 包的真实身份是它服务的那个应用，而不是 Web 界面本身。`pkgname`/`appname` 都写 `demo`，把原生容器名留在安装清单里（`app = luci-app-demo`），这样用户敲的是 `pica -S demo` 而非 `pica -S luci-app-demo`，安装体验更好。
+- **`-bin` / `@<谁>` 只进 `pkgname`，不进 `appname`**：选择器语法里 `@` 是分支分隔符（`pica -S demo@stable` 解析为 appname `demo` + branch `stable`）。把 `@` 放进 `appname` 会让这个包永远无法被名字选中；放在 `pkgname` 里只作身份与展示，不干扰选择。
+- **`pkgname` 里的 `@` 不会到后端**：后端只接收 `app` / `base` / `kmod` 里的原生包名，那些名字不允许 `@`（只允许 `[A-Za-z0-9._+-]`，否则 `E_MANIFEST_INVALID`）。`@` 属于 pica 侧身份，从不下发给 `opkg` / `apk`。
+- **同一 `appname` 的多个包**（如官方 `demo` 与某个 `demo@alice`）：`pica -S demo` 把二者都纳入候选，取 `pkgver-pkgrel` 最高的那个（版本相同则先出现的源胜出）。`@<谁>` 只用于区分身份与展示，当前不提供“按 `pkgname` 精确选某一方”。
+- **语言包**：`app_i18n = <模板>-{lang}` 里的 `{lang}` 由配置项 `i18n` 解析（默认 `zh-cn`）；从源直接安装应用时，pica 会顺带尝试 `luci-i18n-<app>-<lang>`（当前仅 `zh-cn` 参与安装 / 卸载）。
 
 ## scripts/.env 预留
 
@@ -668,7 +694,7 @@ app:branch
 ## manifest 示例（LuCI1，双后端）
 
 ```ini
-pkgname = luci-app-example
+pkgname = example
 appname = example
 url = https://github.com/example/example
 luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-example
