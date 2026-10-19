@@ -30,6 +30,13 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, IsTerminal, Write as IoWrite};
 
+/// What an installed optional dependency failed, in the words both the screen
+/// and the report use.
+///
+/// One `&'static str` for both, so the two cannot drift into saying different
+/// things about the same item.
+const BOUND_UNMET: &str = "the installed version does not satisfy the declared constraint";
+
 /// How one optional dependency can be treated by this install.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Availability {
@@ -52,6 +59,16 @@ pub(crate) struct Item {
   pub(crate) name: String,
   pub(crate) requirement: Option<String>,
   pub(crate) availability: Availability,
+  /// Whether the version already on the device failed the bound the artifact
+  /// declares.
+  ///
+  /// This is not a kind of [`Availability`]: availability answers "can this
+  /// install deliver the package", the bound answers "does the assertion still
+  /// hold". They are orthogonal, for the same reason `required` and `optional`
+  /// are two dimensions rather than one enum. A version that misses the bound is
+  /// still installed and still out of this run's reach, so it stays
+  /// [`Availability::Installed`]; only the wording and the report change.
+  pub(crate) bound_unmet: bool,
   /// Compressed download size in bytes, when a trustworthy figure exists.
   pub(crate) download: Option<u64>,
   /// Installed size in bytes, when a trustworthy figure exists.
@@ -76,6 +93,7 @@ impl Plan {
           name: dep.name.clone(),
           requirement: if dep.has_bound() { Some(dep.requirement()) } else { None },
           availability: Availability::Unavailable(reason),
+          bound_unmet: false,
           download: None,
           installed_size: None,
           selected: false,
@@ -170,6 +188,11 @@ impl Plan {
         if let Some(requirement) = &item.requirement {
           entry["constraint"] = json!(requirement);
         }
+        // `installed_before` alone would hide that the version pica found is not
+        // the version the artifact asked for.
+        if item.bound_unmet {
+          entry["reason"] = json!(BOUND_UNMET);
+        }
         if let Some(size) = item.download {
           entry["download_size"] = json!(size);
         }
@@ -203,6 +226,7 @@ pub(crate) fn plan(
         name: dep.name.clone(),
         requirement: if dep.has_bound() { Some(dep.requirement()) } else { None },
         availability: availability(group, status.as_deref(), source),
+        bound_unmet: bound_unmet_in(report, group, &dep.name),
         download: None,
         installed_size: None,
         selected: false,
@@ -313,7 +337,7 @@ pub(crate) fn render(package: &str, plan: &Plan) -> String {
 
   for (index, item) in plan.items.iter().enumerate() {
     let (mark, detail) = match item.availability {
-      Availability::Installed => ("[+]", "already installed".to_string()),
+      Availability::Installed => ("[+]", installed_detail(item)),
       Availability::Packaged => {
         ("[+]", "installed from the artifact's pkgs/ with this request".to_string())
       }
@@ -332,6 +356,25 @@ pub(crate) fn render(package: &str, plan: &Plan) -> String {
     );
   }
   out
+}
+
+/// The detail line for an already-installed item.
+///
+/// A version that misses the declared bound is said so here: the log already
+/// warns about it during the precheck, and calling the same item "already
+/// installed" without qualification would contradict that warning on the same
+/// screen. The bound text is the artifact's own declaration; the installed
+/// version is not printed because this module never asked which version that
+/// is, and one extra question just to decorate a line would bring its own
+/// failure mode.
+fn installed_detail(item: &Item) -> String {
+  if !item.bound_unmet {
+    return "already installed".to_string();
+  }
+  match &item.requirement {
+    Some(requirement) => format!("already installed, but {BOUND_UNMET} ({requirement})"),
+    None => format!("already installed, but {BOUND_UNMET}"),
+  }
 }
 
 fn sizes(item: &Item) -> String {
@@ -385,12 +428,33 @@ fn format_bytes(bytes: u64) -> String {
   if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
+/// The precheck entry for one declaration, if the precheck looked at it.
+fn entry_of<'a>(report: &'a Value, group: &str, name: &str) -> Option<&'a Value> {
+  report
+    .get(group)?
+    .as_array()?
+    .iter()
+    .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+}
+
 /// The precheck status of one declaration, if the precheck looked at it.
 fn status_of(report: &Value, group: &str, name: &str) -> Option<String> {
-  let entries = report.get(group)?.as_array()?;
-  let entry =
-    entries.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))?;
-  entry.get("status").and_then(Value::as_str).map(ToString::to_string)
+  entry_of(report, group, name)
+    .and_then(|entry| entry.get("status"))
+    .and_then(Value::as_str)
+    .map(ToString::to_string)
+}
+
+/// Whether the precheck compared an installed version against a bound and found
+/// it wanting.
+///
+/// A missing key is "the question was not asked" — no bound, or nothing
+/// installed — so it reads as `false` without claiming the bound held.
+fn bound_unmet_in(report: &Value, group: &str, name: &str) -> bool {
+  entry_of(report, group, name)
+    .and_then(|entry| entry.get("bound_satisfied"))
+    .and_then(Value::as_bool)
+    == Some(false)
 }
 
 /// Turns a precheck status plus the artifact's dependency source into what this
@@ -472,10 +536,82 @@ mod tests {
       name: name.to_string(),
       requirement: None,
       availability,
+      bound_unmet: false,
       download: None,
       installed_size: None,
       selected: false,
     }
+  }
+
+  #[test]
+  fn a_met_bound_keeps_the_plain_installed_line() {
+    let plan = Plan {
+      items: vec![Item {
+        requirement: Some(">=1.0".to_string()),
+        ..item("present", Availability::Installed)
+      }],
+    };
+    let text = render("demo", &plan);
+    assert!(text.contains("already installed"), "{text}");
+    assert!(!text.contains(BOUND_UNMET), "{text}");
+    assert!(plan.report("installed")[0].get("reason").is_none(), "{text}");
+  }
+
+  #[test]
+  fn an_unmet_bound_is_said_once_and_left_alone() {
+    let plan = Plan {
+      items: vec![Item {
+        requirement: Some(">=2.0".to_string()),
+        bound_unmet: true,
+        ..item("present", Availability::Installed)
+      }],
+    };
+
+    let text = render("demo", &plan);
+    let line = text.lines().find(|line| line.contains("present")).expect("the item is listed");
+    assert!(line.contains(BOUND_UNMET), "{line}");
+    assert!(line.contains(">=2.0"), "the declared constraint is named: {line}");
+    assert_eq!(
+      text.lines().filter(|line| line.contains(BOUND_UNMET)).count(),
+      1,
+      "the detail stays on the item's own line: {text}"
+    );
+
+    let report = plan.report("installed");
+    assert_eq!(report[0]["outcome"], "installed_before", "{report}");
+    assert_eq!(report[0]["reason"], BOUND_UNMET, "{report}");
+
+    // Missing the bound is not a reason to touch the package: it is still not
+    // selected, and this install still does not cover it.
+    assert_eq!(plan.selected_names("app"), Vec::<String>::new());
+    assert_eq!(plan.selected_count(), 0);
+    assert!(!plan.covers("app", "present"));
+  }
+
+  #[test]
+  fn a_missing_verdict_is_not_a_failed_bound() {
+    // The precheck omits `bound_satisfied` when there was nothing to compare:
+    // no bound declared, or nothing installed. A missing key is not `false`.
+    let no_bound = json!({"app": [{"name": "plain", "status": "installed"}]});
+    assert!(!bound_unmet_in(&no_bound, "app", "plain"));
+
+    let met = json!({
+      "app": [{"name": "ok", "status": "installed", "constraint": ">=1.0", "bound_satisfied": true}]
+    });
+    assert!(!bound_unmet_in(&met, "app", "ok"));
+
+    let unmet = json!({
+      "app": [{"name": "old", "status": "installed", "constraint": ">=2.0", "bound_satisfied": false}]
+    });
+    assert!(bound_unmet_in(&unmet, "app", "old"));
+
+    // With no verdict the screen reads exactly as it did before this field
+    // existed, and the report gains nothing.
+    let plan = Plan { items: vec![item("plain", Availability::Installed)] };
+    let text = render("demo", &plan);
+    assert!(text.contains("already installed"), "{text}");
+    assert!(!text.contains(BOUND_UNMET), "{text}");
+    assert!(plan.report("installed")[0].get("reason").is_none());
   }
 
   #[test]

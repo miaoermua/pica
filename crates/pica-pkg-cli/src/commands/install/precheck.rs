@@ -138,13 +138,18 @@ fn dep_entries(
       }
       Err(err) => return Err(err),
     };
-    if status == "installed" {
-      let violations = crate::constraints::unmet(app, requester, group, std::slice::from_ref(dep));
-      if let Some(message) = violations.into_iter().next() {
+    // Only an installed dependency has a version on disk to compare against; for
+    // the rest the bound travels to the post-install recheck instead. `None`
+    // therefore means "not asked", which is why the key is omitted rather than
+    // written as `false`.
+    let bound = (status == "installed" && dep.has_bound())
+      .then(|| crate::constraints::unmet(app, requester, group, std::slice::from_ref(dep)));
+    if let Some(violations) = &bound {
+      if let Some(message) = violations.first() {
         if dep.optional {
           app.log_warn(format!("optional dependency is not satisfied: {message}"));
         } else {
-          return Err(CliError::new(E_VERSION_INCOMPATIBLE, message));
+          return Err(CliError::new(E_VERSION_INCOMPATIBLE, message.clone()));
         }
       }
     }
@@ -158,6 +163,11 @@ fn dep_entries(
       // that the artifact asserted a version, even when the dependency was not
       // installed yet and the assertion could not be checked.
       entry["constraint"] = json!(dep.requirement());
+    }
+    // The verdict, when one was reached. Its absence is not "satisfied": it says
+    // the question could not be put to a version this install knows about.
+    if let Some(violations) = bound {
+      entry["bound_satisfied"] = json!(violations.is_empty());
     }
     entries.push(entry);
   }

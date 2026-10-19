@@ -1114,6 +1114,20 @@ esac
 exit 0
 "#;
 
+/// The same, plus the answers a bound check needs: `apk info --installed` says
+/// `opt-app` is on the box, and `apk list --installed` says which version.
+const APK_STUB_WITH_OPT_VERSION: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  info) case "$3" in opt-app) exit 0 ;; *) exit 1 ;; esac ;;
+  list) printf '%s-@INSTALLED@\n' "$4" ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
+esac
+exit 0
+"#;
+
 /// An `apk` whose feed offers `opt-app` in two versions, with the sizes each
 /// one would cost. `1.10` is newer than `1.9`, so its figures are the ones the
 /// install should carry — a string comparison would pick `1.9` and understate
@@ -1352,6 +1366,55 @@ fn an_already_installed_optional_dependency_is_not_installed_again() {
     optional_outcomes(&sandbox, "opt-apk"),
     vec![("opt-app".to_string(), "installed_before".to_string())]
   );
+}
+
+#[test]
+fn an_installed_optional_dependency_short_of_its_bound_says_so() {
+  // The version on the box is 1.0 and the artifact asks for >=2.0. The package
+  // stays installed and untouched, but `installed_before` alone would be a
+  // claim that the declaration held.
+  let sandbox = Sandbox::with_stubs(
+    EMPTY_DB,
+    OPKG_STUB,
+    &APK_STUB_WITH_OPT_VERSION.replace("@INSTALLED@", "1.0.0"),
+  );
+  let artifact =
+    sandbox.container_artifact("opt-apk", "apk", "app = opt-app>=2.0?\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let entry = optional_entry(&sandbox, "opt-apk", "opt-app");
+  assert_eq!(entry["outcome"], "installed_before", "{entry}");
+  assert_eq!(entry["constraint"], ">=2.0", "{entry}");
+  assert_eq!(
+    entry["reason"], "the installed version does not satisfy the declared constraint",
+    "{entry}"
+  );
+  assert!(
+    !apk_add_targets(&sandbox.calls()).iter().flatten().any(|target| target == "opt-app"),
+    "nothing is installed over the one on the box: {}",
+    sandbox.calls()
+  );
+}
+
+#[test]
+fn an_installed_optional_dependency_that_meets_its_bound_gains_no_reason() {
+  let sandbox = Sandbox::with_stubs(
+    EMPTY_DB,
+    OPKG_STUB,
+    &APK_STUB_WITH_OPT_VERSION.replace("@INSTALLED@", "2.1.0"),
+  );
+  let artifact =
+    sandbox.container_artifact("opt-apk", "apk", "app = opt-app>=2.0?\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let entry = optional_entry(&sandbox, "opt-apk", "opt-app");
+  assert_eq!(entry["outcome"], "installed_before", "{entry}");
+  assert_eq!(entry["constraint"], ">=2.0", "{entry}");
+  assert!(entry.get("reason").is_none(), "{entry}");
 }
 
 #[test]

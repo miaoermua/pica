@@ -502,7 +502,7 @@ kmod = kmod-tun=0.1
 - **pica 没有预发布语义表**，不要用 `-rc` / `-beta` 表达"低于正式版"：`1.0.0-rc1` 会被切成 `pkgver=1.0.0` + `pkgrel=rc1`，因而**高于** `1.0.0`。需要这种关系时，请改用容器或调整 `pkgver`。
 - **需要精确版本请用 `pkgs/<backend>/` 携带容器**，由后端按路径安装：版本由容器自身决定，pica 不表达、也不校验它。
 - 校验时机：
-  - 安装预检（`-U` / `-S`）：依赖**已安装**且版本不满足时报错（`E_VERSION_INCOMPATIBLE`），消息里同时给出实际版本与要求的约束；依赖**尚未安装**时不阻塞安装，约束写进 `install-report` 供审计。
+  - 安装预检（`-U` / `-S`）：依赖**已安装**且版本不满足时报错（`E_VERSION_INCOMPATIBLE`），消息里同时给出实际版本与要求的约束；依赖**尚未安装**时不阻塞安装，约束写进 `install-report` 供审计。已安装且带约束时，预检条目还会写 `bound_satisfied`：键缺席表示这次没有可比较的版本（没装、或没写约束），与 `false` 不是一回事。
   - 安装第 5 步（交给后端）之后：同一组约束再判一次，不满足只 `warning`——容器已经落盘，pica 不撤销后端选定的版本。
   - 升级（`-Su`）：后端升级完成后复查所有已安装包声明的约束，不满足逐条 `warning`，不自动降级。
 - 约束不会让源里没有的包变成有的：缺失依赖仍走原有的 precheck 报错。
@@ -532,9 +532,9 @@ kmod = kmod-tun>=0.1?
 | 两个一起给 | `E_ARG_INVALID`，不猜哪个优先 |
 
 - "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
-- 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。
+- 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。已装但版本不满足声明的约束时，`outcome` 仍是 `installed_before`（这次安装确实不会动它），但选择器会写明"已装版本不满足声明的约束（约束原文）"，报告条目带 `reason`——"装着的版本不对"与"装不上"是两件事。
 - 选择器里的两个尺寸都来自后端自己的源索引，且只描述**这个包本身**、不含它的依赖：`Download` 是下载的包文件大小（opkg 列表的 `Size`、apk 的 `file-size`），`Installed` 是解包后的大小（`Installed-Size` / `installed-size`）。取的是后端真正会装的那个版本（裸包名 = 源里最高版本），两个数字互不推导：源里没写、或写成 `0`（apk 的 ADB 容器就是这样），就显示 `Unknown`。已安装与随 `pkgs/` 一起装的可选项没有下载动作，不显示尺寸。
-- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
+- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，已装版本不满足约束时含 `reason`（原始措辞与 stderr 上那句一致），源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
 - 选择器与提示一律走 stderr，stdout 只留命令结果，`--json` 不会被污染。
 
 ## arch（后端架构字段）
