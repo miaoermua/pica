@@ -624,8 +624,10 @@ mod tests {
 
   #[test]
   fn an_unknown_size_is_not_shown_as_zero() {
-    // 0 in the index means "not measured" (an unpackable container), and
-    // `index_sizes` drops it. What is left has to read as unknown, not 0.
+    // A feed that records 0 means "not measured" (apk's ADB containers), and
+    // both readers turn it into `None`: `opkg.rs`'s `candidate` filters
+    // `*bytes > 0`, and `apk.rs`'s `apk_size` does the same. An absent figure
+    // has to read as unknown, not 0.
     let plan = Plan { items: vec![item("xray-core", Availability::Available)] };
     let text = render("demo", &plan);
     assert!(text.contains("Download: Unknown"), "{text}");
