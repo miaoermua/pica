@@ -1,14 +1,21 @@
-//! Version bounds in a manifest's `app` / `base` / `kmod` lists.
+//! Version bounds and optionality in a manifest's `app` / `base` / `kmod` lists.
 //!
 //! A declaration is either a bare name (`libfoo`) or a name with one bound
 //! (`libfoo>=1.2`). The bound is an assertion pica checks against what the
 //! system has installed — never solver input. It is deliberately not handed to
 //! a backend: `apk` accepts a versioned atom, `opkg` installs by name or by
 //! `.ipk` path, and one string cannot mean the same thing to both.
+//!
+//! A trailing `?` marks the declaration as optional (`libfoo>=1.2?`). Optional
+//! means "offer it to the user", never "not needed": the name still names a
+//! package the manifest wants, so the precheck reports it and the installer can
+//! choose it. `?` is not a package-name character, so the marker cannot be
+//! confused with a real name, and a manifest without it parses as before.
 
 use crate::error::{PicaError, PicaResult};
 use crate::version::pkgver_cmp;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 /// The comparison a bound asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +66,12 @@ pub struct Constraint {
   pub name: String,
   /// The bound, when the declaration carries one.
   pub bound: Option<(Op, String)>,
+  /// Whether the declaration ended with `?`.
+  ///
+  /// Optional declarations are still declarations: they are reported by the
+  /// precheck and can be selected for installation. What they lose is the right
+  /// to stop a install when they are missing.
+  pub optional: bool,
 }
 
 impl Constraint {
@@ -73,13 +86,20 @@ impl Constraint {
       return Err(PicaError::msg("empty dependency declaration"));
     }
 
+    // The marker is stripped before anything else so `>=` after a name is never
+    // read as part of an optional marker. `?` cannot appear in a package name,
+    // so a trailing one is unambiguous; `??` leaves `?` in the name and is
+    // refused by the name check rather than being read as "very optional".
     let normalized = normalize_operators(trimmed);
-    let Some(index) = normalized.find(['<', '>', '=']) else {
-      require_name(&normalized, trimmed)?;
-      return Ok(Self { raw: trimmed.to_string(), name: normalized, bound: None });
+    let (body, optional) = split_optional(&normalized);
+
+    let Some(index) = body.find(['<', '>', '=']) else {
+      let name = body.trim();
+      require_name(name, trimmed)?;
+      return Ok(Self { raw: trimmed.to_string(), name: name.to_string(), bound: None, optional });
     };
 
-    let rest = &normalized[index..];
+    let rest = &body[index..];
     let (op, version) = if let Some(tail) = rest.strip_prefix(">=") {
       (Op::Ge, tail)
     } else if let Some(tail) = rest.strip_prefix("<=") {
@@ -105,13 +125,14 @@ impl Constraint {
       return Err(PicaError::msg(format!("invalid operator or version in dependency: {trimmed}")));
     }
 
-    let name = normalized[..index].trim();
+    let name = body[..index].trim();
     require_name(name, trimmed)?;
 
     Ok(Self {
       raw: trimmed.to_string(),
       name: name.to_string(),
       bound: Some((op, version.to_string())),
+      optional,
     })
   }
 
@@ -153,6 +174,56 @@ pub fn parse_all(items: &[String]) -> PicaResult<Vec<Constraint>> {
   items.iter().filter(|item| !item.trim().is_empty()).map(|item| Constraint::parse(item)).collect()
 }
 
+/// Parses a dependency list, dropping repeats and letting the required form win.
+///
+/// A name listed twice is one dependency, not two installs. When the two forms
+/// disagree about optionality, the required one is kept: the manifest said the
+/// package must be there once, and a second, weaker mention cannot take that
+/// back. The surviving declaration keeps its own bound and its own position, so
+/// a `libfoo>=1.2?` before a `libfoo` is reported as the bounded required form.
+///
+/// # Errors
+/// Returns the first invalid declaration, as [`Constraint::parse`] does.
+pub fn resolve(items: &[String]) -> PicaResult<Vec<Constraint>> {
+  let parsed = parse_all(items)?;
+  let required: HashSet<String> = parsed
+    .iter()
+    .filter(|constraint| !constraint.optional)
+    .map(|constraint| constraint.name.clone())
+    .collect();
+
+  let mut seen = HashSet::new();
+  let mut resolved = Vec::with_capacity(parsed.len());
+  for constraint in parsed {
+    if constraint.optional && required.contains(constraint.name.as_str()) {
+      continue;
+    }
+    if !seen.insert(constraint.name.clone()) {
+      continue;
+    }
+    resolved.push(constraint);
+  }
+  Ok(resolved)
+}
+
+/// The declarations that must be installed for the package to work.
+pub fn required(constraints: &[Constraint]) -> impl Iterator<Item = &Constraint> {
+  constraints.iter().filter(|constraint| !constraint.optional)
+}
+
+/// The declarations the user may decline.
+pub fn optional(constraints: &[Constraint]) -> impl Iterator<Item = &Constraint> {
+  constraints.iter().filter(|constraint| constraint.optional)
+}
+
+/// Splits a trailing `?` off `input`, returning the declaration without it.
+fn split_optional(input: &str) -> (&str, bool) {
+  match input.strip_suffix('?') {
+    Some(body) => (body.trim_end(), true),
+    None => (input, false),
+  }
+}
+
 /// The names behind `constraints`, which is the only part a backend may see.
 ///
 /// Keeping this a function rather than a field means a caller cannot
@@ -175,6 +246,7 @@ fn normalize_operators(input: &str) -> String {
       '＞' => out.push('>'),
       '＜' => out.push('<'),
       '＝' => out.push('='),
+      '？' => out.push('?'),
       other => out.push(other),
     }
   }
@@ -203,7 +275,7 @@ fn require_name(name: &str, raw: &str) -> PicaResult<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{Constraint, Op, names, parse_all};
+  use super::{Constraint, Op, names, parse_all, resolve};
 
   fn parsed(raw: &str) -> Constraint {
     Constraint::parse(raw).expect("constraint parses")
@@ -340,5 +412,65 @@ mod tests {
   fn names_drops_the_bounds() {
     let list = parse_all(&["libfoo>=1.2".to_string(), "libbar".to_string()]).expect("parses");
     assert_eq!(names(&list), vec!["libfoo".to_string(), "libbar".to_string()]);
+  }
+
+  #[test]
+  fn a_trailing_question_mark_marks_a_declaration_optional() {
+    let constraint = parsed("libfoo?");
+    assert_eq!(constraint.name, "libfoo");
+    assert!(constraint.optional, "the marker is not part of the name");
+    assert_eq!(constraint.raw, "libfoo?", "the marker is kept for display");
+    assert!(!constraint.has_bound());
+    assert!(constraint.is_met_by("0.0.1"), "optional still means the packages the manifest wants");
+
+    let bounded = parsed("libfoo>=1.2?");
+    assert_eq!(bounded.name, "libfoo");
+    assert_eq!(bounded.bound, Some((Op::Ge, "1.2".to_string())));
+    assert!(bounded.optional);
+
+    // Whitespace before the marker is not part of the name, and the full-width
+    // question mark an IME produces is the same marker.
+    assert_eq!(parsed("libfoo >= 1.2 ?").name, "libfoo");
+    assert!(parsed("libfoo≥1.2？").optional);
+
+    // A manifest written before the marker existed keeps its meaning.
+    assert!(!parsed("libfoo").optional);
+    assert!(!parsed("libfoo>=1.2").optional);
+  }
+
+  #[test]
+  fn a_misplaced_optional_marker_is_refused() {
+    for raw in ["?", "  ?  ", "??", "libfoo??", "libfoo?>=1.2", "libfoo? bar"] {
+      assert!(Constraint::parse(raw).is_err(), "{raw:?} must be refused");
+    }
+  }
+
+  #[test]
+  fn resolve_drops_repeats_and_keeps_the_required_form() {
+    let resolved = resolve(&[
+      "libfoo>=1.0?".to_string(),
+      "libbar".to_string(),
+      "libfoo".to_string(),
+      "libbar?".to_string(),
+      "libbaz>=2?".to_string(),
+      "libbaz?".to_string(),
+      String::new(),
+    ])
+    .expect("resolves");
+
+    let summary: Vec<(String, bool, String)> =
+      resolved.iter().map(|c| (c.name.clone(), c.optional, c.requirement())).collect();
+    assert_eq!(
+      summary,
+      vec![
+        // `libbar` and `libfoo` were required somewhere, so the optional
+        // mentions disappear; `libfoo` keeps the required declaration's
+        // (unbounded) form and its own position.
+        ("libbar".to_string(), false, String::new()),
+        ("libfoo".to_string(), false, String::new()),
+        // Repeated optionals collapse to the first mention, bound included.
+        ("libbaz".to_string(), true, ">=2".to_string()),
+      ]
+    );
   }
 }

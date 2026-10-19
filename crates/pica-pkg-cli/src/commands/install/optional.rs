@@ -1,0 +1,598 @@
+//! Optional dependencies: which ones the artifact declares with `?`, and which
+//! the user asked for.
+//!
+//! A `?` declaration is optional, not a prerequisite. It goes through the
+//! same precheck as everything else — that is the only way to know whether the
+//! package exists and is already installed — but it never blocks the install, and
+//! it only reaches a backend when the user chose it (or `--with-optional` did).
+//!
+//! Three rules shape this module:
+//!
+//! - The plan is built after the precheck and before the transaction, so it can be
+//!   shown without having written anything, and a user who declines leaves no
+//!   trace.
+//! - Whatever state an item is in, the installer must be able to tell it apart.
+//!   "Unavailable" is never silently turned into "declined", and a package that
+//!   was already installed is never installed a second time.
+//! - Nothing is guessed. Sizes come from the pica index when an entry with the
+//!   same name and backend exists; otherwise they are reported as unknown. The
+//!   containers in `pkgs/` are one batch (see `feed::install_pkgs_dir`), so their
+//!   members are not selectable one by one.
+
+use super::feed::DependencySource;
+use super::precheck::DeclaredDeps;
+use crate::app::{App, OptionalDeps};
+use crate::state::read_json_file;
+use pica_pkg_core::constraint;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::{BufRead, IsTerminal, Write as IoWrite};
+
+/// How one optional dependency can be treated by this install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Availability {
+  /// Already on the device. Shown, never reinstalled.
+  Installed,
+  /// In the backend's feeds and selectable.
+  Available,
+  /// Declared, but this install cannot deliver it. The reason is what the user
+  /// sees, so it says why rather than "error".
+  Unavailable(&'static str),
+  /// Shipped in the artifact's `pkgs/` and installed with that batch. The batch
+  /// is indivisible, so the item is shown and not selectable.
+  Packaged,
+}
+
+/// One optional dependency, with what is known about it.
+#[derive(Clone, Debug)]
+pub(crate) struct Item {
+  pub(crate) group: &'static str,
+  pub(crate) name: String,
+  pub(crate) requirement: Option<String>,
+  pub(crate) availability: Availability,
+  /// Compressed download size in bytes, when a trustworthy figure exists.
+  pub(crate) download: Option<u64>,
+  /// Installed size in bytes, when a trustworthy figure exists.
+  pub(crate) installed_size: Option<u64>,
+  pub(crate) selected: bool,
+}
+
+/// Everything one install decided about the artifact's optional dependencies.
+#[derive(Debug, Default)]
+pub(crate) struct Plan {
+  items: Vec<Item>,
+}
+
+impl Plan {
+  /// A plan for a backend that cannot install dependencies at all.
+  pub(crate) fn unavailable(deps: &DeclaredDeps, reason: &'static str) -> Self {
+    let mut items = Vec::new();
+    for (group, constraints) in [("kmod", &deps.kmod), ("base", &deps.base), ("app", &deps.app)] {
+      for dep in constraint::optional(constraints) {
+        items.push(Item {
+          group,
+          name: dep.name.clone(),
+          requirement: if dep.has_bound() { Some(dep.requirement()) } else { None },
+          availability: Availability::Unavailable(reason),
+          download: None,
+          installed_size: None,
+          selected: false,
+        });
+      }
+    }
+    Self { items }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.items.is_empty()
+  }
+
+  /// Names of the optional dependencies the user chose for `group`.
+  pub(crate) fn selected_names(&self, group: &str) -> Vec<String> {
+    self
+      .items
+      .iter()
+      .filter(|item| item.group == group && item.selected)
+      .map(|item| item.name.clone())
+      .collect()
+  }
+
+  pub(crate) fn selected_count(&self) -> usize {
+    self.items.iter().filter(|item| item.selected).count()
+  }
+
+  /// Whether this install is responsible for `name`: it asked the backend for
+  /// it, or the artifact's `pkgs/` batch installs it. Already-installed ones are
+  /// excluded — the precheck judged those, and this run did not touch them.
+  ///
+  /// This is what decides which bounds are rechecked after step 5 (see
+  /// `pipeline::recheck_constraints`). A packaged optional dependency is
+  /// installed even though it was never selectable, so its bound has to be
+  /// checked like any other package this run put on the device.
+  pub(crate) fn covers(&self, group: &str, name: &str) -> bool {
+    self.items.iter().any(|item| {
+      item.group == group
+        && item.name == name
+        && (item.selected || item.availability == Availability::Packaged)
+    })
+  }
+
+  /// States the optional dependencies this install will not deliver, once, so a user
+  /// does not have to open the report to find out why.
+  pub(crate) fn warn_skipped(&self, app: &mut App) {
+    let mut by_reason: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for item in &self.items {
+      let Availability::Unavailable(reason) = item.availability else {
+        continue;
+      };
+      match by_reason.iter_mut().find(|(known, _)| *known == reason) {
+        Some((_, names)) => names.push(item.name.clone()),
+        None => by_reason.push((reason, vec![item.name.clone()])),
+      }
+    }
+
+    for (reason, names) in by_reason {
+      app.log_warn(format!("optional dependencies skipped ({}): {}", reason, names.join(" ")));
+    }
+  }
+
+  /// The `optional` section of the install report.
+  ///
+  /// `selected_outcome` is what a chosen package became: `installed` for a
+  /// completed install, `failed` for one that was rolled back. A declined or
+  /// unavailable package is never recorded as installed.
+  pub(crate) fn report(&self, selected_outcome: &str) -> Value {
+    let items: Vec<Value> = self
+      .items
+      .iter()
+      .map(|item| {
+        let outcome = match item.availability {
+          Availability::Installed => "installed_before",
+          Availability::Available => {
+            if item.selected {
+              selected_outcome
+            } else {
+              "declined"
+            }
+          }
+          Availability::Unavailable(_) => "unavailable",
+          Availability::Packaged => "installed_with_pkgs",
+        };
+
+        let mut entry = json!({
+          "group": item.group,
+          "name": item.name,
+          "optional": true,
+          "outcome": outcome,
+        });
+        if let Some(requirement) = &item.requirement {
+          entry["constraint"] = json!(requirement);
+        }
+        if let Some(size) = item.installed_size {
+          entry["installed_size"] = json!(size);
+        }
+        entry
+      })
+      .collect();
+
+    Value::Array(items)
+  }
+}
+
+/// Builds the plan from what the precheck already learned, then asks the user
+/// for a choice when the mode and the terminal allow it.
+pub(crate) fn plan(
+  app: &App,
+  package: &str,
+  deps: &DeclaredDeps,
+  report: &Value,
+  source: Option<DependencySource>,
+) -> Plan {
+  let sizes = index_sizes(app);
+  let mut items = Vec::new();
+
+  for (group, constraints) in [("kmod", &deps.kmod), ("base", &deps.base), ("app", &deps.app)] {
+    for dep in constraint::optional(constraints) {
+      let status = status_of(report, group, &dep.name);
+      let availability = availability(group, status.as_deref(), source);
+      // Sizes are only promised for what can actually be installed: an item in
+      // `pkgs/` is not a feed download, and the index knows nothing about a
+      // package that is not there.
+      let size = match availability {
+        Availability::Available => sizes.get(&dep.name).copied(),
+        _ => None,
+      };
+
+      items.push(Item {
+        group,
+        name: dep.name.clone(),
+        requirement: if dep.has_bound() { Some(dep.requirement()) } else { None },
+        availability,
+        download: None,
+        installed_size: size,
+        selected: false,
+      });
+    }
+  }
+
+  let mut plan = Plan { items };
+  if plan.items.is_empty() {
+    return plan;
+  }
+
+  match app.options.optional_deps {
+    OptionalDeps::None => {}
+    // `--with-optional` is an explicit instruction, so it applies without a
+    // terminal and without asking. Already-installed items are left alone.
+    OptionalDeps::All => {
+      for item in &mut plan.items {
+        item.selected = item.availability == Availability::Available;
+      }
+    }
+    OptionalDeps::Ask => ask(app, package, &mut plan),
+  }
+
+  plan
+}
+
+/// Shows the selector and reads the answer.
+///
+/// The prompt is written to stderr, never stdout: `--json` may be on, and the
+/// greeting is not the result of the command.
+fn ask(app: &App, package: &str, plan: &mut Plan) {
+  if !plan.items.iter().any(|item| item.availability == Availability::Available) {
+    return;
+  }
+
+  // `--non-interactive` is the documented way to say "do not wait"; a stdin that
+  // is not a terminal is the same situation without the flag. Reading either
+  // would block a cron job or swallow a script's input.
+  if app.options.non_interactive || !std::io::stdin().is_terminal() {
+    if !app.options.non_interactive {
+      eprintln!(
+        "pica: stdin is not a terminal; installing no optional dependencies \
+         (use --with-optional to include them)"
+      );
+    }
+    return;
+  }
+
+  eprint!("{}", render(package, plan));
+  let selectable: Vec<usize> = plan
+    .items
+    .iter()
+    .enumerate()
+    .filter_map(|(index, item)| (item.availability == Availability::Available).then_some(index + 1))
+    .collect();
+
+  loop {
+    eprint!("Select optional packages by number, `all`, or press Enter to skip: ");
+    let _ = std::io::stderr().flush();
+
+    let mut input = String::new();
+    let stdin = std::io::stdin();
+    // EOF means nobody is there to answer, which is a skip, not an error.
+    if stdin.lock().read_line(&mut input).unwrap_or(0) == 0 {
+      eprintln!();
+      return;
+    }
+
+    match parse_selection(&input, &selectable) {
+      Ok(chosen) => {
+        for index in chosen {
+          plan.items[index - 1].selected = true;
+        }
+        return;
+      }
+      Err(message) => eprintln!("{message}"),
+    }
+  }
+}
+
+/// Renders the list shown before the question.
+///
+/// Kept separate from the prompt so the formatting can be asserted without a
+/// terminal, and so the text cannot accidentally go to stdout.
+pub(crate) fn render(package: &str, plan: &Plan) -> String {
+  let mut out = format!("Optional dependencies for {package}\n\n");
+  let width = plan.items.iter().map(|item| item.name.len()).max().unwrap_or(0);
+
+  for (index, item) in plan.items.iter().enumerate() {
+    let (mark, detail) = match item.availability {
+      Availability::Installed => ("[+]", "already installed".to_string()),
+      Availability::Packaged => {
+        ("[+]", "installed from the artifact's pkgs/ with this request".to_string())
+      }
+      Availability::Unavailable(reason) => ("[-]", format!("unavailable ({reason})")),
+      Availability::Available => {
+        let mark = if item.selected { "[x]" } else { "[ ]" };
+        (mark, sizes(item))
+      }
+    };
+    let _ = writeln!(out, "  [{}] {mark} {:<width$}  {detail}", index + 1, item.name);
+  }
+
+  if plan.items.iter().any(|item| item.installed_size.is_some()) {
+    out.push_str(
+      "\nSizes are this package alone, estimated from the pica index; they exclude dependencies.\n",
+    );
+  }
+  out
+}
+
+fn sizes(item: &Item) -> String {
+  let download = item.download.map_or_else(|| "Unknown".to_string(), format_bytes);
+  let installed = item
+    .installed_size
+    .map_or_else(|| "Unknown".to_string(), |bytes| format!("~{} (est.)", format_bytes(bytes)));
+  format!("Download: {download}  Installed: {installed}")
+}
+
+/// Parses one line of the selector into the 1-based numbers it names.
+///
+/// Empty input is a skip. `all` is every offered number. Anything else must be
+/// a number from the list: a typo is reported instead of being treated as "no",
+/// because silently installing nothing after a typo is the worse surprise.
+pub(crate) fn parse_selection(input: &str, selectable: &[usize]) -> Result<Vec<usize>, String> {
+  let trimmed = input.trim();
+  if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+    return Ok(Vec::new());
+  }
+  if trimmed.eq_ignore_ascii_case("all") {
+    return Ok(selectable.to_vec());
+  }
+
+  let mut chosen = Vec::new();
+  for token in trimmed.split([' ', ',', '\t']) {
+    if token.is_empty() {
+      continue;
+    }
+    let number: usize =
+      token.parse().map_err(|_| format!("`{token}` is not a number; nothing was selected"))?;
+    if !selectable.contains(&number) {
+      return Err(format!("`{token}` is not one of the offered numbers; nothing was selected"));
+    }
+    if !chosen.contains(&number) {
+      chosen.push(number);
+    }
+  }
+  Ok(chosen)
+}
+
+#[allow(clippy::cast_precision_loss, reason = "a byte count is far below 2^52")]
+fn format_bytes(bytes: u64) -> String {
+  const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+  let mut value = bytes as f64;
+  let mut unit = 0;
+  while value >= 1024.0 && unit + 1 < UNITS.len() {
+    value /= 1024.0;
+    unit += 1;
+  }
+  if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+/// The precheck status of one declaration, if the precheck looked at it.
+fn status_of(report: &Value, group: &str, name: &str) -> Option<String> {
+  let entries = report.get(group)?.as_array()?;
+  let entry =
+    entries.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))?;
+  entry.get("status").and_then(Value::as_str).map(ToString::to_string)
+}
+
+/// Turns a precheck status plus the artifact's dependency source into what this
+/// install can offer.
+fn availability(
+  group: &str,
+  status: Option<&str>,
+  source: Option<DependencySource>,
+) -> Availability {
+  match status {
+    Some("installed") => Availability::Installed,
+    // Kernel modules always come from the feeds: an application artifact cannot
+    // carry one, so the containers decision does not apply to them.
+    Some("feed") if group == "kmod" => Availability::Available,
+    Some("feed") => match source {
+      Some(DependencySource::Feeds) => Availability::Available,
+      Some(DependencySource::Containers) => {
+        Availability::Unavailable("this artifact installs its dependencies from pkgs/")
+      }
+      None => Availability::Unavailable("this install has no dependency source"),
+    },
+    Some("packaged") => match source {
+      Some(DependencySource::Containers) => Availability::Packaged,
+      _ => Availability::Unavailable("packaged in the artifact, but this install uses the feeds"),
+    },
+    Some("unknown") => Availability::Unavailable("the feeds could not be read"),
+    _ => Availability::Unavailable("not available from the feeds"),
+  }
+}
+
+/// Installed sizes for the packages the synced pica index knows about.
+///
+/// Only entries with the same backend are used: an `apk` package's size says
+/// nothing about the `opkg` package of the same name. A recorded size of 0 is
+/// treated as unknown — the index records 0 for containers pica cannot unpack
+/// (see `docs/standard.md`), which is "not measured", not "empty".
+///
+/// The index is read once for the whole list, so a router with twenty
+/// optional dependencies does not start twenty collections.
+fn index_sizes(app: &App) -> HashMap<String, u64> {
+  let mut sizes = HashMap::new();
+  let Ok(index) = read_json_file(&app.paths.index_file) else {
+    return sizes;
+  };
+  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
+    return sizes;
+  };
+
+  let backend = app.backend();
+  for repo in repos.values() {
+    let Some(packages) =
+      repo.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
+    else {
+      continue;
+    };
+
+    for pkg in packages {
+      if pkg.get("pkgmgr").and_then(Value::as_str) != Some(backend.as_str()) {
+        continue;
+      }
+      let Some(name) = pkg.get("pkgname").and_then(Value::as_str) else {
+        continue;
+      };
+      let size = match pkg.get("size") {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
+        _ => None,
+      };
+      if let Some(size) = size.filter(|size| *size > 0) {
+        sizes.entry(name.to_string()).or_insert(size);
+      }
+    }
+  }
+  sizes
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn item(name: &str, availability: Availability) -> Item {
+    Item {
+      group: "app",
+      name: name.to_string(),
+      requirement: None,
+      availability,
+      download: None,
+      installed_size: None,
+      selected: false,
+    }
+  }
+
+  #[test]
+  fn an_unknown_size_is_not_shown_as_zero() {
+    // 0 in the index means "not measured" (an unpackable container), and
+    // `index_sizes` drops it. What is left has to read as unknown, not 0.
+    let plan = Plan { items: vec![item("xray-core", Availability::Available)] };
+    let text = render("demo", &plan);
+    assert!(text.contains("Download: Unknown"), "{text}");
+    assert!(text.contains("Installed: Unknown"), "{text}");
+    assert!(!text.contains(" 0 B"), "{text}");
+  }
+
+  #[test]
+  fn a_known_size_is_marked_as_an_estimate() {
+    let plan = Plan {
+      items: vec![Item {
+        installed_size: Some(4 * 1024 * 1024),
+        ..item("xray-core", Availability::Available)
+      }],
+    };
+    let text = render("demo", &plan);
+    assert!(text.contains("Installed: ~4.0 MiB (est.)"), "{text}");
+    assert!(text.contains("exclude dependencies"), "{text}");
+  }
+
+  #[test]
+  fn every_state_has_its_own_marker() {
+    let plan = Plan {
+      items: vec![
+        item("offered", Availability::Available),
+        item("present", Availability::Installed),
+        item("bundled", Availability::Packaged),
+        item("absent", Availability::Unavailable("not available from the feeds")),
+      ],
+    };
+    let text = render("demo", &plan);
+    assert!(text.contains("[1] [ ] offered"), "{text}");
+    assert!(text.contains("[2] [+] present"), "{text}");
+    assert!(text.contains("already installed"), "{text}");
+    assert!(text.contains("installed from the artifact's pkgs/ with this request"), "{text}");
+    assert!(text.contains("[4] [-] absent"), "{text}");
+    assert!(text.contains("unavailable (not available from the feeds)"), "{text}");
+    assert!(text.starts_with("Optional dependencies for demo\n"), "{text}");
+  }
+
+  #[test]
+  fn a_selection_is_numbers_or_all_and_typos_are_reported() {
+    let offered = [1, 3];
+    assert_eq!(parse_selection("", &offered), Ok(Vec::new()));
+    assert_eq!(parse_selection("  none ", &offered), Ok(Vec::new()));
+    assert_eq!(parse_selection("1, 3", &offered), Ok(vec![1, 3]));
+    assert_eq!(parse_selection("3 1 3", &offered), Ok(vec![3, 1]));
+    assert_eq!(parse_selection("all", &offered), Ok(vec![1, 3]));
+    assert!(parse_selection("2", &offered).is_err());
+    assert!(parse_selection("xray", &offered).is_err());
+  }
+
+  #[test]
+  fn the_report_keeps_declined_unavailable_and_installed_apart() {
+    let plan = Plan {
+      items: vec![
+        Item { selected: true, ..item("chosen", Availability::Available) },
+        item("declined", Availability::Available),
+        item("present", Availability::Installed),
+        item("bundled", Availability::Packaged),
+        item("absent", Availability::Unavailable("not available from the feeds")),
+      ],
+    };
+
+    let report = plan.report("installed");
+    let outcomes: Vec<&str> =
+      report.as_array().expect("array").iter().filter_map(|e| e["outcome"].as_str()).collect();
+    assert_eq!(
+      outcomes,
+      vec!["installed", "declined", "installed_before", "installed_with_pkgs", "unavailable"]
+    );
+    assert_eq!(plan.report("failed")[0]["outcome"], "failed");
+  }
+
+  #[test]
+  fn only_the_choices_that_can_be_installed_are_installed() {
+    let plan = Plan {
+      items: vec![
+        Item { selected: true, ..item("chosen", Availability::Available) },
+        item("absent", Availability::Unavailable("not available from the feeds")),
+        item("present", Availability::Installed),
+      ],
+    };
+    assert_eq!(plan.selected_names("app"), vec!["chosen".to_string()]);
+    assert_eq!(plan.selected_count(), 1);
+    assert!(plan.covers("app", "chosen"));
+    assert!(!plan.covers("app", "absent"));
+  }
+
+  #[test]
+  fn a_packaged_optional_dependency_is_covered_even_though_it_is_not_selectable() {
+    // It goes on the device with the `pkgs/` batch, so this run is the one that
+    // has to stand behind a bound it declared.
+    let plan = Plan {
+      items: vec![
+        item("bundled", Availability::Packaged),
+        item("present", Availability::Installed),
+      ],
+    };
+    assert!(plan.covers("app", "bundled"));
+    assert!(!plan.covers("app", "present"));
+    assert!(plan.selected_names("app").is_empty());
+  }
+
+  #[test]
+  fn a_declined_optional_dependency_is_not_declared_missing() {
+    // The contract with the precheck: `?` entries never appear in the missing
+    // list, so the install continues when they are absent.
+    let report = json!({
+      "kmod": [],
+      "base": [],
+      "app": [
+        {"name": "optional", "status": "missing", "optional": true},
+        {"name": "required", "status": "missing"},
+      ],
+    });
+    assert_eq!(
+      super::super::precheck::summarize_missing_precheck(&report),
+      vec!["app:required".to_string()]
+    );
+  }
+}

@@ -242,6 +242,7 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
   - `packaged-first`
   - `feed-only`
   - `packaged-only`
+- `--with-optional` / `--no-optional`：全装 / 全不装可选依赖（`?`），默认在终端上询问、非终端一个不装（见「可选依赖（`?`）」）。两者互斥。
 
 ## 依赖索引：答不出来就不答
 
@@ -361,6 +362,8 @@ app_i18n = luci-i18n-hello-{lang}
 base = busybox
 # A bound is checked by pica, never passed to the backend (see below)
 # base = luci-base>=1.2
+# A trailing ? is optional: offered to the user, never a reason to fail
+# app = luci-app-hello-extra?
 # kmod = kmod-tun
 # 两个后端名字不同时才需要这一行；名字通常相同。
 # base@apk = <该依赖在 apk 源里的名字>
@@ -415,6 +418,8 @@ visibility = open
 app = <native package name>
 base = <native package name>
 kmod = <native package name>
+# A trailing ? marks an optional dependency (see 「可选依赖（?）」)
+app = <native package name>?
 
 # Backend override (repeatable): <key>@<backend>, backend = opkg | apk | pica
 # The annotated key replaces the plain key wholesale for that backend.
@@ -502,6 +507,34 @@ kmod = kmod-tun=0.1
   - 升级（`-Su`）：后端升级完成后复查所有已安装包声明的约束，不满足逐条 `warning`，不自动降级。
 - 约束不会让源里没有的包变成有的：缺失依赖仍走原有的 precheck 报错。
 - `-Qi` 的 `Requires` 字段按原文列出带约束的声明（如 `base:luci-base>=1.2`）；不带约束的包名仍由 `Depends` 汇报。
+
+### 可选依赖（`?`）
+
+在声明末尾加 `?` 表示"可选，不是必需"：
+
+```
+app  = luci-app-mosdns?
+kmod = kmod-tun>=0.1?
+```
+
+- `?` 必须在整条声明最后，版本约束写在它前面（`luci-app-demo>1.0?`）。`?` 不是包名字符，因此不会与真实包名混淆；`??` 会在名字校验里被拒，而不是被读成"更可选"。
+- 同一个包名同时以必需和可选出现时，必需的那条生效：`resolve` 只留一条，后端与报告都看不到第二份。
+- 可选项与必需依赖走同一套预检（仍会问源里有没有、本机装没装），区别只在缺失或版本不符时**不**报错，状态照常写进报告。
+
+装不装由 `--with-optional` / `--no-optional` 决定，默认是"能问就问"：
+
+| 情况 | 行为 |
+| --- | --- |
+| 默认、stdin 是终端 | 列出可选项，按编号、`all` 或回车跳过 |
+| 默认、stdin 不是终端或 `--non-interactive` | 一个不装；不是终端时在 stderr 说明可以用 `--with-optional` |
+| `--with-optional` | 所有可装的可选项都装，不询问、不需要终端 |
+| `--no-optional` | 一个不装，也不输出上一条提示 |
+| 两个一起给 | `E_ARG_INVALID`，不猜哪个优先 |
+
+- "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
+- 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。
+- 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`）。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。
+- 选择器与提示一律走 stderr，stdout 只留命令结果，`--json` 不会被污染。
 
 ## arch（后端架构字段）
 

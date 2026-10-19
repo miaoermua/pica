@@ -55,6 +55,21 @@ impl FeedPolicy {
   }
 }
 
+/// What an install does with the optional dependencies a manifest declares.
+///
+/// This is deliberately a separate choice from [`FeedPolicy`]: where a
+/// dependency comes from and whether the user wants it at all are different
+/// questions, and answering one must not silently answer the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalDeps {
+  /// Offer the list on a terminal, install none where nobody can be asked.
+  Ask,
+  /// Install every optional dependency that is available (`--with-optional`).
+  All,
+  /// Install none of them (`--no-optional`).
+  None,
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
   pub etc_dir: PathBuf,
@@ -105,6 +120,8 @@ pub struct Options {
   pub fetch_retry_delay: u64,
   /// Explicit `--pkgmgr` value. Highest-priority backend selection.
   pub pkgmgr: Option<String>,
+  /// What to do with the optional dependencies in a manifest.
+  pub optional_deps: OptionalDeps,
 }
 
 #[derive(Debug)]
@@ -273,6 +290,8 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut fetch_retry = 2u32;
   let mut fetch_retry_delay = 1u64;
   let mut pkgmgr = None;
+  let mut optional_deps = OptionalDeps::Ask;
+  let mut optional_given = false;
   let mut positional = Vec::new();
 
   let mut index = 0;
@@ -288,6 +307,20 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       }
       "--non-interactive" => {
         non_interactive = true;
+        index += 1;
+      }
+      // Both flags answer the same question, so guessing which one wins would
+      // be a silent change of what the user asked for. Say so instead.
+      "--with-optional" | "--no-optional" => {
+        if optional_given {
+          return Err(CliError::new(
+            E_ARG_INVALID,
+            "--with-optional and --no-optional are mutually exclusive",
+          ));
+        }
+        optional_given = true;
+        optional_deps =
+          if args[index] == "--with-optional" { OptionalDeps::All } else { OptionalDeps::None };
         index += 1;
       }
       "--feed-policy" => {
@@ -346,6 +379,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       fetch_retry,
       fetch_retry_delay,
       pkgmgr,
+      optional_deps,
     },
     positional,
   ))

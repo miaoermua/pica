@@ -263,6 +263,17 @@ impl Sandbox {
     cmd.assert()
   }
 
+  /// The same, with an empty pipe on stdin.
+  ///
+  /// `write_stdin` gives the child a pipe that is closed straight away. Whether
+  /// the test runs from a terminal or from CI, that is not a terminal — the
+  /// situation the optional-dependency selector has to handle without blocking.
+  fn run_off_terminal(&self, args: &[&str]) -> Assert {
+    let mut cmd = self.command();
+    cmd.args(args).write_stdin("");
+    cmd.assert()
+  }
+
   /// Package manager invocations recorded so far, one per line.
   fn calls(&self) -> String {
     fs::read_to_string(self.state_dir().join("calls.log")).unwrap_or_default()
@@ -309,15 +320,16 @@ impl Sandbox {
   ///
   /// The payload goes under `tmp/` because this sandbox redirects the database
   /// but not the target root, so a `root/etc/...` would try to write to the
-  /// real `/etc`.
-  fn root_only_artifact(&self, pkgname: &str, declared: &str) -> PathBuf {
+  /// real `/etc`. `extra` is appended to the manifest, where a dependency
+  /// declaration goes.
+  fn root_only_artifact(&self, pkgname: &str, declared: &str, extra: &str) -> PathBuf {
     let src = self.dir.path().join(format!("src-{pkgname}"));
     let root = src.join("root/tmp");
     fs::create_dir_all(&root).expect("create pkgdir");
     fs::write(
       src.join("manifest"),
       format!(
-        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = {declared}\nplatform = all\nos = all\narch = all\n"
+        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = {declared}\nplatform = all\nos = all\narch = all\n{extra}"
       ),
     )
     .expect("write manifest");
@@ -626,7 +638,7 @@ fn install_records_the_backend_in_use_not_the_declared_one() {
   // package manager. Recording the declared value would make `-R` drive apk
   // against files apk never touched.
   let sandbox = Sandbox::new(EMPTY_DB);
-  let artifact = sandbox.root_only_artifact("declared-apk", "apk");
+  let artifact = sandbox.root_only_artifact("declared-apk", "apk", "");
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
   sandbox.run(&["--pkgmgr", "pica", "-U", artifact]).success();
@@ -1065,5 +1077,323 @@ fn a_bound_the_backend_breaks_while_installing_is_reported_not_undone() {
   assert!(
     stderr.contains("bound-opkg requires base:base-dep>=2.0, but 1.1 is installed"),
     "the warning names both versions: {stderr}"
+  );
+}
+
+// -- Optional dependencies -----------------------------------------------------
+//
+// A `?` declaration is optional: the precheck still looks it up, so the
+// user can be told what is available, but the install must not fail when it is
+// absent and must not install it unless it was asked for. The stubs below make
+// the two halves of that visible — what reaches `apk add`, and what the install
+// report says happened.
+
+/// An `apk` whose feeds hold every name but `absent-dep`, and where nothing is
+/// installed. `info` deliberately fails: the shared stubs exit 0 for it, which
+/// apk reads as "installed".
+const APK_STUB_WITH_ABSENT: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  info) exit 1 ;;
+  search) case "$3" in absent-dep) exit 1 ;; *) printf '%s-1.0.0\n' "$3" ;; esac ;;
+esac
+exit 0
+"#;
+
+/// The same, except that `opt-app` is already on the device.
+const APK_STUB_WITH_OPT_INSTALLED: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  info) case "$3" in opt-app) exit 0 ;; *) exit 1 ;; esac ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
+esac
+exit 0
+"#;
+
+/// The `precheck.optional` entries of an install report, as `(name, outcome)`.
+fn optional_outcomes(sandbox: &Sandbox, pkgname: &str) -> Vec<(String, String)> {
+  let raw = fs::read_to_string(sandbox.state_dir().join("install-report.json"))
+    .expect("the install writes a report");
+  let report: serde_json::Value = serde_json::from_str(&raw).expect("report is json");
+  report["reports"][pkgname]["precheck"]["optional"]
+    .as_array()
+    .unwrap_or_else(|| panic!("no optional section for {pkgname}"))
+    .iter()
+    .map(|entry| {
+      (
+        entry["name"].as_str().unwrap_or_default().to_string(),
+        entry["outcome"].as_str().unwrap_or_default().to_string(),
+      )
+    })
+    .collect()
+}
+
+#[test]
+fn off_a_terminal_the_optional_dependencies_are_skipped_and_said_so() {
+  // Nobody can be asked, and reading stdin would block a script or a cron job.
+  // The default is therefore "install none", and it must not be silent: the
+  // user has to learn that `--with-optional` exists.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "base = base-dep\napp = app-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert = sandbox.run_off_terminal(&["-U", artifact, "--feed-policy", "feed-first"]).success();
+
+  let calls = sandbox.calls();
+  assert_eq!(
+    apk_add_targets(&calls),
+    vec![vec!["base-dep".to_string()], vec!["app-dep".to_string()]],
+    "only the required dependencies are installed: {calls}"
+  );
+
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  assert!(stderr.contains("stdin is not a terminal"), "the skip is explained: {stderr}");
+  assert!(stderr.contains("--with-optional"), "and the way out is named: {stderr}");
+
+  let stdout = stdout_of(&assert);
+  assert!(
+    !stdout.contains("Optional dependencies"),
+    "the selector never reaches stdout, where it would corrupt `--json`: {stdout}"
+  );
+
+  assert_eq!(
+    optional_outcomes(&sandbox, "opt-apk"),
+    vec![("opt-app".to_string(), "declined".to_string())],
+    "a skipped optional dependency is recorded as declined, not as installed"
+  );
+}
+
+#[test]
+fn with_optional_installs_the_optional_dependency_in_its_phase() {
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "base = base-dep\napp = app-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+
+  let calls = sandbox.calls();
+  assert_eq!(
+    apk_add_targets(&calls),
+    vec![vec!["base-dep".to_string()], vec!["app-dep".to_string(), "opt-app".to_string()],],
+    "the chosen optional dependency joins its own phase, not a third request: {calls}"
+  );
+  assert_eq!(
+    optional_outcomes(&sandbox, "opt-apk"),
+    vec![("opt-app".to_string(), "installed".to_string())]
+  );
+}
+
+#[test]
+fn no_optional_is_the_same_choice_without_the_explanation() {
+  // The flag exists for scripts that would otherwise see the "stdin is not a
+  // terminal" note on every run.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "app = app-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert = sandbox
+    .run_off_terminal(&["-U", artifact, "--feed-policy", "feed-first", "--no-optional"])
+    .success();
+
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  assert!(!stderr.contains("stdin is not a terminal"), "the choice was explicit: {stderr}");
+
+  let calls = sandbox.calls();
+  assert_eq!(
+    apk_add_targets(&calls),
+    vec![vec!["app-dep".to_string()]],
+    "nothing optional is installed: {calls}"
+  );
+}
+
+#[test]
+fn the_two_optional_flags_cannot_both_be_given() {
+  // Guessing which one wins would silently install packages the user said not
+  // to install, or skip ones they asked for.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.apk_artifact("opt-apk");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact, "--with-optional", "--no-optional"])
+    .failure()
+    .stderr(contains("mutually exclusive"));
+
+  assert_eq!(sandbox.calls(), "", "the argument error stops the install first");
+}
+
+#[test]
+fn an_unavailable_optional_dependency_is_skipped_with_a_warning() {
+  // The feeds are the source here, and they do not have `absent-dep`. The
+  // install proceeds — the manifest said it may — but the report must not claim
+  // the package was declined: nobody was asked.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "app = app-dep\napp = absent-dep?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert =
+    sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  assert!(
+    stderr.contains("optional dependencies skipped (not available from the feeds): absent-dep"),
+    "the warning names the package and the reason: {stderr}"
+  );
+
+  let calls = sandbox.calls();
+  assert_eq!(
+    apk_add_targets(&calls),
+    vec![vec!["app-dep".to_string()]],
+    "the absent optional dependency is not asked for: {calls}"
+  );
+  assert_eq!(
+    optional_outcomes(&sandbox, "opt-apk"),
+    vec![("absent-dep".to_string(), "unavailable".to_string())]
+  );
+}
+
+#[test]
+fn an_already_installed_optional_dependency_is_not_installed_again() {
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_OPT_INSTALLED);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "app = app-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+
+  let calls = sandbox.calls();
+  assert_eq!(
+    apk_add_targets(&calls),
+    vec![vec!["app-dep".to_string()]],
+    "`--with-optional` means `all`, not `all again`: {calls}"
+  );
+  assert_eq!(
+    optional_outcomes(&sandbox, "opt-apk"),
+    vec![("opt-app".to_string(), "installed_before".to_string())]
+  );
+}
+
+#[test]
+fn an_optional_dependency_the_containers_will_supply_is_not_a_feed_install() {
+  // `packaged-first` takes the artifact's own containers, so a feed package
+  // cannot be installed in the same run: apk would resolve it outside `pkgs/`
+  // while the batch installs a second copy. The optional dependency is shown
+  // as unavailable rather than silently turned into a feed install.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact =
+    sandbox.container_artifact("opt-apk", "apk", "app = opt-app?\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert =
+    sandbox.run(&["-U", artifact, "--feed-policy", "packaged-first", "--with-optional"]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds.len(), 1, "the batch is the only request: {calls}");
+  assert_eq!(file_names(&adds[0]), vec!["demo-app.apk".to_string()], "{calls}");
+
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  assert!(
+    stderr.contains(
+      "optional dependencies skipped (this artifact installs its dependencies from pkgs/)"
+    ),
+    "the reason is the source decision, not the feeds: {stderr}"
+  );
+}
+
+#[test]
+fn an_optional_kmod_goes_through_the_feeds_even_when_the_containers_supply_the_rest() {
+  // An application artifact cannot ship a kernel module, so the containers
+  // decision does not apply: a kmod is offered and installed from the feeds.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact =
+    sandbox.container_artifact("kmod-holder", "apk", "kmod = opt-kmod?\n", &["demo.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["-U", artifact, "--feed-policy", "packaged-first", "--with-optional"]).success();
+
+  let calls = sandbox.calls();
+  let adds = apk_add_targets(&calls);
+  assert_eq!(adds[0], vec!["opt-kmod".to_string()], "the kmod is one request of its own: {calls}");
+  assert!(
+    adds.iter().any(|targets| file_names(targets) == vec!["demo.apk".to_string()]),
+    "the container batch still installs: {calls}"
+  );
+}
+
+#[test]
+fn a_required_dependency_that_is_missing_still_stops_the_install() {
+  // The whole point of `?` is that the same absence is fatal without it. This is
+  // the guard against the optional path accidentally loosening the required one.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_WITH_ABSENT);
+  let artifact = sandbox.container_artifact(
+    "opt-apk",
+    "apk",
+    "app = absent-dep\napp = opt-app?\n",
+    &["demo-app.apk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"])
+    .failure()
+    .stderr(contains("dependency precheck failed, missing: app:absent-dep"));
+
+  assert!(
+    !sandbox.calls().contains("apk add"),
+    "the precheck stopped before anything was installed: {}",
+    sandbox.calls()
+  );
+}
+
+#[test]
+fn a_pica_artifact_may_declare_optional_dependencies_it_cannot_install() {
+  // `pkgmgr=pica` has no resolver, so a required declaration is refused (the
+  // package would silently lose something it promised). An optional dependency
+  // is the one case where the honest answer is a warning: the install is
+  // complete without it.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("opt-pica", "pica", "app = opt-app?\n");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert = sandbox.run(&["-U", artifact, "--with-optional"]).success();
+
+  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  assert!(
+    stderr.contains("pkgmgr=pica cannot install optional dependencies; skipping opt-app"),
+    "{stderr}"
+  );
+  assert_eq!(sandbox.calls(), "", "no package manager may be driven");
+  assert_eq!(
+    optional_outcomes(&sandbox, "opt-pica"),
+    vec![("opt-app".to_string(), "unavailable".to_string())]
   );
 }

@@ -1,4 +1,5 @@
 mod feed;
+mod optional;
 mod pipeline;
 mod precheck;
 

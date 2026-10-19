@@ -205,7 +205,7 @@ mod tests {
   use super::{
     DependencySource, dependency_source, install_pkgs_dir, pkg_list_diff_added, reorder_app_list,
   };
-  use crate::app::{App, FeedPolicy, JsonMode, Options, Paths};
+  use crate::app::{App, FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
   use pretty_assertions::assert_eq;
 
   #[test]
@@ -249,6 +249,7 @@ mod tests {
         fetch_retry: 2,
         fetch_retry_delay: 1,
         pkgmgr: None,
+        optional_deps: OptionalDeps::None,
       },
     )
   }

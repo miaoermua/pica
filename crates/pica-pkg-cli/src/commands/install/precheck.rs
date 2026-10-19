@@ -69,8 +69,13 @@ fn packaged_or_missing(pkgs_dir: &Path, dep: &str) -> String {
 }
 
 /// Parses one dependency list, naming the manifest key in the error.
+///
+/// [`constraint::resolve`] runs here rather than at each reader so that the
+/// `?` marker and the required-wins rule are decided once: every consumer sees
+/// one entry per package, and a name declared both ways cannot be installed as
+/// optional by one path and skipped by another.
 pub(super) fn parse_group(items: &[String], field: &str) -> CliResult<Vec<Constraint>> {
-  constraint::parse_all(items)
+  constraint::resolve(items)
     .map_err(|err| CliError::new(E_MANIFEST_INVALID, format!("{field}: {err}")))
 }
 
@@ -108,8 +113,13 @@ impl DeclaredDeps {
 /// so the bound is recorded in the report and checked again after step 5 (see
 /// `pipeline::recheck_constraints`). What is never done is putting the bound on
 /// the backend's command line — the name is all a backend is asked for.
+///
+/// An optional declaration that is missing or too old is recorded and warned
+/// about, never raised to an error: the manifest itself said the install may
+/// proceed without it. Its entry carries `"optional": true` so the report, the
+/// selector and the missing-dependency summary can tell the two apart.
 fn dep_entries(
-  app: &App,
+  app: &mut App,
   requester: &str,
   group: &str,
   deps: &[Constraint],
@@ -117,15 +127,32 @@ fn dep_entries(
 ) -> CliResult<Vec<Value>> {
   let mut entries = Vec::new();
   for dep in deps {
-    let status = precheck_dep_source(app, &dep.name, pkgs_dir)?;
+    let status = match precheck_dep_source(app, &dep.name, pkgs_dir) {
+      Ok(status) => status,
+      // A feed index that cannot be read is an error for a required dependency:
+      // "missing" would be a claim about the feeds that pica cannot make. For an
+      // optional one it is only a reason not to offer it.
+      Err(err) if dep.optional => {
+        app.log_warn(format!("optional dependency {} was skipped: {}", dep.name, err.message));
+        "unknown".to_string()
+      }
+      Err(err) => return Err(err),
+    };
     if status == "installed" {
       let violations = crate::constraints::unmet(app, requester, group, std::slice::from_ref(dep));
       if let Some(message) = violations.into_iter().next() {
-        return Err(CliError::new(E_VERSION_INCOMPATIBLE, message));
+        if dep.optional {
+          app.log_warn(format!("optional dependency is not satisfied: {message}"));
+        } else {
+          return Err(CliError::new(E_VERSION_INCOMPATIBLE, message));
+        }
       }
     }
 
     let mut entry = json!({"name": dep.name, "status": status});
+    if dep.optional {
+      entry["optional"] = json!(true);
+    }
     if dep.has_bound() {
       // The report is what an install leaves behind for auditing: it records
       // that the artifact asserted a version, even when the dependency was not
@@ -138,7 +165,7 @@ fn dep_entries(
 }
 
 pub(crate) fn build_precheck_report(
-  app: &App,
+  app: &mut App,
   manifest: &Manifest,
   pkgs_dir: &Path,
   deps: &DeclaredDeps,
@@ -170,6 +197,11 @@ pub(super) fn summarize_missing_precheck(precheck: &Value) -> Vec<String> {
     };
 
     for entry in entries {
+      // An optional dependency is not a prerequisite: listing it here would
+      // turn "optional and absent" into the same refusal as "required and absent".
+      if entry.get("optional").and_then(Value::as_bool).unwrap_or(false) {
+        continue;
+      }
       let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
       if status != "missing" {
         continue;
@@ -259,6 +291,61 @@ fn check_package_arch(app: &mut App, pkg: &PackageFields) -> CliResult<()> {
   }
 }
 
+/// Refuses declarations the chosen backend cannot resolve.
+///
+/// The `pica` backend owns files but does not resolve dependencies, so a
+/// package that declares any would install cleanly while silently skipping
+/// them. The predicate is shared with the install-time gate in `pipeline`, so
+/// the check and the gate cannot disagree about who installs these.
+///
+/// Only required declarations are refused. An optional one is a suggestion the
+/// backend cannot take up, which is exactly the "unavailable, warn and skip"
+/// case: refusing the whole artifact would make it mandatory.
+fn check_resolvable_dependencies(
+  app: &mut App,
+  manifest: &Manifest,
+  pkg: &PackageFields,
+) -> CliResult<()> {
+  if installs_declared_dependencies(&pkg.pkgmgr) {
+    return Ok(());
+  }
+
+  let mut required = Vec::new();
+  let mut optional = Vec::new();
+  for key in ["app", "base", "kmod"] {
+    let Ok(constraints) = constraint::resolve(&manifest.get_array_for(key, &pkg.pkgmgr)) else {
+      // The same list is parsed again, with the manifest key in the error, by
+      // `DeclaredDeps::parse`. Not repeating that here keeps one message.
+      continue;
+    };
+    for dep in constraints {
+      if dep.optional { optional.push(dep.raw) } else { required.push(dep.raw) }
+    }
+  }
+
+  if !required.is_empty() {
+    return Err(CliError::new(
+      E_PACKAGE_INVALID,
+      format!(
+        "package declares {} but pkgmgr={} cannot resolve dependencies; \
+         rebuild it with pkgmgr=opkg or pkgmgr=apk, or drop the dependency",
+        required.join(" "),
+        pkg.pkgmgr
+      ),
+    ));
+  }
+
+  if !optional.is_empty() {
+    app.log_warn(format!(
+      "pkgmgr={} cannot install optional dependencies; skipping {}",
+      pkg.pkgmgr,
+      optional.join(" ")
+    ));
+  }
+
+  Ok(())
+}
+
 pub(super) fn validate_package(
   app: &mut App,
   manifest: &Manifest,
@@ -287,28 +374,7 @@ pub(super) fn validate_package(
 
   check_package_arch(app, pkg)?;
 
-  // The `pica` backend owns files but does not resolve dependencies, so a
-  // package that declares any would install cleanly while silently skipping
-  // them. The predicate is shared with the install-time gate in `pipeline`, so
-  // the check and the gate cannot disagree about who installs these.
-  if !installs_declared_dependencies(&pkg.pkgmgr) {
-    let declared: Vec<String> = ["app", "base", "kmod"]
-      .iter()
-      .flat_map(|key| manifest.get_array_for(key, &pkg.pkgmgr))
-      .filter(|dep| !dep.trim().is_empty())
-      .collect();
-    if !declared.is_empty() {
-      return Err(CliError::new(
-        E_PACKAGE_INVALID,
-        format!(
-          "package declares {} but pkgmgr={} cannot resolve dependencies; \
-           rebuild it with pkgmgr=opkg or pkgmgr=apk, or drop the dependency",
-          declared.join(" "),
-          pkg.pkgmgr
-        ),
-      ));
-    }
-  }
+  check_resolvable_dependencies(app, manifest, pkg)?;
 
   // `pkgmgr` is validated while resolving the backend; re-checking it here would
   // duplicate the rule in two places and let them drift.

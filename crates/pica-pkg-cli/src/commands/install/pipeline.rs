@@ -1,19 +1,20 @@
 use super::feed::{
   DependencySource, dependency_source, install_pkgs_dir, pkg_list_diff_added, reorder_app_list,
 };
+use super::optional::{self, Plan as OptionalPlan};
 use super::precheck::{
   DeclaredDeps, build_precheck_report, summarize_missing_precheck, validate_package,
 };
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
-  E_RUNTIME, E_VERSION_INCOMPATIBLE, ensure_dirs, resolve_lang,
+  E_RUNTIME, E_VERSION_INCOMPATIBLE, FeedPolicy, ensure_dirs, resolve_lang,
 };
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
 use crate::system::{TargetRoot, run_hook, run_tar_extract};
 use pica_pkg_core::PICA_VERSION;
-use pica_pkg_core::constraint;
+use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::io::make_temp_dir;
 use pica_pkg_core::io::{PayloadInstall, install_payload, remove_payload};
 use pica_pkg_core::manifest::Manifest;
@@ -80,6 +81,13 @@ pub(super) struct ScriptConfig {
 struct DependencyPrecheck {
   report: Value,
   deps: DeclaredDeps,
+  /// Where the artifact's declared dependencies come from, decided here rather
+  /// than in step 5 because the selector has to know which optional
+  /// dependencies are actually installable before it shows them.
+  source: Option<DependencySource>,
+  /// What the user chose (or what the mode decided) about the optional
+  /// dependencies.
+  optional: OptionalPlan,
 }
 
 /// Everything one artifact install needs.
@@ -349,7 +357,7 @@ fn pkgfile_into(
 
   // 9. The database record is written last: until it exists the install is not
   //    complete, so a failure here unwinds the files again.
-  if let Err(err) = record_installation(app, &ctx, &precheck, &tx) {
+  if let Err(err) = record_installation(app, &ctx, &precheck, &tx, false) {
     return Err(abandon(app, &ctx, &precheck, &mut tx, err));
   }
 
@@ -403,6 +411,24 @@ fn non_empty(items: Vec<String>) -> Vec<String> {
 /// Read-only: it drives the package manager's index and queries only, so a
 /// failure here leaves nothing behind to roll back.
 fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<DependencyPrecheck> {
+  let pkgs_dir = ctx.tmpdir.join(PKGS);
+
+  // Under `pica` there is no feed to consult and no resolver to run. A package
+  // with required dependencies was already refused by `validate_package`; only
+  // optional ones can still be there, and they are recorded as unavailable
+  // instead of being dropped, so the report says the manifest asked for them.
+  if !installs_declared_dependencies(ctx.pkgmgr) {
+    let declared_app = non_empty(ctx.manifest.get_array_for("app", ctx.pkgmgr));
+    let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &declared_app)?;
+    let optional = OptionalPlan::unavailable(&deps, "pkgmgr=pica cannot install dependencies");
+    return Ok(DependencyPrecheck {
+      report: json!({"kmod": [], "base": [], "app": []}),
+      deps,
+      source: None,
+      optional,
+    });
+  }
+
   let mut app_list = non_empty(ctx.manifest.get_array_for("app", ctx.pkgmgr));
   let lang = resolve_lang(&app.paths.conf_file);
   let i18n_template = ctx.manifest.get_first("app_i18n");
@@ -410,16 +436,6 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
     app_list.push(i18n_template.replace("{lang}", &lang));
   }
   app_list = reorder_app_list(app_list);
-
-  // Under `pica` there is no feed to consult and no resolver to run. The
-  // dependency lists are guaranteed empty by `validate_package`, so the checked
-  // report is empty rather than skipped-with-declarations-present.
-  if !installs_declared_dependencies(ctx.pkgmgr) {
-    return Ok(DependencyPrecheck {
-      report: json!({"kmod": [], "base": [], "app": []}),
-      deps: DeclaredDeps { kmod: Vec::new(), base: Vec::new(), app: Vec::new() },
-    });
-  }
 
   app.log_info(format!("Resolving {} dependencies and app list...", ctx.pkgmgr));
 
@@ -432,7 +448,7 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   // were missing and the install would be refused for them.
   package_manager.update_index()?;
 
-  let report = build_precheck_report(app, ctx.manifest, &ctx.tmpdir.join(PKGS), &deps)?;
+  let report = build_precheck_report(app, ctx.manifest, &pkgs_dir, &deps)?;
   let missing = summarize_missing_precheck(&report);
   if !missing.is_empty() {
     app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));
@@ -442,7 +458,64 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
     ));
   }
 
-  Ok(DependencyPrecheck { report, deps })
+  // The source is decided before the selector, not in step 5: an option that
+  // cannot be installed from the policy's source must not be offered.
+  let source = dependency_source_for(app, &deps, pkgs_dir.is_dir())?;
+  let optional = optional::plan(app, ctx.pkgname, &deps, &report, source);
+  optional.warn_skipped(app);
+  if optional.selected_count() > 0 {
+    app.log_info(format!(
+      "Installing {} optional dependencies on request",
+      optional.selected_count()
+    ));
+  }
+
+  Ok(DependencyPrecheck { report, deps, source, optional })
+}
+
+/// The container-or-feeds decision, taken once in the precheck.
+///
+/// [`dependency_source`] answers for the required dependencies and keeps its
+/// existing errors and prompts. The one case it does not answer is an artifact
+/// whose required lists are empty: it returns `None` there, and an optional
+/// dependency still needs a source to be installable. With no `pkgs/` the feeds
+/// are the only candidate, and `packaged-only` is the one policy that forbids
+/// them — in which case there is nothing to offer and the install proceeds.
+fn dependency_source_for(
+  app: &mut App,
+  deps: &DeclaredDeps,
+  have_pkgs_dir: bool,
+) -> CliResult<Option<DependencySource>> {
+  let declared: Vec<String> =
+    required_names(&deps.base).into_iter().chain(required_names(&deps.app)).collect();
+
+  if declared.is_empty() && !have_pkgs_dir {
+    return Ok(match app.options.feed_policy {
+      FeedPolicy::PackagedOnly => None,
+      _ => Some(DependencySource::Feeds),
+    });
+  }
+
+  dependency_source(app, &declared, have_pkgs_dir)
+}
+
+/// The declarations a backend must be given: the required ones.
+fn required_names(constraints: &[Constraint]) -> Vec<String> {
+  constraint::required(constraints).map(|constraint| constraint.name.clone()).collect()
+}
+
+/// One feed phase: what must be installed plus what the user chose.
+///
+/// `resolve` already removed any name declared both ways, so the two halves
+/// cannot hold the same package and the request holds each name once.
+fn phase_names(
+  constraints: &[Constraint],
+  precheck: &DependencyPrecheck,
+  group: &str,
+) -> Vec<String> {
+  let mut names = required_names(constraints);
+  names.extend(precheck.optional.selected_names(group));
+  names
 }
 
 /// Step 5: installs whatever the artifact's dependencies need, and nothing when
@@ -485,24 +558,16 @@ fn install_dependency_containers(
   // kmods are always resolved through the feeds: an OpenWrt kernel module is not
   // something an application artifact can carry (see `build_precheck_report`).
   // One request for the missing ones, so the backend sees the set at once.
+  // A chosen optional kmod joins that one request; an installed one never does.
   let package_manager = app.package_manager()?;
-  let missing_kmods: Vec<String> = constraint::names(&precheck.deps.kmod)
-    .into_iter()
-    .filter(|dep| !package_manager.is_installed(dep))
-    .collect();
+  let mut missing_kmods = required_names(&precheck.deps.kmod);
+  missing_kmods.extend(precheck.optional.selected_names("kmod"));
+  missing_kmods.retain(|dep| !package_manager.is_installed(dep));
   package_manager.install("kmod", &missing_kmods)?;
 
-  // `base` and `app` are one decision, taken before either is installed. Two
-  // decisions — one per phase, both looking at the same `pkgs/` — is what let the
-  // same container batch be handed to the backend twice. Only the names go into
-  // that decision and into the requests below: the bounds are pica's to check,
-  // and opkg would read `libfoo>=1.2` as a package called that.
-  let declared: Vec<String> = constraint::names(&precheck.deps.base)
-    .into_iter()
-    .chain(constraint::names(&precheck.deps.app))
-    .collect();
-  let source = dependency_source(app, &declared, pkgs_dir.is_dir())?;
-  let Some(source) = source else {
+  // The source was decided in the precheck (see `dependency_source_for`), so the
+  // selector could only offer what this install can deliver.
+  let Some(source) = precheck.source else {
     return Ok(());
   };
 
@@ -510,11 +575,13 @@ fn install_dependency_containers(
     // Feeds are installed in phases, base first: a base dependency has to be on
     // the device before the app asks its own resolver for anything. Each phase is
     // one request, so a name in a phase can depend on a sibling of the same phase.
+    // Only the names go into the requests: the bounds are pica's to check, and
+    // opkg would read `libfoo>=1.2` as a package called that.
     DependencySource::Feeds => {
       let package_manager = app.package_manager()?;
-      package_manager.install("base", &constraint::names(&precheck.deps.base))?;
+      package_manager.install("base", &phase_names(&precheck.deps.base, precheck, "base"))?;
       let snap_before_app = package_manager.snapshot_installed();
-      package_manager.install("app", &constraint::names(&precheck.deps.app))?;
+      package_manager.install("app", &phase_names(&precheck.deps.app, precheck, "app"))?;
       let snap_after_app = app.package_manager()?.snapshot_installed();
       tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
     }
@@ -541,7 +608,17 @@ fn recheck_constraints(app: &mut App, ctx: &InstallContext<'_>, precheck: &Depen
   for (group, constraints) in
     [("kmod", &precheck.deps.kmod), ("base", &precheck.deps.base), ("app", &precheck.deps.app)]
   {
-    for message in crate::constraints::unmet(app, ctx.pkgname, group, constraints) {
+    // Only required dependencies and the optional ones this install actually
+    // put on the device: a declined one that happens to be installed was already
+    // judged by the precheck, and warning about it again would blame this
+    // install for a version it did not choose.
+    let checked: Vec<Constraint> = constraints
+      .iter()
+      .filter(|dep| !dep.optional || precheck.optional.covers(group, &dep.name))
+      .cloned()
+      .collect();
+
+    for message in crate::constraints::unmet(app, ctx.pkgname, group, &checked) {
       app.log_warn(message);
     }
   }
@@ -924,7 +1001,7 @@ fn abandon(
     leftovers.join(" ")
   ));
 
-  if let Err(record_err) = record_installation(app, ctx, precheck, tx) {
+  if let Err(record_err) = record_installation(app, ctx, precheck, tx, true) {
     app.log_warn(format!(
       "{}: could not record the partial install: {}",
       ctx.pkgname, record_err.message
@@ -940,13 +1017,22 @@ fn record_installation(
   ctx: &InstallContext<'_>,
   precheck: &DependencyPrecheck,
   tx: &InstallTransaction,
+  failed: bool,
 ) -> CliResult<()> {
+  // The precheck object is stored verbatim, so the optional dependencies are an
+  // extra key inside it: a reader that predates `?` sees the same kmod/base/app
+  // arrays it always did, and ignores the new key.
+  let mut report = precheck.report.clone();
+  if !precheck.optional.is_empty() {
+    report["optional"] = precheck.optional.report(if failed { "failed" } else { "installed" });
+  }
+
   report_set_install_result(
     &app.paths,
     ctx.pkgname,
     ctx.selector,
     &ctx.manifest.value,
-    &precheck.report,
+    &report,
     &tx.tx_added,
     &tx.app_added,
   )?;
@@ -989,7 +1075,7 @@ fn record_installation(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::app::{FeedPolicy, JsonMode, Options, Paths};
+  use crate::app::{FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
   use pretty_assertions::assert_eq;
   use std::os::unix::fs::symlink;
   use std::process::Command;
@@ -1028,6 +1114,7 @@ arch = all
       fetch_retry: 0,
       fetch_retry_delay: 0,
       pkgmgr: None,
+      optional_deps: OptionalDeps::None,
     };
 
     let mut app = App::new(paths, options);
