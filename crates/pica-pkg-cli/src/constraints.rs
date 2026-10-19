@@ -14,6 +14,15 @@ use pica_pkg_core::constraint::Constraint;
 /// feed regardless of the package's own backend, then the base and app groups.
 pub(crate) const GROUPS: [&str; 3] = ["kmod", "base", "app"];
 
+/// What an installed package failed, in the one wording the warning and the
+/// selector share.
+///
+/// It says the assertion did not hold and names no version: the bound is judged
+/// from a version pica read once, and the caller adds the declaration it was
+/// written as.
+pub(crate) const BOUND_UNMET: &str =
+  "the installed version does not satisfy the declared constraint";
+
 /// The bounds in `constraints` that the installed system does not satisfy.
 ///
 /// Each message names the package that declared the bound, the bound as it was

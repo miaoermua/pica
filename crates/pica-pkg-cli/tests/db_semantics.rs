@@ -1392,10 +1392,8 @@ fn an_installed_optional_dependency_short_of_its_bound_says_so() {
   let entry = optional_entry(&sandbox, "opt-apk", "opt-app");
   assert_eq!(entry["outcome"], "installed_before", "{entry}");
   assert_eq!(entry["constraint"], ">=2.0", "{entry}");
-  assert_eq!(
-    entry["reason"], "the installed version does not satisfy the declared constraint",
-    "{entry}"
-  );
+  assert_eq!(entry["bound_satisfied"], false, "{entry}");
+  assert!(entry.get("reason").is_none(), "`reason` is for unavailable outcomes: {entry}");
   assert!(
     !apk_add_targets(&sandbox.calls()).iter().flatten().any(|target| target == "opt-app"),
     "nothing is installed over the one on the box: {}",
@@ -1404,7 +1402,9 @@ fn an_installed_optional_dependency_short_of_its_bound_says_so() {
 }
 
 #[test]
-fn an_installed_optional_dependency_that_meets_its_bound_gains_no_reason() {
+fn an_installed_optional_dependency_that_meets_its_bound_gains_no_verdict() {
+  // Only the negative is recorded: a satisfied bound needs no restating, and
+  // `reason` is reserved for why an outcome is `unavailable`.
   let sandbox = Sandbox::with_stubs(
     EMPTY_DB,
     OPKG_STUB,
@@ -1420,6 +1420,7 @@ fn an_installed_optional_dependency_that_meets_its_bound_gains_no_reason() {
   assert_eq!(entry["outcome"], "installed_before", "{entry}");
   assert_eq!(entry["constraint"], ">=2.0", "{entry}");
   assert!(entry.get("reason").is_none(), "{entry}");
+  assert!(entry.get("bound_satisfied").is_none(), "{entry}");
 }
 
 #[test]

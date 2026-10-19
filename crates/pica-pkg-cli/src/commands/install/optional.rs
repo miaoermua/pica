@@ -23,19 +23,13 @@
 use super::feed::DependencySource;
 use super::precheck::DeclaredDeps;
 use crate::app::{App, OptionalDeps};
+use crate::constraints::BOUND_UNMET;
 use crate::pkgmgr::FeedCandidate;
 use pica_pkg_core::{constraint, version};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, IsTerminal, Write as IoWrite};
-
-/// What an installed optional dependency failed, in the words both the screen
-/// and the report use.
-///
-/// One `&'static str` for both, so the two cannot drift into saying different
-/// things about the same item.
-const BOUND_UNMET: &str = "the installed version does not satisfy the declared constraint";
 
 /// How one optional dependency can be treated by this install.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,9 +190,11 @@ impl Plan {
           entry["reason"] = json!(reason);
         }
         // `installed_before` alone would hide that the version pica found is not
-        // the version the artifact asked for.
+        // the version the artifact asked for. Same key, same meaning as on the
+        // precheck entry: present means the question was asked and answered no,
+        // so only the negative is written; a satisfied bound needs no restating.
         if item.bound_unmet {
-          entry["reason"] = json!(BOUND_UNMET);
+          entry["bound_satisfied"] = json!(false);
         }
         if let Some(size) = item.download {
           entry["download_size"] = json!(size);
@@ -562,7 +558,9 @@ mod tests {
     let text = render("demo", &plan);
     assert!(text.contains("already installed"), "{text}");
     assert!(!text.contains(BOUND_UNMET), "{text}");
-    assert!(plan.report("installed")[0].get("reason").is_none(), "{text}");
+    let entry = &plan.report("installed")[0];
+    assert!(entry.get("reason").is_none(), "{entry}");
+    assert!(entry.get("bound_satisfied").is_none(), "a satisfied bound is not restated: {entry}");
   }
 
   #[test]
@@ -587,7 +585,11 @@ mod tests {
 
     let report = plan.report("installed");
     assert_eq!(report[0]["outcome"], "installed_before", "{report}");
-    assert_eq!(report[0]["reason"], BOUND_UNMET, "{report}");
+    assert_eq!(report[0]["bound_satisfied"], false, "{report}");
+    assert!(
+      report[0].get("reason").is_none(),
+      "`reason` explains an unavailable outcome only: {report}"
+    );
 
     // Missing the bound is not a reason to touch the package: it is still not
     // selected, and this install still does not cover it.
@@ -619,7 +621,9 @@ mod tests {
     let text = render("demo", &plan);
     assert!(text.contains("already installed"), "{text}");
     assert!(!text.contains(BOUND_UNMET), "{text}");
-    assert!(plan.report("installed")[0].get("reason").is_none());
+    let entry = &plan.report("installed")[0];
+    assert!(entry.get("reason").is_none(), "{entry}");
+    assert!(entry.get("bound_satisfied").is_none(), "{entry}");
   }
 
   #[test]
@@ -779,6 +783,41 @@ mod tests {
     }
     assert_ne!(report[0]["reason"], report[1]["reason"], "the two failures stay apart");
     assert!(report[2].get("reason").is_none(), "installed items gain nothing: {}", report[2]);
+  }
+
+  #[test]
+  fn reason_and_bound_satisfied_never_share_an_entry() {
+    // `reason` explains an `unavailable` outcome; `bound_satisfied` records that
+    // an installed version missed its bound. An entry is one or the other, and
+    // an entry with neither needs no explaining.
+    let plan = Plan {
+      items: vec![
+        item("absent", Availability::Unavailable("not available from the feeds")),
+        Item {
+          requirement: Some(">=2.0".to_string()),
+          bound_unmet: true,
+          ..item("old", Availability::Installed)
+        },
+        item("present", Availability::Installed),
+        item("offered", Availability::Available),
+      ],
+    };
+
+    let report = plan.report("installed");
+    let entries = report.as_array().expect("array");
+
+    assert_eq!(entries[0]["outcome"], "unavailable");
+    assert_eq!(entries[0]["reason"], "not available from the feeds");
+    assert!(entries[0].get("bound_satisfied").is_none(), "{}", entries[0]);
+
+    assert_eq!(entries[1]["outcome"], "installed_before");
+    assert_eq!(entries[1]["bound_satisfied"], false, "{}", entries[1]);
+    assert!(entries[1].get("reason").is_none(), "{}", entries[1]);
+
+    for entry in &entries[2..] {
+      assert!(entry.get("reason").is_none(), "{entry}");
+      assert!(entry.get("bound_satisfied").is_none(), "{entry}");
+    }
   }
 
   #[test]

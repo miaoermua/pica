@@ -147,7 +147,7 @@ fn dep_entries(
     if let Some(violations) = &bound {
       if let Some(message) = violations.first() {
         if dep.optional {
-          app.log_warn(format!("optional dependency is not satisfied: {message}"));
+          app.log_warn(format!("{}: {message}", crate::constraints::BOUND_UNMET));
         } else {
           return Err(CliError::new(E_VERSION_INCOMPATIBLE, message.clone()));
         }
