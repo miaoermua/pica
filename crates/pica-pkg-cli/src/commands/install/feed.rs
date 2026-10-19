@@ -91,6 +91,10 @@ pub(crate) fn dependency_source(
       // An index that cannot be made readable stops the question here: counting
       // the declared packages against a feed nobody could fetch would report
       // "0/n in the feeds" for a host whose feeds were merely unreachable.
+      //
+      // No downgrade for optional-only artifacts: `declared` is the required
+      // list, and an empty one returned above, so this prompt only exists when
+      // there is something the index has to answer for.
       package_manager.update_index()?;
       // An empty entry is not a package anybody could look up, so it counts on
       // neither side of the fraction.

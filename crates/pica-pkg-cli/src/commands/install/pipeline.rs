@@ -405,6 +405,43 @@ fn non_empty(items: Vec<String>) -> Vec<String> {
   items.into_iter().filter(|item| !item.is_empty()).collect()
 }
 
+/// Brings the host's dependency index up to date, or establishes that this
+/// artifact does not need it.
+///
+/// The precheck below calls a dependency missing when the backend's index does
+/// not list it, so an index that cannot be read has to stop the run: a router
+/// with unreachable feeds would otherwise be told its dependencies were missing
+/// and the install would be refused for them.
+///
+/// An artifact that requires nothing has nothing the index could judge. Its
+/// optional entries are skipped by the missing summary and already degrade to
+/// "unknown" on their own, so an unreadable index there costs those options
+/// their offer and nothing else — and blocking the install would turn an
+/// optional dependency into a mandatory one.
+fn ensure_index(app: &mut App, deps: &DeclaredDeps) -> CliResult<()> {
+  let Err(err) = app.package_manager()?.update_index() else {
+    return Ok(());
+  };
+  if declares_required(deps) {
+    return Err(err);
+  }
+  app.log_warn(format!(
+    "dependency index unavailable, optional dependencies cannot be offered: {}",
+    err.message
+  ));
+  Ok(())
+}
+
+/// Whether any of the three groups declares something required, `kmod`
+/// included: the index answers for kernel modules exactly as it does for
+/// packages, so a group left out here would unlock the downgrade on an artifact
+/// that still needs the answer.
+fn declares_required(deps: &DeclaredDeps) -> bool {
+  [&deps.kmod, &deps.base, &deps.app]
+    .into_iter()
+    .any(|constraints| constraint::required(constraints).next().is_some())
+}
+
 /// Step 3: works out which dependencies this install would need and whether they
 /// can be satisfied.
 ///
@@ -441,12 +478,7 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
 
   let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &app_list)?;
 
-  let package_manager = app.package_manager()?;
-  // The report below calls a dependency missing when the backend's index does
-  // not have it, so an index that cannot be read has to stop the precheck here:
-  // a router with unreachable feeds would otherwise be told its dependencies
-  // were missing and the install would be refused for them.
-  package_manager.update_index()?;
+  ensure_index(app, &deps)?;
 
   let report = build_precheck_report(app, ctx.manifest, &pkgs_dir, &deps)?;
   let missing = summarize_missing_precheck(&report);
@@ -1075,7 +1107,8 @@ fn record_installation(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::app::{FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
+  use crate::app::{E_INDEX_UNAVAILABLE, FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
+  use crate::pkgmgr::FeedCandidate;
   use pretty_assertions::assert_eq;
   use std::os::unix::fs::symlink;
   use std::process::Command;
@@ -1120,6 +1153,126 @@ arch = all
     let mut app = App::new(paths, options);
     app.select_package_manager(PackageManagerKind::Pica.as_str()).expect("force the pica backend");
     app
+  }
+
+  /// A backend that answers the one question `ensure_index` asks: whether the
+  /// index can be made readable. `readable: false` is what unreachable feeds
+  /// look like from the precheck's side; nothing else is answered.
+  struct IndexStub {
+    readable: bool,
+  }
+
+  impl crate::pkgmgr::PackageManager for IndexStub {
+    fn kind(&self) -> PackageManagerKind {
+      PackageManagerKind::Apk
+    }
+
+    fn update_index(&self) -> CliResult<()> {
+      if self.readable {
+        return Ok(());
+      }
+      Err(CliError::new(E_INDEX_UNAVAILABLE, "apk update failed (exit 1): Network unreachable"))
+    }
+
+    fn package_exists(&self, _name: &str) -> CliResult<bool> {
+      Ok(false)
+    }
+
+    fn feed_candidates(&self, _name: &str) -> CliResult<Vec<FeedCandidate>> {
+      Ok(Vec::new())
+    }
+
+    fn is_installed(&self, _name: &str) -> bool {
+      false
+    }
+
+    fn installed_version(&self, _name: &str) -> Option<String> {
+      None
+    }
+
+    fn install(&self, _label: &str, _targets: &[String]) -> CliResult<()> {
+      Ok(())
+    }
+
+    fn remove(&self, _target: &str) -> CliResult<()> {
+      Ok(())
+    }
+
+    fn architectures(&self) -> Vec<String> {
+      Vec::new()
+    }
+
+    fn installed(&self) -> Vec<(String, String)> {
+      Vec::new()
+    }
+
+    fn depends(&self, _name: &str) -> Vec<String> {
+      Vec::new()
+    }
+
+    fn owns_file(&self, _path: &str) -> Option<String> {
+      None
+    }
+  }
+
+  fn declarations(kmod: &[&str], base: &[&str], app: &[&str]) -> DeclaredDeps {
+    let parse = |items: &[&str]| {
+      items.iter().map(|item| Constraint::parse(item).expect("valid declaration")).collect()
+    };
+    DeclaredDeps { kmod: parse(kmod), base: parse(base), app: parse(app) }
+  }
+
+  fn app_with_index(work: &Path, readable: bool) -> App {
+    let mut app = test_app(work);
+    app.package_manager = Some(Box::new(IndexStub { readable }));
+    app
+  }
+
+  #[test]
+  fn an_unreadable_index_does_not_stop_an_artifact_that_requires_nothing() {
+    let work = tempfile::tempdir().expect("temp dir");
+    let mut app = app_with_index(work.path(), false);
+
+    let deps = declarations(&[], &[], &["opt-app?"]);
+    ensure_index(&mut app, &deps).expect("optional declarations do not need the index");
+  }
+
+  #[test]
+  fn an_unreadable_index_still_stops_anything_required() {
+    let work = tempfile::tempdir().expect("temp dir");
+
+    for deps in
+      [declarations(&[], &["base-dep"], &["opt-app?"]), declarations(&[], &[], &["app-dep"])]
+    {
+      let mut app = app_with_index(work.path(), false);
+      let err = ensure_index(&mut app, &deps).expect_err("a required dependency needs the index");
+      assert_eq!(err.code, E_INDEX_UNAVAILABLE, "{err:?}");
+    }
+  }
+
+  #[test]
+  fn a_required_kernel_module_counts_as_requiring_the_index() {
+    // The precheck has three groups, and the source decision only looks at two.
+    // A guard that forgot `kmod` would let a module-only artifact through on an
+    // index that never answered.
+    let work = tempfile::tempdir().expect("temp dir");
+    let mut app = app_with_index(work.path(), false);
+
+    let deps = declarations(&["kmod-tun"], &[], &["opt-app?"]);
+    let err = ensure_index(&mut app, &deps).expect_err("a required module needs the index");
+    assert_eq!(err.code, E_INDEX_UNAVAILABLE, "{err:?}");
+  }
+
+  #[test]
+  fn a_readable_index_is_asked_for_optional_and_required_alike() {
+    // The downgrade is about a failure, not about skipping the refresh: an index
+    // that answers must still be asked, so the optional names get a real status
+    // rather than "unknown".
+    for deps in [declarations(&[], &[], &["opt-app?"]), declarations(&[], &["base-dep"], &[])] {
+      let work = tempfile::tempdir().expect("temp dir");
+      let mut app = app_with_index(work.path(), true);
+      ensure_index(&mut app, &deps).expect("a readable index never fails the precheck");
+    }
   }
 
   fn write_file(path: &Path, contents: &str) {

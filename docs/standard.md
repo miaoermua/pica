@@ -250,6 +250,7 @@ pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源�
 
 - 查询前先保证索引可读：只有确实缺索引才调用一次 `opkg update` / `apk update`；已有索引不重复拉取，这是整条路径上唯一昂贵的步骤。
 - 缺索引且刷新没能补上（断网、源地址失效、`opkg` 锁被活进程持有）报 `E_INDEX_UNAVAILABLE`，消息里带上缺哪些源、刷新命令的退出码与其输出，**不会**把"取不到索引"当成"源里没有这个包"，也不会因此把依赖报成 missing。
+- 唯一的例外是产物**没有任何必选声明**（`kmod` / `base` / `app` 三组里都没有不带 `?` 的条目）：这时索引不参与任何"缺失"判定，读不到只让每个可选项变成 `unavailable`（原因写"读不到索引"，与"源里没有"分开），安装继续。只要存在一条必选声明，读不到索引照旧是错误——把可选依赖的装不上扩大成整个产物的装不上，才是把两件事搞混。
 - "本机的源"按后端自己读配置的方式认定：`opkg` 是 `/etc/opkg.conf` 与 `/etc/opkg/*.conf`，`apk` 是 `/etc/apk/repositories` 加 `/etc/apk/repositories.d`、`/lib/apk/repositories.d` 下的 `*.list`（OpenWrt 25.12 的 feeds 就在那里，`/etc/apk/repositories` 是空的）。一个源都没配置就是"本机没有源"，不是错误。
 - `--feed-policy packaged-only` 不询问源，因此在源不可达的主机上依旧可以只从 pica 仓库安装。
 
