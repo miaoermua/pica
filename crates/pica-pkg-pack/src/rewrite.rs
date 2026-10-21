@@ -4,18 +4,32 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+/// Fields the packer owns: they are recomputed per artifact, so any author
+/// value is dropped rather than trusted. `targets` is a build-time-only field
+/// and must not leak into an installed manifest.
+const OWNED_KEYS: [&str; 9] =
+  ["builddate", "size", "csize", "platform", "arch", "pkgver", "pkgrel", "pkgmgr", "targets"];
+
+/// Fields the packer recomputes for one build target. Grouping them keeps the
+/// per-target values together instead of as a long argument list that is easy to
+/// transpose at the call site.
+pub(crate) struct BuiltFields<'a> {
+  pub pkgver: &'a str,
+  pub pkgrel: &'a str,
+  pub platform: &'a str,
+  pub arch: &'a str,
+  pub pkgmgr: &'a str,
+  pub size: u64,
+}
+
 pub(crate) fn rewrite_manifest_for_build(
   source: &Path,
   target: &Path,
-  pkgver: &str,
-  pkgrel: &str,
-  platform: &str,
-  arch: &str,
+  fields: &BuiltFields<'_>,
 ) -> PicaResult<()> {
   let content = fs::read_to_string(source)?;
   let mut lines = Vec::new();
-  let remove_keys: HashSet<&str> =
-    ["builddate", "size", "platform", "arch", "pkgver", "pkgrel", "uname"].into_iter().collect();
+  let remove_keys: HashSet<&str> = OWNED_KEYS.into_iter().collect();
 
   for raw_line in content.lines() {
     let trimmed = raw_line.trim_start();
@@ -29,18 +43,19 @@ pub(crate) fn rewrite_manifest_for_build(
       continue;
     };
 
-    let key = raw_key.trim();
-    if remove_keys.contains(key) {
+    if remove_keys.contains(raw_key.trim()) {
       continue;
     }
     lines.push(raw_line.to_string());
   }
 
   lines.push(format!("builddate = {}", now_unix_secs()));
-  lines.push(format!("pkgver = {pkgver}"));
-  lines.push(format!("pkgrel = {pkgrel}"));
-  lines.push(format!("platform = {platform}"));
-  lines.push(format!("arch = {arch}"));
+  lines.push(format!("pkgver = {}", fields.pkgver));
+  lines.push(format!("pkgrel = {}", fields.pkgrel));
+  lines.push(format!("platform = {}", fields.platform));
+  lines.push(format!("arch = {}", fields.arch));
+  lines.push(format!("pkgmgr = {}", fields.pkgmgr));
+  lines.push(format!("size = {}", fields.size));
 
   let mut output = lines.join("\n");
   output.push('\n');
@@ -48,69 +63,78 @@ pub(crate) fn rewrite_manifest_for_build(
   Ok(())
 }
 
-pub(crate) fn append_manifest_kv(path: &Path, key: &str, value: &str) -> PicaResult<()> {
-  let mut content = fs::read_to_string(path)?;
-  if !content.ends_with('\n') {
-    content.push('\n');
-  }
-  content.push_str(key);
-  content.push_str(" = ");
-  content.push_str(value);
-  content.push('\n');
-  fs::write(path, content)?;
-  Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-  use super::rewrite_manifest_for_build;
+  use super::{BuiltFields, rewrite_manifest_for_build};
   use std::fs;
 
-  #[test]
-  fn rewrite_manifest_for_build_replaces_runtime_fields() {
+  fn rewrite(source_text: &str, pkgmgr: &str) -> String {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    let source = root.join("manifest.src");
-    let target = root.join("manifest.dst");
-
-    fs::write(
+    let source = tmp.path().join("manifest.src");
+    let target = tmp.path().join("manifest.dst");
+    fs::write(&source, source_text).expect("write source manifest");
+    rewrite_manifest_for_build(
       &source,
-      "pkgname = hello\nplatform = old\narch = old\npkgver = 0.0.1\npkgrel = 1\nsize = 1\nbuilddate = 1\n",
+      &target,
+      &BuiltFields {
+        pkgver: "1.2.3",
+        pkgrel: "4",
+        platform: "all",
+        arch: "arm64",
+        pkgmgr,
+        size: 4096,
+      },
     )
-    .expect("write source manifest");
+    .expect("rewrite manifest");
+    fs::read_to_string(&target).expect("read target manifest")
+  }
 
-    rewrite_manifest_for_build(&source, &target, "1.2.3", "4", "all", "arm64")
-      .expect("rewrite manifest");
-
-    let out = fs::read_to_string(&target).expect("read target manifest");
+  #[test]
+  fn replaces_owned_fields_and_keeps_author_fields() {
+    let out = rewrite(
+      "pkgname = hello\nplatform = old\narch = old\npkgver = 0.0.1\npkgrel = 1\nsize = 1\nbuilddate = 1\nuname = aarch64\n",
+      "opkg",
+    );
     assert!(out.contains("pkgname = hello"));
     assert!(out.contains("pkgver = 1.2.3"));
     assert!(out.contains("pkgrel = 4"));
     assert!(out.contains("platform = all"));
     assert!(out.contains("arch = arm64"));
+    assert!(out.contains("pkgmgr = opkg"));
+    assert!(out.contains("size = 4096"));
     assert!(out.contains("builddate = "));
     assert!(!out.contains("size = 1"));
     assert!(!out.contains("platform = old"));
   }
 
   #[test]
-  fn rewrite_manifest_supports_legacy_pkgver_without_pkgrel() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let root = tmp.path().to_path_buf();
-    let source = root.join("manifest.src");
-    let target = root.join("manifest.dst");
+  fn keeps_uname_compat_gate() {
+    let out = rewrite("pkgname = hello\nuname = aarch64\n", "apk");
+    assert!(
+      out.contains("uname = aarch64"),
+      "uname is an author-declared compat gate and must survive into the artifact"
+    );
+  }
 
-    fs::write(&source, "pkgname = hello\npkgver = 0.1.0-7\nplatform = old\narch = old\n")
-      .expect("write source manifest");
+  #[test]
+  fn writes_the_pica_backend_into_the_artifact() {
+    let out = rewrite("pkgname = hello\ntargets = pica\n", "pica");
+    assert!(out.contains("pkgmgr = pica"));
+    assert!(!out.contains("targets"));
+  }
 
-    rewrite_manifest_for_build(&source, &target, "0.1.0", "7", "all", "all")
-      .expect("rewrite manifest");
+  #[test]
+  fn strips_build_only_targets_field() {
+    let out = rewrite("pkgname = hello\ntargets = opkg\ntargets = apk\n", "apk");
+    assert!(!out.contains("targets"), "targets is build-time only");
+    assert!(out.contains("pkgmgr = apk"));
+  }
 
-    let out = fs::read_to_string(&target).expect("read target manifest");
-    assert!(out.contains("pkgver = 0.1.0"));
-    assert!(out.contains("pkgrel = 7"));
-    assert!(out.contains("platform = all"));
-    assert!(out.contains("arch = all"));
+  #[test]
+  fn supports_legacy_pkgver_without_pkgrel() {
+    let out = rewrite("pkgname = hello\npkgver = 0.1.0-7\nplatform = old\narch = old\n", "apk");
+    assert!(out.contains("pkgver = 1.2.3"));
+    assert!(out.contains("pkgrel = 4"));
     assert!(!out.contains("platform = old"));
   }
 }

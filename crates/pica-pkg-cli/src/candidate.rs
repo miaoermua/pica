@@ -1,4 +1,5 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID};
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
+use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_os;
 use crate::state::read_json_file;
 use pica_pkg_core::selector::Selector;
@@ -14,6 +15,7 @@ pub(crate) fn find_pica_candidates_in_index(
   let index = read_json_file(&app.paths.index_file)?;
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let host_os = detect_os();
+  let host_backend = app.backend();
 
   let mut out = Vec::new();
 
@@ -56,11 +58,8 @@ pub(crate) fn find_pica_candidates_in_index(
         .to_string();
       let pkg_platform = pkg.get("platform").and_then(Value::as_str).unwrap_or("").to_string();
       let pkg_arch = pkg.get("arch").and_then(Value::as_str).unwrap_or("").to_string();
-      let size = match pkg.get("size") {
-        Some(Value::Number(number)) => number.as_u64(),
-        Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
-        _ => None,
-      };
+      let size = index_bytes(pkg, "size");
+      let csize = index_bytes(pkg, "csize");
       let filename = pkg.get("filename").and_then(Value::as_str).unwrap_or("").to_string();
       let download_url = pkg.get("download_url").and_then(Value::as_str).map(ToString::to_string);
       let min_pica = pkg.get("pica").and_then(Value::as_str).map(ToString::to_string);
@@ -77,6 +76,17 @@ pub(crate) fn find_pica_candidates_in_index(
 
       let os_match = pkg_os.is_empty() || pkg_os == "all" || pkg_os == host_os;
       if !os_match {
+        continue;
+      }
+
+      // Backend identity: a `pica` package ships a payload Pica installs itself
+      // and needs nothing from the host, so it matches anywhere. `opkg` and
+      // `apk` packages need their own backend to be the one in use here.
+      let backend_match = match PackageManagerKind::parse(&pkgmgr) {
+        Some(kind) => !kind.requires_system_binary() || host_backend == kind,
+        None => false,
+      };
+      if !backend_match {
         continue;
       }
 
@@ -98,6 +108,7 @@ pub(crate) fn find_pica_candidates_in_index(
         platform: pkg_platform,
         arch: pkg_arch,
         size,
+        csize,
         filename,
         download_url,
         min_pica,
@@ -108,6 +119,21 @@ pub(crate) fn find_pica_candidates_in_index(
   }
 
   Ok(out)
+}
+
+/// A byte figure the index records: `size` (installed volume) or `csize`
+/// (compressed artifact).
+///
+/// `None` means the index does not record the figure. A recorded 0 is returned
+/// as 0 and left for the caller to interpret — it is not folded into `None`
+/// here, because "the index says zero" and "the index says nothing" are
+/// different facts even when neither can be shown.
+fn index_bytes(pkg: &Value, key: &str) -> Option<u64> {
+  match pkg.get(key) {
+    Some(Value::Number(number)) => number.as_u64(),
+    Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
+    _ => None,
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +155,7 @@ pub(crate) struct RepoCandidate {
   pub(crate) platform: String,
   pub(crate) arch: String,
   pub(crate) size: Option<u64>,
+  pub(crate) csize: Option<u64>,
   pub(crate) filename: String,
   pub(crate) download_url: Option<String>,
   pub(crate) min_pica: Option<String>,

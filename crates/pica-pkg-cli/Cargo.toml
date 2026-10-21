@@ -1,7 +1,8 @@
 [package]
 name = "pica-pkg-cli"
-version = "0.3.0"
-edition = "2024"
+version = "0.3.33"
+edition.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -14,6 +15,7 @@ path = "src/main.rs"
 pica-pkg-core = { path = "../pica-pkg-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

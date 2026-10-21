@@ -66,7 +66,13 @@ fn read_lock_pid(lock_dir: &Path) -> Option<u32> {
   text.trim().parse::<u32>().ok()
 }
 
-fn pid_is_running(pid: u32) -> bool {
+/// Whether the process `pid` is still there.
+///
+/// `/proc` is how a router can answer this at all, so a host without it (a
+/// development machine, a container with a trimmed `/proc`) reports every pid
+/// as gone — which is why the lock files that carry a pid are only *reclaimed*
+/// with this answer, never trusted to it.
+pub(crate) fn pid_is_running(pid: u32) -> bool {
   if pid == 0 {
     return false;
   }

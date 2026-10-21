@@ -1,8 +1,9 @@
-use crate::app::{ensure_dirs, App, CliError, CliResult, Paths, E_DB_INVALID, E_RUNTIME};
+use crate::app::{App, CliError, CliResult, E_DB_INVALID, E_RUNTIME, Paths, ensure_dirs};
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::selector::Selector;
-use serde_json::{json, Map, Value};
+use pica_pkg_core::version::pkgver_cmp_key;
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::Path;
 
@@ -31,11 +32,7 @@ pub fn report_set_install_result(
 
   let program_url = {
     let value = manifest_get_first(manifest, "url");
-    if value.is_empty() {
-      manifest_get_first(manifest, "origin")
-    } else {
-      value
-    }
+    if value.is_empty() { manifest_get_first(manifest, "origin") } else { value }
   };
 
   report["reports"][pkgname] = json!({
@@ -62,12 +59,18 @@ pub fn report_set_install_result(
   write_json_atomic_pretty(&paths.report_file, &report)
 }
 
+/// Records an installation.
+///
+/// `files` and `dirs` are the payload this install created; removal replays them
+/// in reverse. Installs delegated to a native package manager pass `packages` in
+/// `files` instead, because that backend, not Pica, owns the real file list.
 pub fn db_set_installed(
   db_file: &Path,
   pkgname: &str,
   manifest: &Value,
   pkgfile: &str,
   files: &[String],
+  dirs: &[String],
 ) -> CliResult<()> {
   let mut db = read_json_file(db_file)?;
   ensure_json_object_field(&mut db, "installed")?;
@@ -83,6 +86,7 @@ pub fn db_set_installed(
         "manifest": manifest,
         "pkgfile": pkgfile,
         "files": files,
+        "dirs": dirs,
         "installed_at": now_unix_secs(),
     }),
   );
@@ -103,13 +107,27 @@ pub fn db_del_installed(db_file: &Path, pkgname: &str) -> CliResult<()> {
   write_json_atomic_pretty(db_file, &db)
 }
 
-pub fn db_has_installed(db_file: &Path, pkgname: &str) -> CliResult<bool> {
+/// The version the database records for `pkgname`, if it records the package.
+///
+/// It is the same string the index and the transaction header print, built from
+/// the stored `pkgver`/`pkgrel` by the same function the install used, so an
+/// upgrade can be recognised without parsing anything twice.
+pub fn db_installed_version(db_file: &Path, pkgname: &str) -> CliResult<Option<String>> {
   let db = read_json_file(db_file)?;
-  let has = db
-    .get("installed")
-    .and_then(Value::as_object)
-    .is_some_and(|installed| installed.contains_key(pkgname));
-  Ok(has)
+  let Some(entry) = db.get("installed").and_then(Value::as_object).and_then(|i| i.get(pkgname))
+  else {
+    return Ok(None);
+  };
+
+  let manifest = entry.get("manifest").unwrap_or(&Value::Null);
+  let pkgver = manifest_get_first(manifest, "pkgver");
+  if pkgver.is_empty() {
+    // Recorded without a version: say so rather than inventing one.
+    return Ok(Some(String::new()));
+  }
+  let pkgrel = manifest_get_first(manifest, "pkgrel");
+
+  Ok(Some(pkgver_cmp_key(&pkgver, &pkgrel)))
 }
 
 pub fn db_find_installed_pkgname_by_selector(
@@ -165,9 +183,13 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   Ok(())
 }
 
-pub(crate) fn cleanup_pkg_cache_with_notice(app: &mut App) {
-  app.log_info("Cleaning up Pica cache");
-
+/// Drops the cached packages left by this run.
+///
+/// Silent on success: the cache is Pica's own bookkeeping, and a user who asked
+/// to install something learns nothing from being told it was tidied. Failures
+/// are still reported, because a cache that cannot be cleaned is a fact about
+/// the machine.
+pub(crate) fn cleanup_pkg_cache(app: &mut App) {
   let cache_pkgs_dir = app.paths.cache_dir.join("pkgs");
   if !cache_pkgs_dir.is_dir() {
     return;
@@ -202,7 +224,7 @@ mod tests {
   use crate::app::E_RUNTIME;
   use pica_pkg_core::selector::Selector;
   use pretty_assertions::assert_eq;
-  use serde_json::{json, Value};
+  use serde_json::{Value, json};
 
   #[test]
   fn ensure_json_object_field_creates_and_validates() {

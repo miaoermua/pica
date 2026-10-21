@@ -1,24 +1,45 @@
 mod archive;
+mod backend;
 mod build;
-mod platform;
+mod container;
+mod matrix;
+mod payload;
 mod rewrite;
 
 use build::main_build;
-use pica_pkg_core::error::{PicaError, PicaResult};
 use pica_pkg_core::PICA_VERSION;
+use pica_pkg_core::error::{PicaError, PicaResult};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 
 fn usage() {
   println!(
-        "Usage:\n  pica-pack build <staging_dir> [--outdir DIR]\n\
-\nstaging_dir must contain:\n  - manifest\n  - cmd/\n  - binary/ is optional\n  - src/ is optional\n  - depend/ is optional\n  - LICENSE is optional\n\
-\nIf binary/ exists, the recommended layout is:\n  binary/<platform>/<arch>/*.ipk\n\
-\nIf depend/ exists, the recommended layout is:\n  depend/<platform>/<arch>/*.ipk\n\
-\nWhen such layout is present, pica-pack will build one package per\n<platform>/<arch> combination.\n\
-\nPackage filename:\n  <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>.pkg.tar.gz"
-    );
+    "Usage:\n  pica-pack build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|pica|opkg,apk]\n\
+     \n\
+     <pkgdir> layout:\n  \
+       manifest                         required, key = value (see docs/standard.md)\n  \
+       scripts/                         optional, lifecycle scripts (install/update/remove/.env)\n  \
+       root/                            optional, files mirrored onto the target rootfs\n  \
+       pkgs/opkg/ | pkgs/apk/           optional, containers the target's own package manager\n  \
+                                       installs; never accepted under pkgs/pica/\n  \
+       pkgs/<backend>/<platform>/<arch>/  optional matrix layout\n  \
+       LICENSE                          optional\n\
+     \n\
+     Build targets come from `targets` in the manifest (repeatable or\n\
+     comma-separated), overridden by --pkgmgr. Defaults to opkg.\n\
+     \n\
+     Each <platform>/<arch> combination produces one artifact holding only\n\
+     that combination's packages, flattened into pkgs/.\n\
+     \n\
+     Artifact filename:\n  \
+       <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-pica].pkg.tar.gz\n  \
+       (the platform segment is omitted when platform = all)\n\
+     \n\
+     Output (one directory per backend):\n  \
+       opkg -> <outdir>/opkg/    apk -> <outdir>/apk/    pica -> <outdir>/pica/\n  \
+       each with its own repo.json and SHA256SUMS"
+  );
 }
 
 fn msg(text: impl AsRef<str>) {
@@ -53,11 +74,12 @@ fn run() -> PicaResult<()> {
       Ok(())
     }
     "build" => {
-      let Some(staging_dir_arg) = args.next() else {
-        return Err(PicaError::msg("build requires <staging_dir>"));
+      let Some(pkgdir_arg) = args.next() else {
+        return Err(PicaError::msg("build requires <pkgdir>"));
       };
 
       let mut outdir: Option<PathBuf> = None;
+      let mut pkgmgr: Option<String> = None;
       let rest: Vec<String> = args.collect();
       let mut index = 0;
       while index < rest.len() {
@@ -67,6 +89,15 @@ fn run() -> PicaResult<()> {
               return Err(PicaError::msg("--outdir requires DIR"));
             };
             outdir = Some(PathBuf::from(value));
+            index += 2;
+          }
+          "--pkgmgr" => {
+            let Some(value) = rest.get(index + 1) else {
+              return Err(PicaError::msg(
+                "--pkgmgr requires opkg, apk, pica, or a comma-separated list",
+              ));
+            };
+            pkgmgr = Some(value.clone());
             index += 2;
           }
           "-h" | "--help" => {
@@ -79,7 +110,7 @@ fn run() -> PicaResult<()> {
         }
       }
 
-      main_build(Path::new(&staging_dir_arg), outdir)
+      main_build(Path::new(&pkgdir_arg), outdir, pkgmgr.as_deref())
     }
     other => Err(PicaError::msg(format!("unknown command: {other}"))),
   }

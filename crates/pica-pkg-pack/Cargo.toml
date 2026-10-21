@@ -1,7 +1,8 @@
 [package]
 name = "pica-pkg-pack"
-version = "0.3.0"
-edition = "2024"
+version = "0.3.33"
+edition.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -13,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 pica-pkg-core = { path = "../pica-pkg-core" }
 serde_json = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
