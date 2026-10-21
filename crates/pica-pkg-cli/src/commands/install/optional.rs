@@ -24,6 +24,7 @@ use super::feed::DependencySource;
 use super::precheck::DeclaredDeps;
 use crate::app::{App, OptionalDeps};
 use crate::constraints::BOUND_UNMET;
+use crate::format;
 use crate::pkgmgr::FeedCandidate;
 use pica_pkg_core::{constraint, version};
 use serde_json::{Value, json};
@@ -381,10 +382,10 @@ fn installed_detail(item: &Item) -> String {
 }
 
 fn sizes(item: &Item) -> String {
-  let download = item.download.map_or_else(|| "Unknown".to_string(), format_bytes);
+  let download = item.download.map_or_else(|| "Unknown".to_string(), format::bytes);
   let installed = item
     .installed_size
-    .map_or_else(|| "Unknown".to_string(), |bytes| format!("~{} (est.)", format_bytes(bytes)));
+    .map_or_else(|| "Unknown".to_string(), |bytes| format!("~{} (est.)", format::bytes(bytes)));
   format!("Download: {download}  Installed: {installed}")
 }
 
@@ -417,18 +418,6 @@ pub(crate) fn parse_selection(input: &str, selectable: &[usize]) -> Result<Vec<u
     }
   }
   Ok(chosen)
-}
-
-#[allow(clippy::cast_precision_loss, reason = "a byte count is far below 2^52")]
-fn format_bytes(bytes: u64) -> String {
-  const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-  let mut value = bytes as f64;
-  let mut unit = 0;
-  while value >= 1024.0 && unit + 1 < UNITS.len() {
-    value /= 1024.0;
-    unit += 1;
-  }
-  if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
 /// The precheck entry for one declaration, if the precheck looked at it.

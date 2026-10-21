@@ -43,6 +43,23 @@ pica -S
 pica -S miaoer-app
 ```
 
+输出示例：
+```text
+:: Downloading miaoer-app (0.2.8-1) from main...
+:: Installing miaoer-app (0.2.8-1)
+::   Package installed size: 4.2 MiB
+::   Download size: 1.1 MiB
+:: Checking declared dependencies...
+::   luci-app-miaoer-app (feed)
+:: Installed 128 files, 4.2 MiB
+:: Transaction completed
+```
+
+- 第一行说清这次事务对这个包做了什么：首装是 `Installing`，还装过则是 `Upgrading miaoer-app (0.2.7-1 -> 0.2.8-1)`（降级同理，写 `Downgrading`），版本相同则是 `miaoer-app 0.2.8-1 is already installed; reinstalling`。
+- 缩进的两行大小来自仓库索引，是**包自称**的数字；索引没给或给了 0（表示没测量）就不打印。本地文件与 URL 安装没有索引，因此没有这两行。
+- `Checking declared dependencies...` 下面逐条列出这次真正要动手的依赖及其来源：`(feed)` 表示要从软件源装，`(packaged)` 表示用包内 `pkgs/` 里的容器。已装的依赖不会列出，被跳过的可选依赖也不会列出。
+- 最后一行 `Installed ...` 是实际写入量：文件数按载荷里的条目算，字节数按普通文件算，目录不计。用系统后端（`opkg`/`apk`）安装时没有这一行——文件由后端铺放，Pica 不重复统计，也不虚报一份自己的结果。
+
 > 想要确认应用信息再安装？可以通过 `pica -Si miaoer-app` 快速检视。
 
 ### 3. 本地直装 / URL 在线安装 (`-U`)
@@ -51,10 +68,10 @@ pica -S miaoer-app
 
 ```bash
 # 从本地路径安装
-pica -U /tmp/miaoer-app-0.2.8-1-all.pkg.tar.gz
+pica -U /tmp/miaoer-app-0.2.8-1-all-opkg.pkg.tar.gz
 
 # 从网络直链安装
-pica -U https://example.com/downloads/miaoer-app-0.2.8-1-all.pkg.tar.gz
+pica -U https://example.com/downloads/miaoer-app-0.2.8-1-all-opkg.pkg.tar.gz
 ```
 
 ### 4. 一键卸载应用 (`-R`)
@@ -67,11 +84,14 @@ pica -R miaoer-app
 
 输出示例：
 ```text
-:: Removing miaoer-app...
-:: removing opkg package: miaoer-app
-:: removing opkg package: luci-app-miaoer-app
+:: Removing miaoer-app (0.2.8-1)
+:: Removing opkg package: miaoer-app
+:: Removing opkg package: luci-app-miaoer-app
 :: Transaction completed
 ```
+
+- 头部里的版本是安装时记进数据库的那个版本，不是源里现在提供的版本；记录里没有版本时只写包名。
+- 若这个包是用 `root/` 载荷铺放的，`Transaction completed` 之前会多一行实际结果，例如 `Removed 12 files`；被系统后端仍认领的文件不会删除，改成 `Removed 10 files; kept 2 files owned by opkg`。已经不在的文件既不算删除也不算保留。
 
 ### 5. 查询机器状态 (`-Q`)
 

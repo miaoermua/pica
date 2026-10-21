@@ -9,16 +9,17 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
   E_RUNTIME, E_VERSION_INCOMPATIBLE, FeedPolicy, ensure_dirs, resolve_lang,
 };
+use crate::format;
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
-use crate::state::{db_has_installed, db_set_installed, report_set_install_result};
+use crate::state::{db_installed_version, db_set_installed, report_set_install_result};
 use crate::system::{TargetRoot, run_hook, run_tar_extract};
 use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::io::make_temp_dir;
 use pica_pkg_core::io::{PayloadInstall, install_payload, remove_payload};
 use pica_pkg_core::manifest::Manifest;
-use pica_pkg_core::version::{pkgver_cmp_key, ver_ge};
+use pica_pkg_core::version::{pkgver_cmp_key, pkgver_gt, ver_ge};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,10 +50,10 @@ impl Drop for TempDirGuard {
   }
 }
 
+/// The manifest fields the host checks act on. The package name is not among
+/// them: it names the transaction, which the header already printed.
 pub(super) struct PackageFields {
-  pub(super) pkgname: String,
   pub(super) pkgver_display: String,
-  pub(super) platform: String,
   pub(super) os: String,
   pub(super) arch: String,
   pub(super) uname: String,
@@ -223,6 +224,69 @@ fn canonicalize_display(path: &Path) -> String {
   fs::canonicalize(path).map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
 }
 
+/// The two figures the repository index publishes for a package.
+///
+/// Only a repository has them: a local file or a URL is described by nothing but
+/// itself, so those installs pass the default and no size is shown for them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct IndexSizes {
+  /// `size`: the installed volume the package declares. What the package says
+  /// about itself, not a measurement of the disk after installing it.
+  pub installed: Option<u64>,
+  /// `csize`: the size of the compressed artifact that was downloaded.
+  pub download: Option<u64>,
+}
+
+/// The one line that says what this transaction does to this package.
+///
+/// `installed` is what the database records, so `Upgrading` cannot be claimed
+/// for a package that was never installed, and a version that is already on the
+/// box is named as the reinstall it is. All four sentences live here so a
+/// repository install and a `-U` of the same artifact cannot describe
+/// themselves differently.
+fn transaction_header(pkgname: &str, new_version: &str, installed: Option<&str>) -> String {
+  let Some(old) = installed else {
+    return format!("Installing {pkgname} ({new_version})");
+  };
+
+  if old == new_version {
+    return format!("{pkgname} {new_version} is already installed; reinstalling");
+  }
+  if pkgver_gt(new_version, old) {
+    format!("Upgrading {pkgname} ({old} -> {new_version})")
+  } else if pkgver_gt(old, new_version) {
+    format!("Downgrading {pkgname} ({old} -> {new_version})")
+  } else {
+    // Two different strings that neither compares above the other: the header
+    // does not claim a direction it could not establish.
+    format!("Reinstalling {pkgname} ({new_version})")
+  }
+}
+
+/// The size lines for the header, indented under it.
+///
+/// A figure is only shown when it is a usable number: a missing one was never
+/// published, and a zero is a feed saying "not measured" rather than a package
+/// that occupies nothing. Neither is worth printing, and printing `0 B` would be
+/// worse than saying nothing.
+fn size_lines(sizes: IndexSizes) -> Vec<String> {
+  [("Package installed size", sizes.installed), ("Download size", sizes.download)]
+    .into_iter()
+    .filter_map(|(label, value)| {
+      value.filter(|bytes| *bytes > 0).map(|bytes| format!("  {label}: {}", format::bytes(bytes)))
+    })
+    .collect()
+}
+
+/// `Installed 12 files, 74.2 MiB`, from what the deployment counted.
+///
+/// `files` is the payload's file list, which holds the symlinks as well as the
+/// regular files; `size` sums the bytes of the regular files it wrote. Created
+/// directories are not counted as files.
+fn install_summary(payload: &PayloadInstall) -> String {
+  format!("Installed {}, {}", format::files(payload.files.len()), format::bytes(payload.size))
+}
+
 /// Installs an artifact file into the running system's root.
 ///
 /// `source` is the channel the artifact came from, recorded in the database so
@@ -233,8 +297,9 @@ pub(super) fn pkgfile(
   pkgfile: &Path,
   selector: Option<String>,
   source: EntrySource,
+  sizes: IndexSizes,
 ) -> CliResult<()> {
-  pkgfile_into(app, pkgfile, selector, source, &TargetRoot::system())
+  pkgfile_into(app, pkgfile, selector, source, sizes, &TargetRoot::system())
 }
 
 /// [`pkgfile`] against an explicit root.
@@ -252,6 +317,7 @@ fn pkgfile_into(
   pkgfile: &Path,
   selector: Option<String>,
   source: EntrySource,
+  sizes: IndexSizes,
   target: &TargetRoot,
 ) -> CliResult<()> {
   // 1. Unpack the artifact and read its manifest.
@@ -271,8 +337,6 @@ fn pkgfile_into(
 
   ensure_dirs(&app.paths)?;
 
-  app.log_info("Loading package files...");
-
   let tmpdir = make_temp_dir("pica-install").map_err(CliError::from)?;
   let _tmpdir_guard = TempDirGuard::new(tmpdir.clone());
   run_tar_extract(pkgfile, &tmpdir)?;
@@ -291,10 +355,13 @@ fn pkgfile_into(
   let pkgrel = manifest.get_first("pkgrel");
   let pkgmgr = select_backend_for_package(app, &manifest)?;
 
+  // Part of the artifact contract, checked here so a package cannot leave it
+  // out. Nothing compares it against the host yet: `os`, `arch` and `uname` are
+  // what `validate_package` acts on.
+  let _platform = required_manifest_field(&manifest, "platform")?;
+
   let pkg = PackageFields {
-    pkgname: pkgname.clone(),
     pkgver_display: pkgver_cmp_key(&pkgver, &pkgrel),
-    platform: required_manifest_field(&manifest, "platform")?,
     os: required_manifest_field(&manifest, "os")?,
     arch: required_manifest_field(&manifest, "arch")?,
     uname: manifest.get_first("uname"),
@@ -320,13 +387,25 @@ fn pkgfile_into(
   let canonical_selector = manifest.canonical_selector(&pkgname);
   let selector = selector.unwrap_or(canonical_selector);
 
-  let is_upgrade = db_has_installed(&app.paths.db_file, &pkgname)?;
+  // One lookup answers both questions: whether this replaces an installed
+  // package, and what the header has to say about the version it replaces.
+  let installed_version = db_installed_version(&app.paths.db_file, &pkgname)?;
+  let is_upgrade = installed_version.is_some();
 
   if !pica_required.is_empty() && !ver_ge(PICA_VERSION, &pica_required) {
     return Err(CliError::new(
       E_VERSION_INCOMPATIBLE,
       format!("pica too old: pkg requires >= {pica_required}, cli is {PICA_VERSION}"),
     ));
+  }
+
+  // The transaction says what it is before it touches anything, so every line
+  // after this one — including a failure — belongs to a package the user can
+  // identify. Sizes come first in the index and say what the package claims;
+  // what was actually written is reported at the end.
+  app.log_info(transaction_header(&pkgname, &pkg.pkgver_display, installed_version.as_deref()));
+  for line in size_lines(sizes) {
+    app.log_info(line);
   }
 
   let ctx = InstallContext {
@@ -474,7 +553,11 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   }
   app_list = reorder_app_list(app_list);
 
-  app.log_info(format!("Resolving {} dependencies and app list...", ctx.pkgmgr));
+  // Names what the precheck below actually does: it reads the artifact's
+  // declarations, asks the backend's index about each one and reports where it
+  // would come from. It is not a solver — no version is chosen, no conflict
+  // between packages is detected — so it must not be called one.
+  app.log_info("Checking declared dependencies...");
 
   let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &app_list)?;
 
@@ -500,6 +583,9 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
       "Installing {} optional dependencies on request",
       optional.selected_count()
     ));
+  }
+  for line in dependency_source_lines(&report, &optional) {
+    app.log_info(line);
   }
 
   Ok(DependencyPrecheck { report, deps, source, optional })
@@ -534,6 +620,41 @@ fn dependency_source_for(
 /// The declarations a backend must be given: the required ones.
 fn required_names(constraints: &[Constraint]) -> Vec<String> {
   constraint::required(constraints).map(|constraint| constraint.name.clone()).collect()
+}
+
+/// The dependencies this install has to do something about, each with the source
+/// the precheck found for it: `kmod-tun (feed)`, `helper (packaged)`.
+///
+/// Installed ones are left out — nothing is done about them — and the status
+/// word is the one the precheck recorded, so the line cannot claim a source the
+/// check did not find. An optional dependency is listed only when this install
+/// covers it: a declined one is not being brought in, and saying `(feed)` next to
+/// it would read as though it were.
+fn dependency_source_lines(report: &Value, optional: &OptionalPlan) -> Vec<String> {
+  let mut lines = Vec::new();
+
+  for group in crate::constraints::GROUPS {
+    let Some(entries) = report.get(group).and_then(Value::as_array) else {
+      continue;
+    };
+    for entry in entries {
+      let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
+      if status != "feed" && status != "packaged" {
+        continue;
+      }
+      let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+      if name.is_empty() {
+        continue;
+      }
+      let is_optional = entry.get("optional").and_then(Value::as_bool).unwrap_or(false);
+      if is_optional && !optional.covers(group, name) {
+        continue;
+      }
+      lines.push(format!("  {name} ({status})"));
+    }
+  }
+
+  lines
 }
 
 /// One feed phase: what must be installed plus what the user chose.
@@ -791,9 +912,10 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
     let env_dir = target.resolve(ENV_DIR);
     ensure_dir(&env_dir)?;
     let file = env_dir.join(format!("{}.env", ctx.pkgname));
-    fs::copy(&env_file, &file)
+    let written = fs::copy(&env_file, &file)
       .map_err(|err| CliError::new(E_IO, format!("copy env file failed: {err}")))?;
     payload.files.push(file.display().to_string());
+    payload.size += written;
   }
 
   let scripts_dir = kept_scripts_dir(target, ctx.pkgname);
@@ -802,6 +924,9 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
     if let Ok(entries) = fs::read_dir(&scripts_dir) {
       for entry in entries.flatten() {
         if entry.path().is_file() {
+          // Kept scripts are Pica's own files, so their bytes belong in what
+          // this install wrote — the payload walk did not count them.
+          payload.size += entry.metadata().map_or(0, |meta| meta.len());
           payload.files.push(entry.path().display().to_string());
         }
       }
@@ -949,13 +1074,15 @@ impl InstallTransaction {
     let mut leftovers = Vec::new();
 
     for record in self.payload_records.iter().rev() {
-      remove_payload(record);
+      // Its count is dropped because it does not answer the question below: a
+      // directory may survive too, and that is not a file.
+      let _ = remove_payload(record);
     }
 
-    // `remove_payload` is best effort — it ignores the errors it hits — so what
-    // survived is found by looking rather than by trusting a return value. The
-    // survivors are both reported and kept as this install's payload record,
-    // because a `-R` driven by that record is the only way left to clean them.
+    // `remove_payload` is best effort, so what survived is found by looking
+    // rather than by trusting a return value. The survivors are both reported
+    // and kept as this install's payload record, because a `-R` driven by that
+    // record is the only way left to clean them.
     //
     // A recorded directory is one this install created, so a directory that is
     // still there is a survivor too: it is either not empty (something else —
@@ -1098,6 +1225,13 @@ fn record_installation(
     &payload.files,
     &payload.dirs,
   )?;
+
+  // What Pica itself wrote, and only when Pica is the one that wrote it: a
+  // native backend prints its own summary, and counting Pica's containers for it
+  // would be a second, different answer to the same question.
+  if !failed && !app.backend().requires_system_binary() && !payload.files.is_empty() {
+    app.log_info(install_summary(&payload));
+  }
 
   app.log_info("Transaction completed");
 
@@ -1361,7 +1495,7 @@ arch = all
 
     let artifact = work.join("demo.pkg.tar.gz");
     pack(work, "demo.pkg.tar.gz", &staging);
-    pkgfile_into(app, &artifact, None, EntrySource::Repo, target)
+    pkgfile_into(app, &artifact, None, EntrySource::Repo, IndexSizes::default(), target)
   }
 
   /// A fixture that installs a `demo-lib` container plus a `root/` overlay.
@@ -1625,8 +1759,9 @@ arch = all
 
     let mut app = test_app(work.path());
     let target = TargetRoot::new(work.path().join("target-root"));
-    let err = pkgfile_into(&mut app, &apk, None, EntrySource::Local, &target)
-      .expect_err("-U does not install containers");
+    let err =
+      pkgfile_into(&mut app, &apk, None, EntrySource::Local, IndexSizes::default(), &target)
+        .expect_err("-U does not install containers");
 
     assert!(err.message.contains("is an apk package"), "{}", err.message);
     assert!(err.message.contains("apk add"), "{}", err.message);
@@ -1726,6 +1861,70 @@ arch = all
       record["files"].as_array().map(Vec::len),
       Some(1),
       "the record holds the file the artifact deployed: {record}"
+    );
+  }
+
+  #[test]
+  fn the_header_names_which_of_the_four_things_this_is() {
+    assert_eq!(transaction_header("demo", "1.0.0-1", None), "Installing demo (1.0.0-1)");
+    assert_eq!(
+      transaction_header("demo", "1.1.0-1", Some("1.0.0-1")),
+      "Upgrading demo (1.0.0-1 -> 1.1.0-1)"
+    );
+    assert_eq!(
+      transaction_header("demo", "0.9.0-1", Some("1.0.0-1")),
+      "Downgrading demo (1.0.0-1 -> 0.9.0-1)"
+    );
+    // The same version on disk is a reinstall, not an upgrade.
+    assert_eq!(
+      transaction_header("demo", "1.0.0-1", Some("1.0.0-1")),
+      "demo 1.0.0-1 is already installed; reinstalling"
+    );
+  }
+
+  #[test]
+  fn only_published_sizes_are_shown() {
+    assert!(size_lines(IndexSizes::default()).is_empty(), "nothing published, nothing to say");
+    // A zero is a feed declining to measure, not a package of no size.
+    assert!(size_lines(IndexSizes { installed: Some(0), download: Some(0) }).is_empty());
+
+    assert_eq!(
+      size_lines(IndexSizes { installed: Some(2 * 1024 * 1024), download: Some(1536) }),
+      vec!["  Package installed size: 2.0 MiB".to_string(), "  Download size: 1.5 KiB".to_string(),]
+    );
+  }
+
+  #[test]
+  fn the_summary_counts_the_files_the_payload_wrote() {
+    // Directories are not files, and the size is the bytes actually written.
+    let payload = PayloadInstall {
+      files: vec!["/etc/demo.conf".to_string(), "/usr/bin/demo".to_string()],
+      dirs: vec!["/etc".to_string()],
+      size: 1536,
+    };
+
+    assert_eq!(install_summary(&payload), "Installed 2 files, 1.5 KiB");
+  }
+
+  #[test]
+  fn the_precheck_summary_names_each_source_it_found() {
+    let report = json!({
+      "kmod": [{"name": "kmod-tun", "status": "feed"}],
+      "base": [{"name": "present", "status": "installed"}],
+      "app": [
+        {"name": "helper", "status": "packaged"},
+        {"name": "extra", "status": "feed", "optional": true},
+      ],
+    });
+    let deps = DeclaredDeps { kmod: vec![], base: vec![], app: vec![] };
+    // An empty plan covers no optional dependency, which is the default when the
+    // user was never asked.
+    let optional = optional::Plan::unavailable(&deps, "this backend cannot install them");
+
+    assert_eq!(
+      dependency_source_lines(&report, &optional),
+      vec!["  kmod-tun (feed)".to_string(), "  helper (packaged)".to_string()],
+      "an installed dependency needs nothing, and a declined optional one is not being brought in"
     );
   }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "pica-pkg-pack"
-version = "0.3.0"
+version = "0.3.33"
 edition.workspace = true
 rust-version.workspace = true
 

@@ -17,6 +17,7 @@ use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_gt, ver_ge};
+use pipeline::IndexSizes;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -226,6 +227,9 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     app.options.fetch_retry_delay,
   )?;
 
+  // Only a repository install has a trusted expected hash. A local file or a
+  // bare URL is described by nothing but itself, so neither reaches this line.
+  app.log_info("Verifying SHA-256...");
   let actual_sha256 = pica_pkg_core::io::sha256_hex(&raw);
   if !actual_sha256.eq_ignore_ascii_case(&best.sha256) {
     return Err(CliError::new(
@@ -239,12 +243,22 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
 
-  pipeline::pkgfile(app, &cached, Some(selector.to_string()), EntrySource::Repo)
+  // The index is the only source that publishes sizes for the package, so this
+  // is the only call that has any to show.
+  let sizes = IndexSizes { installed: best.size, download: best.csize };
+
+  pipeline::pkgfile(app, &cached, Some(selector.to_string()), EntrySource::Repo, sizes)
 }
 
 pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliResult<()> {
   if Path::new(source).is_file() {
-    return pipeline::pkgfile(app, Path::new(source), selector, EntrySource::Local);
+    return pipeline::pkgfile(
+      app,
+      Path::new(source),
+      selector,
+      EntrySource::Local,
+      IndexSizes::default(),
+    );
   }
 
   if is_supported_url(source) {
@@ -268,7 +282,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
       app.options.fetch_retry_delay,
     )?;
     pica_pkg_core::io::write_atomic(&cached, &raw).map_err(CliError::from)?;
-    return pipeline::pkgfile(app, &cached, selector, EntrySource::Url);
+    return pipeline::pkgfile(app, &cached, selector, EntrySource::Url, IndexSizes::default());
   }
 
   Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))

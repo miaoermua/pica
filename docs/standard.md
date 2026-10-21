@@ -44,7 +44,7 @@
 
 | `pkgmgr` | `<suffix>` |
 | --- | --- |
-| `opkg` | （空） |
+| `opkg` | `-opkg` |
 | `apk` | `-apk` |
 | `pica` | `-pica` |
 
@@ -145,8 +145,9 @@ Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交
 默认情况下（不传 `--outdir`），`pica-pack` 输出到 `pica-pack/bin/<pkgname>/<backend>/`：
 
 ```
-pica-pack/bin/<pkgname>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.gz
+pica-pack/bin/<pkgname>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>-opkg.pkg.tar.gz
 pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
+pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 ```
 
 每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。
@@ -169,6 +170,7 @@ pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
   - `sha256`
 - `size` 必须是数字，表示安装到设备上的普通文件总字节数（`pica-pack` 构建时统计：`pica` 后端为 `root/` 的载荷，`apk`/`opkg` 后端为 `root/` 加上容器解包后的载荷；算不出来的容器不计入并告警）
 - `csize` 必须是数字，表示归档文件的压缩后字节数
+  - 安装时这两项只用来在事务头部各报一行（`Package installed size` / `Download size`），报的是**包自称**的数字；字段缺失或为 `0` 时不报（`0` 是源没有测量，不是"不占空间"）。实际写入量由安装结束时的 `Installed <n> files, <bytes>` 给出，两者不该互相替代
 - `sha256` 必须是 64 位十六进制字符串
 - `filename` 必须是纯文件名（不能含 `/`、不能含 `..`），且必须以 `.pkg.tar.gz` 结尾
 - `filename` 必须与其他字段一致：
@@ -189,8 +191,8 @@ pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
 `pica -U` 支持本地文件和 URL：
 
 ```
-pica -U ./hello-0.2.8-1-all.pkg.tar.gz
-pica -U https://example.invalid/pkgs/hello-0.2.8-1-all.pkg.tar.gz
+pica -U ./hello-0.2.8-1-all-opkg.pkg.tar.gz
+pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 ```
 
 允许的 URL 协议：

@@ -2,6 +2,7 @@ mod app;
 mod candidate;
 mod commands;
 mod constraints;
+mod format;
 mod installed;
 mod lock;
 mod pkgmgr;
@@ -15,7 +16,7 @@ use crate::app::{
 };
 use crate::commands::{install, query, remove, sync, upgrade};
 use crate::lock::LockGuard;
-use crate::state::cleanup_pkg_cache_with_notice;
+use crate::state::cleanup_pkg_cache;
 use crate::system::need_cmd;
 use pica_pkg_core::PICA_VERSION;
 use std::env;
@@ -84,7 +85,7 @@ fn main() {
   };
 
   let result = run_command(&mut app, &args);
-  cleanup_pkg_cache_with_notice(&mut app);
+  cleanup_pkg_cache(&mut app);
   drop(lock_guard);
 
   match result {

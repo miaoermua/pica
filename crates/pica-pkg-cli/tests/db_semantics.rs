@@ -52,6 +52,19 @@ exit 0
 const APK_3: &str = "3.0.0";
 const APK_2: &str = "2.14.4";
 
+/// `APK_STUB` with a failing `add`: the native transaction fails after the
+/// feed lookup succeeded, which is the path whose error must survive.
+const APK_STUB_FAILS_ADD: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  search) printf '%s-1.0.0\n' "$3" ;;
+  add) echo 'ERROR: simulated failure' >&2; exit 1 ;;
+esac
+exit 0
+"#;
+
 /// `APK_STUB` plus the answer a bound check needs.
 ///
 /// `installed_version` reads `apk list --installed -- <name>`, which apk-tools
@@ -323,19 +336,29 @@ impl Sandbox {
   /// real `/etc`. `extra` is appended to the manifest, where a dependency
   /// declaration goes.
   fn root_only_artifact(&self, pkgname: &str, declared: &str, extra: &str) -> PathBuf {
+    self.root_only_artifact_version(pkgname, "1.0.0", declared, extra)
+  }
+
+  fn root_only_artifact_version(
+    &self,
+    pkgname: &str,
+    version: &str,
+    declared: &str,
+    extra: &str,
+  ) -> PathBuf {
     let src = self.dir.path().join(format!("src-{pkgname}"));
     let root = src.join("root/tmp");
     fs::create_dir_all(&root).expect("create pkgdir");
     fs::write(
       src.join("manifest"),
       format!(
-        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = 1.0.0\npkgrel = 1\npkgmgr = {declared}\nplatform = all\nos = all\narch = all\n{extra}"
+        "pkgname = {pkgname}\nappname = {pkgname}\npkgver = {version}\npkgrel = 1\npkgmgr = {declared}\nplatform = all\nos = all\narch = all\n{extra}"
       ),
     )
     .expect("write manifest");
     fs::write(root.join(format!("{pkgname}.conf")), b"payload\n").expect("write payload");
 
-    let out = self.dir.path().join(format!("{pkgname}.pkg.tar.gz"));
+    let out = self.dir.path().join(format!("{pkgname}-{version}.pkg.tar.gz"));
     let status = std::process::Command::new("tar")
       .arg("-czf")
       .arg(&out)
@@ -672,7 +695,12 @@ fn a_local_apk_is_installed_with_the_non_repository_flag() {
   let artifact = sandbox.apk_artifact("local-apk");
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
-  sandbox.run(&["-U", artifact]).success();
+  let assert = sandbox.run(&["-U", artifact]).success();
+  let stdout = stdout_of(&assert);
+  assert!(
+    !stdout.contains(":: Installed "),
+    "a native backend owns the result summary; Pica must not claim one: {stdout}"
+  );
 
   let calls = sandbox.calls();
   let add = calls.lines().find(|line| line.starts_with("apk add ")).expect("apk add ran");
@@ -1228,7 +1256,11 @@ fn with_optional_installs_the_optional_dependency_in_its_phase() {
   );
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
-  sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+  let assert =
+    sandbox.run(&["-U", artifact, "--feed-policy", "feed-first", "--with-optional"]).success();
+  let stdout = stdout_of(&assert);
+  assert!(stdout.contains(":: Checking declared dependencies..."), "{stdout}");
+  assert!(stdout.contains("base-dep (feed)"), "the source is named, not resolved: {stdout}");
 
   let calls = sandbox.calls();
   assert_eq!(
@@ -1521,4 +1553,216 @@ fn a_pica_artifact_may_declare_optional_dependencies_it_cannot_install() {
 
   let entry = optional_entry(&sandbox, "opt-pica", "opt-app");
   assert_eq!(entry["reason"], "pkgmgr=pica cannot install dependencies", "{entry}");
+}
+
+// -- Transaction output -------------------------------------------------------
+//
+// What a user sees of an install or a removal: the one-line header, the sizes
+// the index publishes, the integrity phase and the deployed/removed summary.
+
+impl Sandbox {
+  fn write_index(&self, json: &str) {
+    fs::write(self.state_dir().join("index.json"), json).expect("write index.json");
+  }
+}
+
+/// One schema-2 index entry pointing at `artifact`, served over `file://`.
+fn repo_index(
+  pkgname: &str,
+  version: &str,
+  artifact: &Path,
+  sha256: &str,
+  size: u64,
+  csize: u64,
+) -> String {
+  let filename = artifact.file_name().and_then(|name| name.to_str()).expect("artifact filename");
+  serde_json::json!({
+      "repos": {
+          "sandbox": {
+              "url": "",
+              "data": {
+                  "schema": 2,
+                  "packages": [{
+                      "pkgname": pkgname,
+                      "appname": pkgname,
+                      "pkgver": version,
+                      "pkgrel": "1",
+                      "pkgmgr": "pica",
+                      "platform": "all",
+                      "arch": "all",
+                      "os": "all",
+                      "filename": filename,
+                      "sha256": sha256,
+                      "size": size,
+                      "csize": csize,
+                      "download_url": format!("file://{}", artifact.display()),
+                  }]
+              }
+          }
+      }
+  })
+  .to_string()
+}
+
+fn artifact_sha256(artifact: &Path) -> String {
+  pica_pkg_core::io::sha256_hex(&fs::read(artifact).expect("read artifact"))
+}
+
+#[test]
+fn a_repository_install_reports_the_header_sizes_and_integrity_check() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("repo-demo", "pica", "");
+  let sha = artifact_sha256(&artifact);
+  sandbox.write_index(&repo_index("repo-demo", "1.0.0", &artifact, &sha, 2048, 1024));
+
+  let stdout = stdout_of(&sandbox.run(&["-Sp", "repo-demo"]).success());
+
+  assert!(stdout.contains(":: Installing repo-demo (1.0.0-1)"), "{stdout}");
+  assert!(stdout.contains("::   Package installed size: 2.0 KiB"), "{stdout}");
+  assert!(stdout.contains("::   Download size: 1.0 KiB"), "{stdout}");
+  assert!(stdout.contains(":: Verifying SHA-256..."), "{stdout}");
+  assert!(stdout.contains(":: Installed 1 file,"), "{stdout}");
+  assert!(stdout.contains(":: Transaction completed"), "{stdout}");
+  let downloading = stdout.find(":: Downloading").expect("download phase");
+  let verifying = stdout.find(":: Verifying SHA-256...").expect("verification phase");
+  let installing = stdout.find(":: Installing repo-demo").expect("install header");
+  assert!(downloading < verifying && verifying < installing, "phases keep their order: {stdout}");
+  assert!(!stdout.contains("version:"), "the metadata dump is gone: {stdout}");
+  assert!(!stdout.contains("platform:"), "the metadata dump is gone: {stdout}");
+  assert!(!stdout.contains("Cleaning up Pica cache"), "routine cleanup is silent: {stdout}");
+
+  let _ = fs::remove_file("/tmp/repo-demo.conf");
+}
+
+#[test]
+fn a_zero_csize_is_omitted_rather_than_printed_as_zero_bytes() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("zero-csize", "pica", "");
+  let sha = artifact_sha256(&artifact);
+  sandbox.write_index(&repo_index("zero-csize", "1.0.0", &artifact, &sha, 1024, 0));
+
+  let stdout = stdout_of(&sandbox.run(&["-Sp", "zero-csize"]).success());
+
+  assert!(stdout.contains("::   Package installed size: 1.0 KiB"), "{stdout}");
+  assert!(!stdout.contains("Download size"), "a zero csize means 'not measured': {stdout}");
+  assert!(!stdout.contains("0 B"), "{stdout}");
+
+  let _ = fs::remove_file("/tmp/zero-csize.conf");
+}
+
+#[test]
+fn an_integrity_mismatch_stops_before_any_summary() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("bad-demo", "pica", "");
+  sandbox.write_index(&repo_index("bad-demo", "1.0.0", &artifact, &"0".repeat(64), 1024, 512));
+
+  let assert = sandbox.run(&["-Sp", "bad-demo"]).failure();
+  let stdout = stdout_of(&assert);
+
+  assert!(stdout.contains(":: Verifying SHA-256..."), "{stdout}");
+  assert!(!stdout.contains(":: Installed "), "nothing was installed: {stdout}");
+  assert!(!stdout.contains(":: Transaction completed"), "{stdout}");
+  assert.stderr(contains("sha256 mismatch"));
+}
+
+#[test]
+fn a_local_install_has_no_verification_step_and_reinstalls_in_place() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("local-demo", "pica", "");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let first = stdout_of(&sandbox.run(&["-U", artifact]).success());
+  assert!(first.contains(":: Installing local-demo (1.0.0-1)"), "{first}");
+  assert!(!first.contains("Verifying SHA-256"), "no expected hash to verify: {first}");
+  assert!(first.contains(":: Installed 1 file"), "{first}");
+
+  let second = stdout_of(&sandbox.run(&["-U", artifact]).success());
+  assert!(second.contains("local-demo 1.0.0-1 is already installed; reinstalling"), "{second}");
+
+  let _ = fs::remove_file("/tmp/local-demo.conf");
+}
+
+#[test]
+fn a_real_upgrade_prints_the_old_and_new_version_once() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let old = sandbox.root_only_artifact_version("upgrade-demo", "1.0.0", "pica", "");
+  let old_sha = artifact_sha256(&old);
+  sandbox.write_index(&repo_index("upgrade-demo", "1.0.0", &old, &old_sha, 1024, 512));
+  sandbox.run(&["-Sp", "upgrade-demo"]).success();
+
+  let new = sandbox.root_only_artifact_version("upgrade-demo", "1.1.0", "pica", "");
+  let new_sha = artifact_sha256(&new);
+  sandbox.write_index(&repo_index("upgrade-demo", "1.1.0", &new, &new_sha, 2048, 1024));
+
+  let stdout = stdout_of(&sandbox.run(&["-Su"]).success());
+
+  assert_eq!(
+    stdout.matches(":: Upgrading upgrade-demo").count(),
+    1,
+    "the upgrade is announced exactly once: {stdout}"
+  );
+  assert!(stdout.contains(":: Upgrading upgrade-demo (1.0.0-1 -> 1.1.0-1)"), "{stdout}");
+  assert!(!stdout.contains("Upgrading upgrade-demo:"), "the old second wording is gone: {stdout}");
+
+  let _ = fs::remove_file("/tmp/upgrade-demo.conf");
+}
+
+#[test]
+fn a_downgrade_names_both_versions_instead_of_calling_it_an_upgrade() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let newer = sandbox.root_only_artifact_version("down-demo", "1.1.0", "pica", "");
+  sandbox.run(&["-U", newer.to_str().expect("artifact path is utf-8")]).success();
+  let older = sandbox.root_only_artifact_version("down-demo", "1.0.0", "pica", "");
+
+  let stdout =
+    stdout_of(&sandbox.run(&["-U", older.to_str().expect("artifact path is utf-8")]).success());
+
+  assert!(stdout.contains(":: Downgrading down-demo (1.1.0-1 -> 1.0.0-1)"), "{stdout}");
+  assert!(!stdout.contains(":: Upgrading down-demo"), "{stdout}");
+
+  let _ = fs::remove_file("/tmp/down-demo.conf");
+}
+
+#[test]
+fn a_pica_removal_reports_the_header_and_what_it_actually_removed() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("remove-demo", "pica", "");
+  sandbox.run(&["-U", artifact.to_str().expect("artifact path is utf-8")]).success();
+
+  let stdout = stdout_of(&sandbox.run(&["-R", "remove-demo"]).success());
+
+  assert!(stdout.contains(":: Removing remove-demo (1.0.0-1)"), "{stdout}");
+  assert!(stdout.contains("::   Removed 1 file"), "{stdout}");
+  assert!(stdout.contains(":: Transaction completed"), "{stdout}");
+  assert!(!stdout.contains("skip package-manager remove"), "{stdout}");
+  assert!(!Path::new("/tmp/remove-demo.conf").exists(), "the payload file is gone");
+  assert_eq!(sandbox.calls(), "", "a pica removal drives no package manager");
+}
+
+#[test]
+fn a_native_artifact_gets_no_pica_result_summary() {
+  // A root/ payload on an apk artifact is still deployed by Pica, but the
+  // package's files belong to apk: the result summary is apk's to print.
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("native-demo", "apk", "");
+
+  let stdout =
+    stdout_of(&sandbox.run(&["-U", artifact.to_str().expect("artifact path is utf-8")]).success());
+
+  assert!(stdout.contains(":: Installing native-demo (1.0.0-1)"), "{stdout}");
+  assert!(!stdout.contains(":: Installed "), "the native backend owns the summary: {stdout}");
+
+  let _ = fs::remove_file("/tmp/native-demo.conf");
+}
+
+#[test]
+fn a_failed_native_feed_install_prints_no_completion_and_keeps_the_error() {
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_FAILS_ADD);
+
+  let assert = sandbox.run(&["-So", "demo"]).failure();
+  let stdout = stdout_of(&assert);
+
+  assert!(!stdout.contains(":: Transaction completed"), "{stdout}");
+  assert.stderr(contains("install failed").and(contains("simulated failure")));
+  assert!(sandbox.calls().contains("apk add"), "{}", sandbox.calls());
 }

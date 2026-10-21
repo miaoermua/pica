@@ -61,7 +61,7 @@ LICENSE                            可选
 产物命名与输出目录：
 
 ```text
-<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-pica].pkg.tar.gz
+<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-opkg|-apk|-pica].pkg.tar.gz
 platform = all 时省略 platform 段
 
 <outdir>/opkg/    opkg

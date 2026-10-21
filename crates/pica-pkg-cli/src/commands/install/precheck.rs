@@ -4,8 +4,7 @@ use crate::app::{
   E_PLATFORM_UNSUPPORTED, E_VERSION_INCOMPATIBLE,
 };
 use crate::platform::{
-  ArchVerdict, check_arch, detect_luci_variant, detect_os, detect_package_arches, detect_platform,
-  normalize_uname,
+  ArchVerdict, check_arch, detect_luci_variant, detect_os, detect_package_arches, normalize_uname,
 };
 use crate::system::run_command_text;
 use pica_pkg_core::constraint::{self, Constraint};
@@ -362,7 +361,6 @@ pub(super) fn validate_package(
   tmpdir: &Path,
   pkg: &PackageFields,
 ) -> CliResult<()> {
-  let host_platform = detect_platform();
   let host_os = detect_os();
   let host_uname_raw = run_command_text("uname", &["-m"]).unwrap_or_else(|_| "unknown".to_string());
   let host_uname = normalize_uname(&host_uname_raw);
@@ -428,23 +426,11 @@ pub(super) fn validate_package(
     }
   }
 
-  app.log_info(format!("Installing {}...", pkg.pkgname));
-  app.log_info(format!("  version: {}", pkg.pkgver_display));
-  app.log_info(format!("  os: {} (host: {host_os})", pkg.os));
-  app.log_info(format!("  platform: {} (host: {host_platform})", pkg.platform));
-  app.log_info(format!("  arch: {}", pkg.arch));
-  app.log_info(format!("  pkgmgr: {}", pkg.pkgmgr));
-  app.log_info(format!("  visibility: {}", pkg.visibility));
-  if !pkg.uname.is_empty() {
-    app.log_info(format!("  uname: {} (host: {host_uname_raw})", pkg.uname));
-  }
-  let pkg_type = manifest.get_first("type");
-  if !pkg_type.is_empty() {
-    app.log_info(format!("  type: {pkg_type}"));
-  }
-  if !pkg.luci.is_empty() {
-    app.log_info(format!("  luci: {}", pkg.luci));
-  }
+  // What this artifact declares about itself — version, os, arch, visibility,
+  // type — is in the manifest and in `-Qi`; the transaction header already said
+  // which package and which version is being installed. Printing the fields one
+  // per line here only buried the phase that followed, and every check above
+  // already refused a mismatch with an error naming both sides.
 
   Ok(())
 }

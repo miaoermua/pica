@@ -86,7 +86,8 @@ pub fn all(app: &mut App) -> CliResult<()> {
       continue;
     }
 
-    app.log_info(format!("Upgrading {pkgname}: {installed_ver} -> {best_ver}"));
+    // The install path prints the transaction header from the database record,
+    // so the upgrade loop does not announce the same upgrade a second time.
     install::pica_from_repo(app, &selector)?;
     updated_any = true;
   }

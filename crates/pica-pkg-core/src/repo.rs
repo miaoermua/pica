@@ -152,8 +152,14 @@ fn validate_filename(pkg: &Package) -> PicaResult<()> {
     return Err(PicaError::msg(format!("package {}: invalid filename {}", pkg.pkgname, filename)));
   }
 
-  let expected =
-    package_filename(&pkg.pkgname, &pkg.pkgver, &pkg.pkgrel, &pkg.platform, &pkg.arch, &pkg.pkgmgr);
+  let expected = package_filename(
+    &pkg.pkgname,
+    &pkg.pkgver,
+    &pkg.pkgrel,
+    &pkg.platform,
+    &pkg.arch,
+    &pkg.pkgmgr,
+  )?;
   if expected != *filename {
     return Err(PicaError::msg(format!(
       "package {}: filename mismatch, expected {}, got {}",
@@ -166,16 +172,23 @@ fn validate_filename(pkg: &Package) -> PicaResult<()> {
 
 /// Backend marker carried by the filename. Purely cosmetic: `pkgmgr` in the
 /// index is the authority, and this suffix is never parsed back out.
-#[must_use]
-pub fn filename_suffix(pkgmgr: &str) -> &'static str {
+///
+/// Every supported backend has an explicit suffix. `None` is an error: naming
+/// an unknown backend the way `opkg` used to be named (no suffix) would let two
+/// backends write the same filename.
+#[must_use = "an unknown backend is a fact the caller must handle"]
+pub fn filename_suffix(pkgmgr: &str) -> Option<&'static str> {
   match pkgmgr {
-    "apk" => "-apk",
-    "pica" => "-pica",
-    _ => "",
+    "opkg" => Some("-opkg"),
+    "apk" => Some("-apk"),
+    "pica" => Some("-pica"),
+    _ => None,
   }
 }
 
-#[must_use]
+/// # Errors
+/// Returns an error when `pkgmgr` is not one of [`SUPPORTED_PKGMGRS`], so an
+/// unknown backend can never be given an `opkg`-shaped name.
 pub fn package_filename(
   pkgname: &str,
   pkgver: &str,
@@ -183,13 +196,19 @@ pub fn package_filename(
   platform: &str,
   arch: &str,
   pkgmgr: &str,
-) -> String {
+) -> PicaResult<String> {
+  let suffix = filename_suffix(pkgmgr).ok_or_else(|| {
+    PicaError::msg(format!(
+      "unsupported pkgmgr {pkgmgr:?} for a package filename (supported: {})",
+      SUPPORTED_PKGMGRS.join(", ")
+    ))
+  })?;
   let stem = if platform == "all" {
     format!("{pkgname}-{pkgver}-{pkgrel}-{arch}")
   } else {
     format!("{pkgname}-{pkgver}-{pkgrel}-{platform}-{arch}")
   };
-  format!("{stem}{}{PKG_EXTENSION}", filename_suffix(pkgmgr))
+  Ok(format!("{stem}{suffix}{PKG_EXTENSION}"))
 }
 
 #[must_use]
@@ -199,7 +218,7 @@ pub fn is_supported_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{Package, REPO_SCHEMA, package_filename, parse_repo_json};
+  use super::{Package, REPO_SCHEMA, filename_suffix, package_filename, parse_repo_json};
   use serde_json::{Value, json};
 
   fn entry(filename: &str, pkgmgr: &str) -> Value {
@@ -220,30 +239,59 @@ mod tests {
   }
 
   #[test]
+  fn every_backend_has_an_explicit_suffix() {
+    assert_eq!(filename_suffix("opkg"), Some("-opkg"));
+    assert_eq!(filename_suffix("apk"), Some("-apk"));
+    assert_eq!(filename_suffix("pica"), Some("-pica"));
+    assert_eq!(filename_suffix("pacman"), None, "an unknown backend has no opkg-shaped name");
+  }
+
+  #[test]
   fn filename_carries_backend_suffix() {
     assert_eq!(
-      package_filename("hello", "1.0.0", "1", "all", "all", "opkg"),
-      "hello-1.0.0-1-all.pkg.tar.gz"
+      package_filename("hello", "1.0.0", "1", "all", "all", "opkg").expect("opkg filename"),
+      "hello-1.0.0-1-all-opkg.pkg.tar.gz"
     );
     assert_eq!(
-      package_filename("hello", "1.0.0", "1", "all", "all", "apk"),
+      package_filename("hello", "1.0.0", "1", "all", "all", "apk").expect("apk filename"),
       "hello-1.0.0-1-all-apk.pkg.tar.gz"
     );
     assert_eq!(
-      package_filename("hello", "1.0.0", "1", "all", "all", "pica"),
+      package_filename("hello", "1.0.0", "1", "all", "all", "pica").expect("pica filename"),
       "hello-1.0.0-1-all-pica.pkg.tar.gz"
     );
     assert_eq!(
-      package_filename("hello", "1.0.0", "1", "arm64", "aarch64_cortex-a53", "apk"),
+      package_filename("demo", "1.0", "1", "amd64", "x86_64", "opkg").expect("opkg filename"),
+      "demo-1.0-1-amd64-x86_64-opkg.pkg.tar.gz"
+    );
+    assert_eq!(
+      package_filename("hello", "1.0.0", "1", "arm64", "aarch64_cortex-a53", "apk")
+        .expect("apk filename"),
       "hello-1.0.0-1-arm64-aarch64_cortex-a53-apk.pkg.tar.gz"
+    );
+    assert_eq!(
+      package_filename("hello", "1.0.0", "1", "arm64", "aarch64_cortex-a53", "pica")
+        .expect("pica filename"),
+      "hello-1.0.0-1-arm64-aarch64_cortex-a53-pica.pkg.tar.gz"
     );
   }
 
   #[test]
+  fn an_unknown_backend_cannot_be_named() {
+    let err = package_filename("hello", "1.0.0", "1", "all", "all", "pacman")
+      .expect_err("an unknown backend must not get a filename");
+    assert!(err.to_string().contains("unsupported pkgmgr"), "{err}");
+    assert!(err.to_string().contains("opkg, apk, pica"), "{err}");
+  }
+
+  #[test]
   fn pica_and_opkg_artifacts_do_not_collide() {
-    let opkg = package_filename("demo", "1.0.0", "1", "all", "all", "opkg");
-    let pica = package_filename("demo", "1.0.0", "1", "all", "all", "pica");
+    let opkg = package_filename("demo", "1.0.0", "1", "all", "all", "opkg").expect("opkg");
+    let apk = package_filename("demo", "1.0.0", "1", "all", "all", "apk").expect("apk");
+    let pica = package_filename("demo", "1.0.0", "1", "all", "all", "pica").expect("pica");
     assert_ne!(opkg, pica);
+    assert_ne!(opkg, apk);
+    assert_ne!(apk, pica);
   }
 
   #[test]
@@ -273,7 +321,7 @@ mod tests {
   fn rejects_legacy_schema_one() {
     let text = json!({
       "schema": 1,
-      "packages": [entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")],
+      "packages": [entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg")],
     })
     .to_string();
     let err = parse_repo_json(&text).expect_err("schema 1 must be rejected");
@@ -282,7 +330,7 @@ mod tests {
 
   #[test]
   fn rejects_unknown_pkgmgr() {
-    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all.pkg.tar.gz", "pacman")]))
+    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "pacman")]))
       .expect_err("must reject");
     assert!(err.to_string().contains("unsupported pkgmgr"));
   }
@@ -295,28 +343,38 @@ mod tests {
   }
 
   #[test]
+  fn rejects_an_opkg_filename_from_before_the_suffix() {
+    // The compatibility break this change makes: an index built before `-opkg`
+    // must be regenerated, not silently accepted under a different on-disk name.
+    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")]))
+      .expect_err("the old opkg filename must not validate");
+    assert!(err.to_string().contains("filename mismatch"), "{err}");
+    assert!(err.to_string().contains("-opkg.pkg.tar.gz"), "{err}");
+  }
+
+  #[test]
   fn reject_invalid_filename() {
     assert!(parse_repo_json(&index(&[entry("../hello.pkg.tar.gz", "opkg")])).is_err());
   }
 
   #[test]
   fn reject_invalid_sha256() {
-    let mut pkg = entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg");
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["sha256"] = json!("xyz");
     assert!(parse_repo_json(&index(&[pkg])).is_err());
   }
 
   #[test]
   fn app_key_falls_back_to_pkgname() {
-    let pkg: Package =
-      serde_json::from_value(entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")).expect("deserialize");
+    let pkg: Package = serde_json::from_value(entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg"))
+      .expect("deserialize");
     assert_eq!(pkg.app_key(), "hello");
     assert_eq!(pkg.os_key(), "all");
   }
 
   #[test]
   fn unknown_fields_survive_round_trip() {
-    let mut pkg = entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg");
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["future_field"] = json!({"nested": [1, 2, 3]});
     let parsed = parse_repo_json(&index(&[pkg])).expect("valid repo");
     let reserialized = serde_json::to_value(&parsed).expect("serialize");

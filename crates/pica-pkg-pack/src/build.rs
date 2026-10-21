@@ -256,7 +256,7 @@ pub(crate) fn build_one(req: &BuildRequest<'_>) -> PicaResult<()> {
     req.build_platform,
     req.build_arch,
     req.backend.as_str(),
-  );
+  )?;
 
   msg(format!(
     "Making package: {} {}-{} [{}]",
@@ -878,7 +878,35 @@ mod tests {
 
       let built = artifact(&root, backend);
       assert!(built.is_file(), "{}", built.display());
+      assert_eq!(
+        built.file_name().expect("artifact name").to_string_lossy(),
+        format!("hello-1.0.0-1-all-{backend}.pkg.tar.gz"),
+        "an all-platform build drops the platform segment but keeps the backend suffix"
+      );
       assert!(artifact_entries(&built).contains("scripts/install"), "{backend}");
+    }
+  }
+
+  #[test]
+  fn a_concrete_platform_keeps_the_segment_for_every_backend() {
+    for backend in ["opkg", "apk", "pica"] {
+      let tmp = tempfile::tempdir().expect("create temp dir");
+      let root = tmp.path().to_path_buf();
+      fs::create_dir_all(root.join("scripts")).expect("mkdir scripts");
+      fs::write(root.join("scripts/install"), "#!/bin/sh\nexit 0\n").expect("write script");
+
+      build_with_manifest(
+        &root,
+        &format!("{BASE_MANIFEST}platform = amd64\narch = x86_64\ntargets = {backend}\n"),
+      )
+      .expect("build");
+
+      let built = artifact(&root, backend);
+      assert_eq!(
+        built.file_name().expect("artifact name").to_string_lossy(),
+        format!("hello-1.0.0-1-amd64-x86_64-{backend}.pkg.tar.gz"),
+        "{backend}"
+      );
     }
   }
 

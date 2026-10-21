@@ -193,6 +193,21 @@ pub struct PayloadInstall {
   pub size: u64,
 }
 
+/// What `remove_payload` managed to take away.
+///
+/// Both figures count files, which is what the record holds: a path recorded as
+/// a file is unlinked whether it is a regular file or a symlink. Directories are
+/// not counted, because they are only removed when they end up empty and the
+/// record does not say which ones did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadRemoval {
+  /// Files this call unlinked.
+  pub removed: usize,
+  /// Files that are still there: the unlink failed for some reason other than
+  /// the file having been absent already.
+  pub kept: usize,
+}
+
 /// Mirrors `source_root` onto `target_root`, preserving file modes and
 /// recreating symlinks instead of following them.
 ///
@@ -299,10 +314,20 @@ fn remove_existing(path: &Path) -> PicaResult<()> {
 /// they are resolved against a target root; anything else in the record (an
 /// install delegated to a native package manager stores package names there) is
 /// not a file Pica created and must never be unlinked relative to the CWD.
-pub fn remove_payload(payload: &PayloadInstall) {
+#[must_use]
+pub fn remove_payload(payload: &PayloadInstall) -> PayloadRemoval {
+  let mut outcome = PayloadRemoval::default();
+
   for file in &payload.files {
-    if Path::new(file).is_absolute() {
-      let _ = fs::remove_file(file);
+    if !Path::new(file).is_absolute() {
+      continue;
+    }
+    match fs::remove_file(file) {
+      Ok(()) => outcome.removed += 1,
+      // Already absent is the state the caller asked for; it is neither a file
+      // this call removed nor one it had to leave behind.
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+      Err(_) => outcome.kept += 1,
     }
   }
   for dir in payload.dirs.iter().rev() {
@@ -314,6 +339,8 @@ pub fn remove_payload(payload: &PayloadInstall) {
       let _ = fs::remove_dir(path);
     }
   }
+
+  outcome
 }
 
 fn resolve_under(target_root: &Path, relative: &Path) -> PicaResult<PathBuf> {
@@ -458,7 +485,9 @@ mod tests {
     assert!(installed.files.iter().any(|f| f.ends_with("usr/bin/app")));
     assert!(installed.dirs.iter().any(|d| d.ends_with("usr/bin")));
 
-    remove_payload(&installed);
+    let outcome = remove_payload(&installed);
+    assert_eq!(outcome.removed, installed.files.len(), "every recorded file was unlinked");
+    assert_eq!(outcome.kept, 0);
     assert!(!target.join("usr/bin/app").exists());
     assert!(!target.join("usr").exists(), "directories we created are pruned");
     assert!(target.is_dir(), "the target root itself survives");
@@ -475,9 +504,35 @@ mod tests {
     let installed = install_payload(&root, &target).expect("install payload");
     assert!(!installed.dirs.iter().any(|d| d.ends_with("usr/bin")));
 
-    remove_payload(&installed);
+    assert_eq!(remove_payload(&installed).removed, installed.files.len());
     assert!(target.join("usr/bin/other").is_file());
     assert!(target.join("usr/bin").is_dir());
+  }
+
+  #[test]
+  fn removal_counts_what_it_did_rather_than_what_the_record_claimed() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    // A recorded path that is now a non-empty directory cannot be unlinked.
+    let blocked = tmp.path().join("blocked");
+    fs::create_dir_all(&blocked).expect("mkdir");
+    fs::write(blocked.join("child"), b"x").expect("write child");
+
+    let payload = PayloadInstall {
+      files: vec![
+        blocked.display().to_string(),
+        // Already gone: the caller asked for absence and got it, so this is
+        // neither removed nor kept.
+        tmp.path().join("gone").display().to_string(),
+      ],
+      dirs: Vec::new(),
+      size: 0,
+    };
+
+    let outcome = remove_payload(&payload);
+    assert_eq!(outcome.removed, 0);
+    assert_eq!(outcome.kept, 1);
+    assert!(blocked.join("child").is_file(), "the failed removal changed nothing");
   }
 
   #[cfg(unix)]
