@@ -170,8 +170,11 @@ fn backend_index(mgr: &str, packages: &[Value]) -> String {
     .to_string()
 }
 
+/// `index.json` is the only entry point: a root that still serves a perfectly
+/// valid `repo.json` next to it is not read, because guessing would mean two
+/// protocols and an ordering between them.
 #[test]
-fn a_schema_2_source_is_still_read_as_one_repo_json() {
+fn a_root_without_index_json_is_not_read_through_repo_json() {
   let sandbox = Sandbox::new();
   sandbox.write(
     "repo.json",
@@ -181,15 +184,46 @@ fn a_schema_2_source_is_still_read_as_one_repo_json() {
     })
     .to_string(),
   );
-  sandbox.write_conf(&json!([{ "name": "main", "url": sandbox.source_url() }]));
+  sandbox.write_conf(&json!([{
+    "name": "main",
+    "url": sandbox.source_url(),
+    "backends": ["pica"],
+  }]));
 
-  sandbox.run(&["-S"]).success();
+  sandbox.run(&["-S"]).failure().stderr(contains("index.json").and(contains("failed")));
 
-  let repo = &sandbox.index()["repos"]["main"];
-  assert_eq!(repo["kind"], "legacy", "{repo}");
-  assert_eq!(repo["data"]["packages"][0]["pkgname"], "legacy-demo");
+  assert!(
+    sandbox.index()["repos"]["main"].is_null(),
+    "a failed sync must not leave an index entry behind"
+  );
+  sandbox.run(&["-Si", "legacy-demo"]).failure().stderr(contains("not found"));
+}
 
-  sandbox.run(&["-Si", "legacy-demo"]).success().stdout(contains("legacy-demo"));
+/// A stored `index.json` that is not a descriptor is an error, not a reason to
+/// look for another file.
+#[test]
+fn an_index_json_that_cannot_be_parsed_fails_the_sync() {
+  let sandbox = Sandbox::new();
+  sandbox.write("index.json", "{ not json");
+  sandbox.write(
+    "repo.json",
+    &json!({
+      "schema": 2,
+      "packages": [package("legacy-demo", "1.0.0", "pica", "file:///tmp/legacy-demo.pkg.tar.gz")],
+    })
+    .to_string(),
+  );
+  sandbox.write_conf(&json!([{
+    "name": "main",
+    "url": sandbox.source_url(),
+    "backends": ["pica"],
+  }]));
+
+  sandbox.run(&["-S"]).failure().stderr(contains("index.json").and(contains("invalid")));
+  assert!(
+    sandbox.index()["repos"]["main"].is_null(),
+    "a failed sync must not leave an index entry behind"
+  );
 }
 
 #[test]
@@ -219,7 +253,6 @@ fn an_entry_descriptor_source_reads_only_the_backend_asked_for() {
   sandbox.run(&["-S"]).success();
 
   let repo = &sandbox.index()["repos"]["main"];
-  assert_eq!(repo["kind"], "entry", "{repo}");
   assert!(repo["indexes"]["pica"].is_object(), "the selected backend was fetched: {repo}");
   assert!(repo["indexes"]["opkg"].is_null(), "an unselected backend is not fetched: {repo}");
 

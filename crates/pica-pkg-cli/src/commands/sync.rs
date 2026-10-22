@@ -1,25 +1,59 @@
-use crate::app::{
-  App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID, ensure_dirs,
-};
-use crate::i18n::{Key, Lang};
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_REPO_INVALID, ensure_dirs};
+use crate::i18n::Key;
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_platform;
 use crate::source::{self, FetchPolicy};
-use crate::state::{
-  ensure_json_object_field, read_json_file, repo_package_sets, write_json_atomic_pretty,
-};
+use crate::state::{Transaction, read_json_file, repo_package_sets};
 use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor, parse_repo_json};
+use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor};
 use serde_json::{Value, json};
 
 /// Backends a source may advertise. Kept as text so an error can list them.
 const SUPPORTED_BACKENDS: &str = "opkg, apk, pica";
 
+/// Everything one sync publishes, built before a single byte is written.
+///
+/// Building first is what makes the sync transactional: a source that fails to
+/// fetch or parse cannot leave its own cache, another source's cache or the
+/// shared index half updated, because nothing has been written yet.
+pub struct Plan {
+  index: Value,
+  caches: Vec<(String, Value)>,
+}
+
+impl Plan {
+  /// Adds every file this plan publishes to `tx`: one cache per source first,
+  /// then the index that references them.
+  ///
+  /// # Errors
+  /// Returns an error if a file's current contents cannot be read or staged.
+  pub fn stage(self, app: &App, tx: &mut Transaction) -> CliResult<()> {
+    for (name, value) in self.caches {
+      let path = app.paths.repos_cache_dir.join(format!("{name}.json"));
+      tx.stage_json(app, &path, &value)?;
+    }
+    tx.stage_json(app, &app.paths.index_file, &self.index)
+  }
+}
+
 pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   app.info(Key::SyncStarted);
 
+  let repos = configured_repos(app)?;
+  let plan = build(app, &repos)?;
+
+  let mut tx = Transaction::new();
+  plan.stage(app, &mut tx)?;
+  tx.commit(app)?;
+
+  check_index_dependencies(app);
+  Ok(())
+}
+
+/// The `repos[]` array from the configuration.
+fn configured_repos(app: &App) -> CliResult<Vec<Value>> {
   let conf = read_json_file(&app.paths.conf_file)?;
   let missing_repos = || {
     CliError::new(
@@ -41,15 +75,19 @@ pub fn repos(app: &mut App) -> CliResult<()> {
     return Err(missing_repos());
   }
 
+  Ok(repos)
+}
+
+/// Fetches, parses and validates every configured source without writing
+/// anything. The caller commits the result, all at once.
+///
+/// # Errors
+/// Returns the first source's error, describing what was wrong with it.
+pub fn build(app: &mut App, repos: &[Value]) -> CliResult<Plan> {
   let host_platform = detect_platform();
   let now = now_unix_secs();
-
-  let mut index = read_json_file(&app.paths.index_file)?;
-  if !index.is_object() {
-    index = json!({"schema": 1, "repos": {}});
-  }
-  index["schema"] = json!(1);
-  ensure_json_object_field(&mut index, "repos")?;
+  let mut index = json!({"schema": 1, "repos": {}});
+  let mut caches = Vec::new();
 
   for (repo_index, repo_entry) in repos.iter().enumerate() {
     let name = repo_entry.get("name").and_then(Value::as_str).unwrap_or("").trim();
@@ -75,90 +113,83 @@ pub fn repos(app: &mut App) -> CliResult<()> {
       CliError::new(E_CONFIG_INVALID, app.args(Key::SyncRootRejected, &[name, url, &err.message]))
     })?;
 
-    let wanted = configured_backends(app.lang, repo_index, name, repo_entry)?;
+    let wanted = configured_backends(app, repo_index, name, repo_entry)?;
 
     app.info_args(Key::SyncDownloading, &[name]);
 
     let effective_platform =
       if repo_platform.is_empty() { host_platform.clone() } else { repo_platform.to_string() };
 
-    let body = match wanted {
-      Some(backends) => sync_from_descriptor(app, name, url, &backends, policy, now)?,
-      // No `backends` key is a configuration written for the schema-2 layout.
-      // It keeps working exactly as it did; a source that only ships the entry
-      // descriptor is reached through the descriptor instead, and that attempt
-      // is reported only if both fail.
-      None => match sync_legacy(app, name, url, policy, now) {
-        Ok(body) => body,
-        Err(legacy_error) => {
-          let Ok(declared) = all_declared_backends(app, url, policy) else {
-            return Err(legacy_error);
-          };
-          app.warn_args(Key::SyncFallback, &[name, &join_backends(&declared)]);
-          let mut body = sync_from_descriptor(app, name, url, &declared, policy, now)?;
-          body["legacy_error"] = json!(legacy_error.message);
-          body
-        }
-      },
-    };
+    let repo_obj =
+      sync_source(app, name, url, &wanted, now, allow_insecure_http, &effective_platform)?;
 
-    let repo_obj = json!({
-        "name": name,
-        "url": url,
-        "updated_at": now,
-        "platform": effective_platform,
-        "allow_insecure_http": allow_insecure_http,
-        "kind": body["kind"].clone(),
-        "backends": body["backends"].clone(),
-        "entry": body["entry"].clone(),
-        "indexes": body["indexes"].clone(),
-        "data": body["data"].clone(),
-        "legacy_error": body["legacy_error"].clone(),
-    });
-
-    let repo_cache_file = app.paths.repos_cache_dir.join(format!("{name}.json"));
-    write_json_atomic_pretty(&repo_cache_file, &repo_obj)?;
-
-    let index_repos = index
-      .get_mut("repos")
-      .and_then(Value::as_object_mut)
-      .ok_or_else(|| CliError::new(E_INDEX_INVALID, "index repos is not object"))?;
-    index_repos.insert(name.to_string(), repo_obj);
+    index["repos"]
+      .as_object_mut()
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, "index repos is not object"))?
+      .insert(name.to_string(), repo_obj.clone());
+    caches.push((name.to_string(), repo_obj));
 
     app.info_args(Key::SyncUpdated, &[name]);
   }
 
-  write_json_atomic_pretty(&app.paths.index_file, &index)?;
+  Ok(Plan { index, caches })
+}
 
-  check_index_dependencies(app);
-  Ok(())
+/// The backends one source publishes, read from its entry descriptor.
+///
+/// `setup` has to know this before it can write a `backends` list, and it must
+/// read the source exactly the way the sync will, so both go through these
+/// rules: the same `index.json`, the same policy, the same wording on failure.
+/// The sync that follows reads the descriptor again; that second read is what
+/// decides what gets written, so nothing is trusted from the first one.
+///
+/// # Errors
+/// Returns the fetch or parse error, described the way a sync describes it.
+pub fn declared_backends(
+  app: &App,
+  name: &str,
+  root: &str,
+  policy: FetchPolicy,
+) -> CliResult<Vec<String>> {
+  let entry_url = source::join_child(root, "index.json")?;
+  let text = fetch_text(app, name, "index.json", &entry_url, policy)?;
+
+  let descriptor = parse_entry_descriptor(&text).map_err(|error| {
+    CliError::new(
+      E_REPO_INVALID,
+      app.args(Key::SyncEntryInvalid, &[name, &entry_url, &error.to_string()]),
+    )
+  })?;
+  Ok(descriptor.managers.keys().cloned().collect())
 }
 
 /// The backend combination this source was configured for, in the order it was
-/// written. `None` means the configuration predates the key and the source is
-/// read the old way.
+/// written. There is no default: the source protocol cannot say which of its
+/// backends this host wants, and guessing would sync indexes nobody asked for.
 fn configured_backends(
-  lang: Lang,
+  app: &App,
   repo_index: usize,
   name: &str,
   repo_entry: &Value,
-) -> CliResult<Option<Vec<String>>> {
+) -> CliResult<Vec<String>> {
+  let index = repo_index.to_string();
   let Some(value) = repo_entry.get("backends") else {
-    return Ok(None);
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      app.args(Key::SyncBackendsMissing, &[&index, name]),
+    ));
   };
   let list = value.as_array().ok_or_else(|| {
-    let index = repo_index.to_string();
-    CliError::new(E_CONFIG_INVALID, lang.args(Key::SyncBackendsNotArray, &[&index, name]))
+    CliError::new(E_CONFIG_INVALID, app.args(Key::SyncBackendsNotArray, &[&index, name]))
   })?;
 
   let mut backends = Vec::new();
   for item in list {
     let text = item.as_str().map_or("", str::trim);
     let kind = PackageManagerKind::parse(text).ok_or_else(|| {
-      let index = repo_index.to_string();
       CliError::new(
         E_CONFIG_INVALID,
-        lang.args(
+        app.args(
           Key::SyncUnsupportedBackend,
           &[&index, name, &format!("{text:?}"), SUPPORTED_BACKENDS],
         ),
@@ -170,14 +201,10 @@ fn configured_backends(
   }
 
   if backends.is_empty() {
-    let index = repo_index.to_string();
-    return Err(CliError::new(
-      E_CONFIG_INVALID,
-      lang.args(Key::SyncBackendsEmpty, &[&index, name]),
-    ));
+    return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::SyncBackendsEmpty, &[&index, name])));
   }
 
-  Ok(Some(backends))
+  Ok(backends)
 }
 
 /// Fetch one of a source's files, refusing anything the policy would not have
@@ -204,47 +231,23 @@ fn fetch_text(
     .map_err(|_| CliError::new(E_REPO_INVALID, app.args(Key::SyncNotUtf8, &[name, what, url])))
 }
 
-/// The schema-2 layout: one `repo.json` describing every package of a source.
-fn sync_legacy(
-  app: &App,
-  name: &str,
-  root: &str,
-  policy: FetchPolicy,
-  now: u64,
-) -> CliResult<Value> {
-  let repo_url = source::join_child(root, "repo.json")?;
-  let text = fetch_text(app, name, "repo.json", &repo_url, policy)?;
-
-  let parsed = parse_repo_json(&text).map_err(|error| {
-    CliError::new(
-      E_REPO_INVALID,
-      app.args(Key::SyncRepoInvalid, &[name, &repo_url, &error.to_string()]),
-    )
-  })?;
-
-  let data = serde_json::to_value(&parsed)
-    .map_err(|error| CliError::new(E_REPO_INVALID, error.to_string()))?;
-
-  Ok(json!({
-    "kind": "legacy",
-    "backends": Vec::<String>::new(),
-    "entry": Value::Null,
-    "indexes": Value::Null,
-    "data": data,
-    "updated_at": now,
-  }))
-}
-
-/// The entry-descriptor layout: `index.json` names a path per backend, and each
-/// of those paths is fetched as its own index.
-fn sync_from_descriptor(
+/// Reads one source through its entry descriptor: `index.json` names a path per
+/// backend, and each of those paths is fetched as its own index.
+///
+/// `index.json` is the only entry. A source that does not serve it is reported
+/// as such; there is no second format to fall back to.
+fn sync_source(
   app: &App,
   name: &str,
   root: &str,
   wanted: &[String],
-  policy: FetchPolicy,
   now: u64,
+  allow_insecure_http: bool,
+  platform: &str,
 ) -> CliResult<Value> {
+  // The root was checked before this was called; the policy below is the same
+  // one, so every child address is held to the same rule as its root.
+  let policy = FetchPolicy::source(allow_insecure_http);
   let entry_url = source::join_child(root, "index.json")?;
   let text = fetch_text(app, name, "index.json", &entry_url, policy)?;
 
@@ -255,25 +258,18 @@ fn sync_from_descriptor(
     )
   })?;
 
-  let declared: Vec<&str> = descriptor.managers.keys().map(String::as_str).collect();
+  let declared: Vec<String> = descriptor.managers.keys().cloned().collect();
 
   // A backend the user asked for but the source does not publish is a hard
   // error: installing through the other one would be a different package.
-  let missing: Vec<&str> = wanted
-    .iter()
-    .map(String::as_str)
-    .filter(|mgr| !descriptor.managers.contains_key(*mgr))
-    .collect();
+  let missing: Vec<String> =
+    wanted.iter().filter(|mgr| !descriptor.managers.contains_key(*mgr)).cloned().collect();
   if !missing.is_empty() {
     return Err(CliError::new(
       E_REPO_INVALID,
       app.args(
         Key::SyncMissingBackend,
-        &[
-          name,
-          &join_backends(&missing.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
-          &join_backends(&declared.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
-        ],
+        &[name, &join_backends(&missing), &join_backends(&declared)],
       ),
     ));
   }
@@ -307,7 +303,11 @@ fn sync_from_descriptor(
   }
 
   Ok(json!({
-    "kind": "entry",
+    "name": name,
+    "url": root,
+    "updated_at": now,
+    "platform": platform,
+    "allow_insecure_http": allow_insecure_http,
     "backends": wanted,
     "entry": {
       "url": entry_url,
@@ -316,21 +316,7 @@ fn sync_from_descriptor(
       "description": descriptor.description,
     },
     "indexes": indexes,
-    "data": Value::Null,
-    "updated_at": now,
   }))
-}
-
-fn all_declared_backends(app: &App, root: &str, policy: FetchPolicy) -> CliResult<Vec<String>> {
-  let entry_url = source::join_child(root, "index.json")?;
-  let text = fetch_text(app, "source", "index.json", &entry_url, policy)?;
-  let descriptor = parse_entry_descriptor(&text).map_err(|error| {
-    CliError::new(
-      E_REPO_INVALID,
-      app.args(Key::SyncEntryInvalid, &["source", &entry_url, &error.to_string()]),
-    )
-  })?;
-  Ok(descriptor.managers.keys().cloned().collect())
 }
 
 fn join_backends(backends: &[String]) -> String {
@@ -387,9 +373,6 @@ fn collect_declared_dependencies(index: &Value) -> Vec<String> {
   };
 
   for repo in repos.values() {
-    // A source read through its entry descriptor keeps one index per backend;
-    // a schema-2 source keeps all of them in `data`. Both are read here so a
-    // dependency is never invisible just because of the layout it arrived in.
     for packages in repo_package_sets(repo) {
       for package in packages {
         let manifest = package.get("manifest").unwrap_or(&Value::Null);
@@ -438,46 +421,41 @@ mod tests {
     let index = json!({
         "repos": {
             "r1": {
-                "data": {
-                    "packages": [
+                "indexes": {
+                    "pica": {"packages": [
                         {"manifest": {"base": ["busybox", "dnsmasq"], "kmod": "kmod-tun", "app": ["luci-app-foo", "busybox"]}},
                         {"manifest": {"base": ["dnsmasq"], "app": "foo"}}
-                    ]
+                    ]}
                 }
             },
             "r2": {
-                "data": {
-                    "packages": [
-                        {"manifest": {"app": ["bar", "foo"], "kmod": ["kmod-tun", "kmod-usb"]}}
-                    ]
+                "indexes": {
+                    "apk": {"packages": [{"manifest": {"base": "busybox", "kmod": ["kmod-tun"]}}]},
+                    "opkg": {"packages": [{"manifest": {"base": "rpcd"}}]}
                 }
             }
         }
     });
 
-    let deps = collect_declared_dependencies(&index);
     assert_eq!(
-      deps,
+      collect_declared_dependencies(&index),
       vec![
-        "bar".to_string(),
         "busybox".to_string(),
         "dnsmasq".to_string(),
         "foo".to_string(),
         "kmod-tun".to_string(),
-        "kmod-usb".to_string(),
         "luci-app-foo".to_string(),
+        "rpcd".to_string(),
       ]
     );
   }
 
   #[test]
-  fn append_dep_list_ignores_empty_and_non_string() {
+  fn append_dep_list_accepts_arrays_and_strings() {
     let mut out = Vec::new();
-    append_dep_list(&mut out, Some(&json!(["a", " ", 1, "b"])));
-    append_dep_list(&mut out, Some(&json!(" c ")));
-    append_dep_list(&mut out, Some(&json!(null)));
-    append_dep_list(&mut out, Some(&json!(1)));
-
-    assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    append_dep_list(&mut out, Some(&json!([" a ", ""])));
+    append_dep_list(&mut out, Some(&json!(" b ")));
+    append_dep_list(&mut out, Some(&json!(42)));
+    assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
   }
 }

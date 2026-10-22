@@ -212,6 +212,25 @@ pub fn detect_kind() -> PackageManagerKind {
   }
 }
 
+/// Every backend this host can actually use, in detection order.
+///
+/// This is the host half of the intersection a source's declared backends are
+/// matched against, so it must not be wider than what can really run here:
+/// `apk` and `opkg` only when their binary is on `PATH`, and `pica` always,
+/// because the native backend needs no external command.
+#[must_use]
+pub fn available_kinds() -> Vec<PackageManagerKind> {
+  let mut kinds = Vec::new();
+  if crate::system::has_command("apk") {
+    kinds.push(PackageManagerKind::Apk);
+  }
+  if crate::system::has_command("opkg") {
+    kinds.push(PackageManagerKind::Opkg);
+  }
+  kinds.push(PackageManagerKind::Pica);
+  kinds
+}
+
 #[cfg(test)]
 mod tests {
   use super::PackageManagerKind;

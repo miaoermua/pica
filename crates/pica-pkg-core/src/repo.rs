@@ -3,15 +3,8 @@ use crate::version::pkgver_cmp_key;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const REPO_SCHEMA: i64 = 2;
 pub const PKG_EXTENSION: &str = ".pkg.tar.gz";
 pub const SUPPORTED_PKGMGRS: [&str; 3] = ["opkg", "apk", "pica"];
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageIndex {
-  pub schema: i64,
-  pub packages: Vec<Package>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
@@ -83,14 +76,6 @@ impl Package {
   }
 }
 
-/// # Errors
-/// Returns an error if JSON parsing fails or validation detects invalid entries.
-pub fn parse_repo_json(content: &str) -> PicaResult<PackageIndex> {
-  let parsed: PackageIndex = serde_json::from_str(content)?;
-  validate(&parsed)?;
-  Ok(parsed)
-}
-
 /// Version of the entry descriptor (`index.json`) at a source root.
 pub const ENTRY_SCHEMA: i64 = 1;
 /// Version of one backend's index, reachable from an entry descriptor.
@@ -107,21 +92,22 @@ pub struct EntryManager {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryDescriptor {
   pub schema: i64,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub name: Option<String>,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub description: Option<String>,
   pub managers: std::collections::BTreeMap<String, EntryManager>,
   #[serde(flatten)]
   pub extra: Map<String, Value>,
 }
 
-/// One backend's view of a source, split out of the `repo.json` it came from.
+/// One backend's index, as named by an entry descriptor. It is the only place a
+/// source publishes packages; there is no other file format to fall back to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendIndex {
   pub schema: i64,
   pub mgr: String,
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub generated_at: Option<String>,
   pub packages: Vec<Package>,
   #[serde(flatten)]
@@ -249,16 +235,6 @@ fn validate_download_url(pkgname: &str, value: &str) -> PicaResult<()> {
 }
 
 /// # Errors
-/// Returns an error if the schema version is wrong or any package entry is invalid.
-pub fn validate(repo: &PackageIndex) -> PicaResult<()> {
-  if repo.schema != REPO_SCHEMA {
-    return Err(PicaError::msg(format!("schema must be {REPO_SCHEMA}")));
-  }
-
-  validate_packages(&repo.packages)
-}
-
-/// # Errors
 /// Returns an error naming the first package entry that breaks the rules every
 /// index shares, whichever file it came from.
 pub fn validate_packages(packages: &[Package]) -> PicaResult<()> {
@@ -378,8 +354,8 @@ pub fn is_supported_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::{
-    BACKEND_INDEX_SCHEMA, Package, REPO_SCHEMA, filename_suffix, package_filename,
-    parse_backend_index, parse_entry_descriptor, parse_repo_json, relative_path_problem,
+    BACKEND_INDEX_SCHEMA, Package, filename_suffix, package_filename, parse_backend_index,
+    parse_entry_descriptor, relative_path_problem,
   };
   use serde_json::{Value, json};
 
@@ -394,10 +370,6 @@ mod tests {
       "filename": filename,
       "sha256": "1".repeat(64),
     })
-  }
-
-  fn index(packages: &[Value]) -> String {
-    json!({ "schema": REPO_SCHEMA, "packages": packages }).to_string()
   }
 
   #[test]
@@ -457,50 +429,66 @@ mod tests {
   }
 
   #[test]
-  fn accepts_schema_two_with_the_pica_backend() {
-    let parsed = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica")]))
-      .expect("valid pica repo");
+  fn accepts_a_pica_backend_index() {
+    let parsed = parse_backend_index(
+      &backend_index("pica", &[entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica")]),
+      "pica",
+    )
+    .expect("valid pica index");
     assert_eq!(parsed.packages[0].pkgmgr, "pica");
   }
 
   #[test]
   fn rejects_the_retired_none_backend() {
-    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-none.pkg.tar.gz", "none")]))
-      .expect_err("`none` was replaced by `pica`");
+    let err = parse_backend_index(
+      &backend_index("none", &[entry("hello-1.0.0-1-all-none.pkg.tar.gz", "none")]),
+      "none",
+    )
+    .expect_err("`none` was replaced by `pica`");
     assert!(err.to_string().contains("unsupported pkgmgr"), "{err}");
     assert!(err.to_string().contains("pica"), "the error must name the supported set: {err}");
   }
 
   #[test]
-  fn accepts_schema_two_with_required_pkgmgr() {
-    let parsed = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-apk.pkg.tar.gz", "apk")]))
-      .expect("valid apk repo");
+  fn accepts_an_apk_backend_index() {
+    let parsed = parse_backend_index(
+      &backend_index("apk", &[entry("hello-1.0.0-1-all-apk.pkg.tar.gz", "apk")]),
+      "apk",
+    )
+    .expect("valid apk index");
     assert_eq!(parsed.packages.len(), 1);
     assert_eq!(parsed.packages[0].pkgmgr, "apk");
   }
 
   #[test]
-  fn rejects_legacy_schema_one() {
+  fn rejects_the_retired_schema_two_index() {
     let text = json!({
-      "schema": 1,
+      "schema": 2,
+      "mgr": "opkg",
       "packages": [entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg")],
     })
     .to_string();
-    let err = parse_repo_json(&text).expect_err("schema 1 must be rejected");
-    assert!(err.to_string().contains("schema must be 2"));
+    let err = parse_backend_index(&text, "opkg").expect_err("schema 2 must be rejected");
+    assert!(err.to_string().contains("schema must be 1"), "{err}");
   }
 
   #[test]
   fn rejects_unknown_pkgmgr() {
-    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "pacman")]))
-      .expect_err("must reject");
+    let err = parse_backend_index(
+      &backend_index("pacman", &[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "pacman")]),
+      "pacman",
+    )
+    .expect_err("must reject");
     assert!(err.to_string().contains("unsupported pkgmgr"));
   }
 
   #[test]
   fn rejects_apk_filename_that_disagrees_with_pkgmgr() {
-    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all-apk.pkg.tar.gz", "opkg")]))
-      .expect_err("must reject");
+    let err = parse_backend_index(
+      &backend_index("opkg", &[entry("hello-1.0.0-1-all-apk.pkg.tar.gz", "opkg")]),
+      "opkg",
+    )
+    .expect_err("must reject");
     assert!(err.to_string().contains("filename mismatch"));
   }
 
@@ -508,22 +496,28 @@ mod tests {
   fn rejects_an_opkg_filename_from_before_the_suffix() {
     // The compatibility break this change makes: an index built before `-opkg`
     // must be regenerated, not silently accepted under a different on-disk name.
-    let err = parse_repo_json(&index(&[entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")]))
-      .expect_err("the old opkg filename must not validate");
+    let err = parse_backend_index(
+      &backend_index("opkg", &[entry("hello-1.0.0-1-all.pkg.tar.gz", "opkg")]),
+      "opkg",
+    )
+    .expect_err("the old opkg filename must not validate");
     assert!(err.to_string().contains("filename mismatch"), "{err}");
     assert!(err.to_string().contains("-opkg.pkg.tar.gz"), "{err}");
   }
 
   #[test]
   fn reject_invalid_filename() {
-    assert!(parse_repo_json(&index(&[entry("../hello.pkg.tar.gz", "opkg")])).is_err());
+    assert!(
+      parse_backend_index(&backend_index("opkg", &[entry("../hello.pkg.tar.gz", "opkg")]), "opkg")
+        .is_err()
+    );
   }
 
   #[test]
   fn reject_invalid_sha256() {
     let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["sha256"] = json!("xyz");
-    assert!(parse_repo_json(&index(&[pkg])).is_err());
+    assert!(parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").is_err());
   }
 
   #[test]
@@ -538,7 +532,7 @@ mod tests {
   fn unknown_fields_survive_round_trip() {
     let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["future_field"] = json!({"nested": [1, 2, 3]});
-    let parsed = parse_repo_json(&index(&[pkg])).expect("valid repo");
+    let parsed = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("valid index");
     let reserialized = serde_json::to_value(&parsed).expect("serialize");
     assert_eq!(
       reserialized["packages"][0]["future_field"],
@@ -651,7 +645,7 @@ mod tests {
   }
 
   #[test]
-  fn a_backend_index_is_held_to_the_same_package_rules_as_repo_json() {
+  fn a_backend_index_is_held_to_the_package_rules() {
     let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["sha256"] = json!("xyz");
     let err = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect_err("bad hash");
@@ -662,7 +656,8 @@ mod tests {
   fn a_download_url_may_be_relative_to_the_source_root() {
     let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
     pkg["download_url"] = json!("opkg/hello-1.0.0-1-all-opkg.pkg.tar.gz");
-    parse_repo_json(&index(&[pkg])).expect("a relative download_url is resolved by the client");
+    parse_backend_index(&backend_index("opkg", &[pkg]), "opkg")
+      .expect("a relative download_url is resolved by the client");
   }
 
   #[test]
@@ -670,7 +665,7 @@ mod tests {
     for bad in ["../../etc/passwd", "/etc/passwd", "opkg/../../x.pkg.tar.gz", "opkg%2f..%2fx"] {
       let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
       pkg["download_url"] = json!(bad);
-      let err = parse_repo_json(&index(&[pkg])).expect_err(bad);
+      let err = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect_err(bad);
       assert!(err.to_string().contains("download_url"), "{bad}: {err}");
     }
   }

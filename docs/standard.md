@@ -159,8 +159,9 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 ```
 <root>/index.json          入口描述（schema 1）
 <root>/<managers[].path>   各后端索引（schema 1）
-<root>/repo.json           旧格式（schema 2），仍受支持
 ```
+
+`index.json` 是这个软件源**唯一的入口**。它不存在、读不到、不是合法 JSON 或不符合下面的约束时，`pica -S` 直接以该源为失败退出；客户端不读取根目录的 `repo.json`，也没有任何"换一种格式再试一次"的路径。
 
 入口描述：
 
@@ -188,26 +189,26 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 - `schema` 必须为 `1`；`mgr` 必须与取它的入口一致（`opkg` 索引里出现 `mgr: "apk"` 属错误）。
 - 每个条目的 `pkgmgr` 必须等于索引的 `mgr`：同名不同后端是不同包，不能互相顶替。
-- 条目字段、`filename` 约束、`sha256` 要求与下文 `repo.json` 完全一致。
+- 条目字段、`filename` 约束、`sha256` 要求与下文「后端索引强约束」完全一致。
 
-兼容与缓存：
+条目与缓存：
 
-- 源条目没有 `backends` 时按旧行为读 `<root>/repo.json`；该文件不可用时才回退入口描述，并抓取它声明的全部后端（`-S` 会提示这次回退）。
-- 索引缓存是 `state/index.json` 的 `repos.<name>`，记录 `kind`（`legacy` / `entry`）、`backends`、`entry`（入口地址与 schema）、`indexes.<mgr>`（地址、`mgr`、`schema`、抓取时间、条目）。缓存键含源身份与启用的后端：换组合必须重新 `-S`。
-- 读取时两种布局都认：`indexes.*.packages` 与旧的 `data.packages`。
+- `repos[].backends` 表示**这个源提供哪些后端**，必须非空、只能是 `opkg` / `apk` / `pica`，由 `pica setup` 按"本机支持的后端 × 源声明的后端"求交集自动写入；单次操作用哪个后端由 `--pkgmgr` 决定，两件事不互相顶替。
+- 索引缓存是 `state/index.json` 的 `repos.<name>`，记录 `backends`、`entry`（入口地址与 schema）、`indexes.<mgr>`（地址、`mgr`、`schema`、抓取时间、条目）。缓存键含源身份与启用的后端：换组合必须重新 `-S`。
+- 缓存只有这一种布局：`indexes.<mgr>.packages`。
 
 ## 下载地址与协议策略
 
 - `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，与入口描述里的 manager path 同一套校验。
-- 公网明文 HTTP 默认拒绝；本机回环、私有网段、链路本地地址允许明文 HTTP（局域网自建源就是这类）；每个源可用 `allow_insecure_http` 单独放行公网明文。远端源不得通过 `file://` 让客户端读本机文件，本地源与旧格式索引不受此限。
+- 公网明文 HTTP 默认拒绝；本机回环、私有网段、链路本地地址允许明文 HTTP（局域网自建源就是这类）；每个源可用 `allow_insecure_http` 单独放行公网明文。远端源不得通过 `file://` 让客户端读本机文件，本地源（`file://` 根地址）不受此限。
 - 重定向逐跳检查：每一跳都按上述策略重新判定，最多 5 跳；`https` 不得重定向到 `http`。
 - `sha256` 校验失败即失败：不换用其他地址、不重试下一个源、不进入缓存。
 
-## repo.json 强约束（schema + filename）
+## 后端索引强约束（schema + filename）
 
-`pica -S` 同步阶段会对 `repo.json` 做严格校验：
+`pica -S` 同步阶段会对每个被启用的后端索引（`index.json` 里 `managers.<mgr>.path` 指向的文件）做严格校验：
 
-- `schema` 必须为 `2`
+- `schema` 必须为 `1`，`mgr` 必须等于它在入口描述里的键
 - `packages` 必须为数组
 - 每个 package 项必须包含非空字符串字段：
   - `pkgname`
@@ -230,12 +231,12 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
   - `<suffix>` 见上文文件名表
 - 未识别的额外字段会被原样保留（`flatten`），不会在同步时丢失
 
-安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与 `repo.json` 的 `sha256` 一致，否则失败。
+安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与索引条目的 `sha256` 一致，否则失败。
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，或一条安全的相对路径（相对源根地址解析），用于覆盖默认下载路径
 
 同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 
-任一约束不满足，`pica -S` 会拒绝该 repo。
+任一约束不满足，`pica -S` 会拒绝该源。
 
 ## URL 安装
 

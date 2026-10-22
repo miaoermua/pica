@@ -1,11 +1,13 @@
 use crate::app::{App, CliError, CliResult, E_DB_INVALID, E_RUNTIME, Paths, ensure_dirs};
+use crate::i18n::Key;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::pkgver_cmp_key;
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 pub fn report_set_install_result(
   paths: &Paths,
@@ -167,6 +169,132 @@ pub fn write_json_atomic_pretty(path: &Path, value: &Value) -> CliResult<()> {
   pica_pkg_core::io::write_json_file_pretty(path, value).map_err(CliError::from)
 }
 
+/// Files that must become visible together.
+///
+/// Nothing touches the disk while a plan is being built; [`Transaction::commit`]
+/// writes each staged file to a sibling temp file and renames it into place, so
+/// every file is either the old one or the new one. Across files, all-or-nothing
+/// comes from remembering the previous bytes and putting them back when a later
+/// write fails. A recovery that also fails is reported with both causes rather
+/// than hidden, because a half-applied state must never look like success.
+#[derive(Default)]
+pub(crate) struct Transaction {
+  entries: Vec<Entry>,
+}
+
+struct Entry {
+  path: PathBuf,
+  next: Vec<u8>,
+  previous: Option<Vec<u8>>,
+}
+
+impl Transaction {
+  pub(crate) fn new() -> Self {
+    Self { entries: Vec::new() }
+  }
+
+  /// Records `path` as it is now and as it should be afterwards.
+  ///
+  /// # Errors
+  /// Returns an error if the current contents cannot be read or the parent
+  /// directory cannot be created.
+  pub(crate) fn stage(&mut self, app: &App, path: &Path, next: Vec<u8>) -> CliResult<()> {
+    let previous = match fs::read(path) {
+      Ok(bytes) => Some(bytes),
+      Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+      Err(err) => {
+        let shown = path.display().to_string();
+        let cause = err.to_string();
+        return Err(CliError::new(E_RUNTIME, app.args(Key::CommitReadFailed, &[&shown, &cause])));
+      }
+    };
+
+    if let Some(parent) = path.parent()
+      && let Err(err) = fs::create_dir_all(parent)
+    {
+      let shown = path.display().to_string();
+      let cause = err.to_string();
+      return Err(CliError::new(E_RUNTIME, app.args(Key::CommitReadFailed, &[&shown, &cause])));
+    }
+
+    self.entries.push(Entry { path: path.to_path_buf(), next, previous });
+    Ok(())
+  }
+
+  /// Stages `value` as pretty JSON, the format every file here is written in.
+  ///
+  /// # Errors
+  /// Returns an error if the value cannot be serialized or the path cannot be
+  /// staged.
+  pub(crate) fn stage_json(&mut self, app: &App, path: &Path, value: &Value) -> CliResult<()> {
+    let text = serde_json::to_string_pretty(value)
+      .map_err(|err| CliError::new(E_RUNTIME, err.to_string()))?;
+    self.stage(app, path, text.into_bytes())
+  }
+
+  /// Writes every staged file, or puts back what was there before.
+  ///
+  /// # Errors
+  /// Returns an error naming the failed write, and either the fact that the
+  /// previous state was restored or the reason it could not be. A failure on
+  /// the first file says so plainly: nothing had been touched yet, and
+  /// claiming a restore would report an undo that never happened.
+  pub(crate) fn commit(self, app: &App) -> CliResult<()> {
+    for index in 0..self.entries.len() {
+      let entry = &self.entries[index];
+      if let Err(err) = replace_file(&entry.path, &entry.next) {
+        let cause = err.message;
+        let shown = entry.path.display().to_string();
+        if index == 0 {
+          return Err(CliError::new(err.code, app.args(Key::CommitFailed, &[&shown, &cause])));
+        }
+        return match restore(&self.entries[..index]) {
+          Ok(()) => Err(CliError::new(err.code, app.args(Key::CommitRestored, &[&cause]))),
+          Err(restore) => {
+            Err(CliError::new(E_RUNTIME, app.args(Key::CommitBroken, &[&cause, &restore.message])))
+          }
+        };
+      }
+    }
+    Ok(())
+  }
+}
+
+/// Puts the previous state of `entries` back, newest first.
+fn restore(entries: &[Entry]) -> CliResult<()> {
+  for entry in entries.iter().rev() {
+    match &entry.previous {
+      Some(bytes) => replace_file(&entry.path, bytes)?,
+      None => match fs::remove_file(&entry.path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+          return Err(CliError::new(E_RUNTIME, format!("{}: {err}", entry.path.display())));
+        }
+      },
+    }
+  }
+  Ok(())
+}
+
+/// Writes `content` to a temp file next to `path`, then renames it over `path`.
+///
+/// The temp file is a sibling so the rename stays within one filesystem, and it
+/// carries the process id so two runs cannot collide. A failed write takes its
+/// own temp file with it.
+fn replace_file(path: &Path, content: &[u8]) -> CliResult<()> {
+  let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+  let temp = path.with_file_name(format!(".{name}.pica-{}", std::process::id()));
+
+  for step in [fs::write(&temp, content), fs::rename(&temp, path)] {
+    if let Err(err) = step {
+      let _ = fs::remove_file(&temp);
+      return Err(CliError::new(E_RUNTIME, format!("{}: {err}", path.display())));
+    }
+  }
+  Ok(())
+}
+
 pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   let Some(obj) = value.as_object_mut() else {
     return Err(CliError::new(E_RUNTIME, "json root is not object"));
@@ -183,12 +311,7 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   Ok(())
 }
 
-/// Every package list one synced repo entry holds.
-///
-/// A source read through an entry descriptor keeps one index per backend under
-/// `indexes`; a schema-2 source keeps all of them in `data`. Callers that only
-/// want "the packages of this source" should not have to know which layout they
-/// are looking at, and must not silently see an empty list for the other one.
+/// Every package list one synced repo entry holds: one list per backend index.
 #[must_use]
 pub(crate) fn repo_package_sets(repo: &Value) -> Vec<&[Value]> {
   let mut sets = Vec::new();
@@ -199,12 +322,6 @@ pub(crate) fn repo_package_sets(repo: &Value) -> Vec<&[Value]> {
         sets.push(packages.as_slice());
       }
     }
-  }
-
-  if let Some(packages) =
-    repo.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
-  {
-    sets.push(packages.as_slice());
   }
 
   sets

@@ -136,43 +136,30 @@ fn fill(template: &str, args: &[&str]) -> String {
 pub(crate) enum Key {
   // ---- setup -------------------------------------------------------------
   SetupTitle,
-  SetupLanguagePrompt,
-  SetupSourceMenuPrompt,
-  SetupSourceUrlNew,
-  SetupUrlEmpty,
-  SetupAddAnother,
-  SetupConfUnreadable,
-  SetupWriteFailed,
-  SetupRestoreFailed,
-  SetupInvalidChoice,
-  SetupCancelled,
   SetupNeedsTerminal,
+  SetupConfUnreadable,
+  SetupNotAnObject,
+  SetupCancelled,
+  SetupInvalidChoice,
+  SetupLanguagePrompt,
   SetupSources,
-  SetupSourceMenuOfficial,
-  SetupSourceMenuCustom,
-  SetupSourceMenuAdd,
-  SetupSourceMenuEdit,
-  SetupSourceMenuKeep,
   SetupSourceLine,
-  SetupPickSource,
-  SetupSourceName,
-  SetupSourceUrl,
-  SetupOfficialUnavailable,
-  SetupUrlRejected,
+  SetupSourcePrompt,
+  SetupSourceOfficial,
+  SetupSourceCustom,
+  SetupSourceKeep,
   SetupAllowHttp,
-  SetupFetchFailed,
-  SetupDescriptorInvalid,
-  SetupBackendDevice,
-  SetupBackendsDeclared,
-  SetupBackendsPrompt,
-  SetupUnknownBackend,
-  SetupNoBackends,
+  SetupYes,
+  SetupNo,
+  SetupSourceUrl,
+  SetupUrlEmpty,
+  SetupOfficialMissing,
+  SetupNoCommonBackend,
+  SetupBackends,
   SetupSaved,
-  SetupSyncFailed,
   SetupComplete,
   SetupNextSteps,
   SetupNotJson,
-  SetupRootIsRelative,
   // ---- sync --------------------------------------------------------------
   SyncStarted,
   SyncDownloading,
@@ -181,22 +168,25 @@ pub(crate) enum Key {
   SyncReposNotArray,
   SyncRepoMissingName,
   SyncRepoMissingUrl,
+  SyncBackendsMissing,
   SyncBackendsNotArray,
   SyncUnsupportedBackend,
   SyncBackendsEmpty,
   SyncRootRejected,
   SyncFetchFailed,
   SyncNotUtf8,
-  SyncRepoInvalid,
   SyncEntryInvalid,
   SyncMissingBackend,
-  SyncFallback,
   SyncIndexInvalid,
+  // ---- commit ------------------------------------------------------------
+  CommitReadFailed,
+  CommitRestored,
+  CommitBroken,
+  CommitFailed,
   // ---- query -------------------------------------------------------------
   NotFound,
   NotFoundHintSources,
   NotFoundHintRepos,
-  NotFoundHintLegacy,
   Provides,
   // ---- install -----------------------------------------------------------
   FileOne,
@@ -248,51 +238,39 @@ pub(crate) enum Key {
 fn english(key: Key) -> &'static str {
   match key {
     Key::SetupTitle => "Setup Pica",
-    Key::SetupLanguagePrompt => "Select language [1-2]: ",
-    Key::SetupSourceMenuPrompt => "Select an option [1-{0}]: ",
-    Key::SetupSourceUrlNew => "Source root URL: ",
-    Key::SetupUrlEmpty => "A source root URL is required.",
-    Key::SetupAddAnother => "Add or change another source? [y/N]: ",
-    Key::SetupConfUnreadable => {
-      "Cannot read {0}: {1}. Fix or remove it, then run pica setup again."
-    }
-    Key::SetupWriteFailed => "Cannot save the configuration: {0}",
-    Key::SetupRestoreFailed => "{0}; restoring the previous files failed too: {1}",
-    Key::SetupInvalidChoice => "Invalid choice: pick a number from {0} to {1}.",
-    Key::SetupCancelled => "Setup cancelled; no configuration was written.",
     Key::SetupNeedsTerminal => {
       "pica setup needs an interactive terminal (stdin is not a tty). Write the configuration \
        directly and sync it: pica.json has \"language\" (zh-CN or en-US) and \"repos\" entries \
        with \"url\" and \"backends\"; then run `pica -S`."
     }
-    Key::SetupSources => "Software sources",
-    Key::SetupSourceMenuOfficial => "Official source",
-    Key::SetupSourceMenuCustom => "Custom source (enter a root URL)",
-    Key::SetupSourceMenuAdd => "Add a new source",
-    Key::SetupSourceMenuEdit => "Edit an existing source",
-    Key::SetupSourceMenuKeep => "Keep the current sources and finish",
+    Key::SetupConfUnreadable => {
+      "Cannot read {0}: {1}. Fix or remove it, then run pica setup again."
+    }
+    Key::SetupNotAnObject => "the file is not a JSON object",
+    Key::SetupCancelled => "Setup cancelled; no configuration was written.",
+    Key::SetupInvalidChoice => "Invalid choice: pick a number from 1 to {0}.",
+    Key::SetupLanguagePrompt => "Select language (Enter = English)",
+    Key::SetupSources => "Configured sources",
     Key::SetupSourceLine => "  {0}. {1}  {2}  (backends: {3})",
-    Key::SetupPickSource => "Select a source [1-{0}]: ",
-    Key::SetupSourceName => "Source name (empty = {0}): ",
-    Key::SetupSourceUrl => "Source root URL (empty keeps {0}): ",
-    Key::SetupOfficialUnavailable => {
-      "This build has no official source configured; enter a source root URL instead."
+    Key::SetupSourcePrompt => "Select a source (Enter = {0})",
+    Key::SetupSourceOfficial => "Official source ({0})",
+    Key::SetupSourceCustom => "Custom source URL",
+    Key::SetupSourceKeep => "Keep the configured sources",
+    Key::SetupAllowHttp => "This source is plain HTTP. Allow it for {0}?",
+    Key::SetupYes => "Yes",
+    Key::SetupNo => "No",
+    Key::SetupSourceUrl => "Source root URL: ",
+    Key::SetupUrlEmpty => "A source root URL is required.",
+    Key::SetupOfficialMissing => {
+      "The official source address is not configured in this build. Set OFFICIAL_REPO_ROOT in \
+       crates/pica-pkg-cli/src/commands/setup.rs, or pass a source root URL."
     }
-    Key::SetupUrlRejected => "Source rejected: {0}",
-    Key::SetupAllowHttp => "{0} is public and uses plain HTTP. Allow it for this source? [y/N]: ",
-    Key::SetupFetchFailed => "Cannot read {0}: {1}",
-    Key::SetupDescriptorInvalid => "index.json at {0} is not a valid source descriptor: {1}",
-    Key::SetupBackendDevice => "This device uses the {0} backend.",
-    Key::SetupBackendsDeclared => "The source declares these backends: {0}",
-    Key::SetupBackendsPrompt => {
-      "Backends to enable for this source (comma separated, empty = {0}): "
+    Key::SetupNoCommonBackend => {
+      "{0}: no backend in common - this host supports {1}, the source declares {2}; nothing \
+       was written"
     }
-    Key::SetupUnknownBackend => "{0} is not declared by this source (declared: {1})",
-    Key::SetupNoBackends => "Enable at least one backend.",
+    Key::SetupBackends => "{0}: using backend(s) {1}",
     Key::SetupSaved => "Configuration saved to {0}.",
-    Key::SetupSyncFailed => {
-      "Sync failed, so the previous configuration was restored and nothing was changed: {0}"
-    }
     Key::SetupComplete => "Setup complete: language {0}; sources: {1}.",
     Key::SetupNextSteps => {
       "Next: `pica -Si <package>` shows a package, `pica -S <package>` installs it, `pica -S` \
@@ -301,7 +279,6 @@ fn english(key: Key) -> &'static str {
     Key::SetupNotJson => {
       "pica setup is interactive and does not support --json or --json-errors; run it without them"
     }
-    Key::SetupRootIsRelative => "A source root must be an absolute URL, not {0}",
 
     Key::SyncStarted => "Synchronizing package databases...",
     Key::SyncDownloading => "{0} downloading...",
@@ -312,6 +289,7 @@ fn english(key: Key) -> &'static str {
     Key::SyncReposNotArray => "config {0} is not an array",
     Key::SyncRepoMissingName => "repo[{0}] missing name",
     Key::SyncRepoMissingUrl => "repo[{0}] missing url",
+    Key::SyncBackendsMissing => "repo[{0}] ({1}) has no backends; run `pica setup` to choose them",
     Key::SyncBackendsNotArray => "repo[{0}] ({1}) backends must be an array of backend names",
     Key::SyncUnsupportedBackend => {
       "repo[{0}] ({1}) backends contains unsupported backend {2} (supported: {3})"
@@ -320,19 +298,21 @@ fn english(key: Key) -> &'static str {
     Key::SyncRootRejected => "{0}: source root {1}: {2}",
     Key::SyncFetchFailed => "{0}: fetching {1} from {2} failed: {3}",
     Key::SyncNotUtf8 => "{0}: {1} at {2} is not UTF-8",
-    Key::SyncRepoInvalid => "{0}: repo.json at {1} failed strict schema/filename validation: {2}",
     Key::SyncEntryInvalid => "{0}: index.json at {1} is invalid: {2}",
     Key::SyncMissingBackend => {
       "{0}: source does not provide backend(s) {1} (declares: {2}); adjust its backends list or \
        use a source that does"
     }
-    Key::SyncFallback => "{0}: repo.json unavailable, using index.json (declares: {1})",
     Key::SyncIndexInvalid => "{0}: {1} index at {2} is invalid: {3}",
+
+    Key::CommitReadFailed => "cannot read {0}: {1}",
+    Key::CommitRestored => "could not write {0}; the previous state was put back",
+    Key::CommitBroken => "could not write {0}, and restoring the previous state failed too: {1}",
+    Key::CommitFailed => "could not write {0}: {1}",
 
     Key::NotFound => "package not found in pica repos: {0}{1}",
     Key::NotFoundHintSources => " (backend {0}; no synced sources, run -S first)",
     Key::NotFoundHintRepos => " (backend {0}; {1})",
-    Key::NotFoundHintLegacy => "every backend (schema 2)",
     Key::Provides => "{0} provides {1}",
 
     Key::InstallBackendNoManager => {
@@ -388,48 +368,40 @@ fn english(key: Key) -> &'static str {
 fn chinese(key: Key) -> &'static str {
   match key {
     Key::SetupTitle => "Pica 初始化",
-    Key::SetupLanguagePrompt => "选择语言 [1-2]：",
-    Key::SetupSourceMenuPrompt => "请选择 [1-{0}]：",
-    Key::SetupSourceUrlNew => "软件源根地址：",
-    Key::SetupUrlEmpty => "必须填写软件源根地址。",
-    Key::SetupAddAnother => "继续添加或修改其他软件源？[y/N]：",
-    Key::SetupConfUnreadable => "无法读取 {0}：{1}。请修复或移走它后重新运行 pica setup。",
-    Key::SetupWriteFailed => "无法保存配置：{0}",
-    Key::SetupRestoreFailed => "{0}；恢复原有文件同样失败：{1}",
-    Key::SetupInvalidChoice => "无效选择：请输入 {0} 到 {1} 之间的数字。",
-    Key::SetupCancelled => "已取消初始化，未写入任何配置。",
     Key::SetupNeedsTerminal => {
       "pica setup 需要交互式终端（stdin 不是 tty）。请直接写配置文件后同步：pica.json 中的 \
        \"language\"（zh-CN 或 en-US）与 \"repos\" 条目（\"url\"、\"backends\"），再运行 `pica -S`。"
     }
-    Key::SetupSources => "软件源",
-    Key::SetupSourceMenuOfficial => "官方源",
-    Key::SetupSourceMenuCustom => "自定义源（输入根地址）",
-    Key::SetupSourceMenuAdd => "添加新软件源",
-    Key::SetupSourceMenuEdit => "修改已有软件源",
-    Key::SetupSourceMenuKeep => "保留当前软件源并结束",
+    Key::SetupConfUnreadable => "无法读取 {0}：{1}。请修复或移走它后重新运行 pica setup。",
+    Key::SetupNotAnObject => "文件不是一个 JSON 对象",
+    Key::SetupCancelled => "已取消初始化，未写入任何配置。",
+    Key::SetupInvalidChoice => "无效选择：请输入 1 到 {0} 之间的数字。",
+    Key::SetupLanguagePrompt => "选择语言（回车 = English）",
+    Key::SetupSources => "已配置的软件源",
     Key::SetupSourceLine => "  {0}. {1}  {2}  （后端：{3}）",
-    Key::SetupPickSource => "选择软件源 [1-{0}]：",
-    Key::SetupSourceName => "软件源名称（留空 = {0}）：",
-    Key::SetupSourceUrl => "软件源根地址（留空保持 {0}）：",
-    Key::SetupOfficialUnavailable => "此构建未配置官方源，请改填软件源根地址。",
-    Key::SetupUrlRejected => "软件源被拒绝：{0}",
-    Key::SetupAllowHttp => "{0} 是公网地址且使用明文 HTTP。为此源放行？[y/N]：",
-    Key::SetupFetchFailed => "无法读取 {0}：{1}",
-    Key::SetupDescriptorInvalid => "{0} 的 index.json 不是有效的源入口描述：{1}",
-    Key::SetupBackendDevice => "本机使用的后端是 {0}。",
-    Key::SetupBackendsDeclared => "该源声明了这些后端：{0}",
-    Key::SetupBackendsPrompt => "为该源启用的后端（逗号分隔，留空 = {0}）：",
-    Key::SetupUnknownBackend => "{0} 未被该源声明（已声明：{1}）",
-    Key::SetupNoBackends => "至少启用一个后端。",
+    Key::SetupSourcePrompt => "选择软件源（回车 = {0}）",
+    Key::SetupSourceOfficial => "官方源（{0}）",
+    Key::SetupSourceCustom => "自定义软件源地址",
+    Key::SetupSourceKeep => "保留已配置的软件源",
+    Key::SetupAllowHttp => "该软件源使用明文 HTTP，是否允许 {0}？",
+    Key::SetupYes => "是",
+    Key::SetupNo => "否",
+    Key::SetupSourceUrl => "软件源根地址：",
+    Key::SetupUrlEmpty => "必须填写软件源根地址。",
+    Key::SetupOfficialMissing => {
+      "此构建没有配置官方源地址。请在 crates/pica-pkg-cli/src/commands/setup.rs 的 \
+       OFFICIAL_REPO_ROOT 中填写，或直接输入软件源根地址。"
+    }
+    Key::SetupNoCommonBackend => {
+      "{0}：本机没有可用共同后端——本机支持 {1}，该源声明 {2}；未写入任何配置"
+    }
+    Key::SetupBackends => "{0}：使用后端 {1}",
     Key::SetupSaved => "配置已保存到 {0}。",
-    Key::SetupSyncFailed => "同步失败，已恢复原有配置，未做任何改动：{0}",
     Key::SetupComplete => "初始化完成：语言 {0}；软件源：{1}。",
     Key::SetupNextSteps => {
       "接下来：`pica -Si <包名>` 查看软件包，`pica -S <包名>` 安装，`pica -S` 重新同步软件源。"
     }
     Key::SetupNotJson => "pica setup 是交互式命令，不支持 --json / --json-errors，请去掉后重试。",
-    Key::SetupRootIsRelative => "软件源根地址必须是绝对 URL，而不是 {0}",
 
     Key::SyncStarted => "正在同步软件源……",
     Key::SyncDownloading => "正在下载 {0}...",
@@ -438,24 +410,27 @@ fn chinese(key: Key) -> &'static str {
     Key::SyncReposNotArray => "配置项 {0} 不是数组",
     Key::SyncRepoMissingName => "repo[{0}] 缺少 name",
     Key::SyncRepoMissingUrl => "repo[{0}] 缺少 url",
+    Key::SyncBackendsMissing => "repo[{0}]（{1}）没有 backends；请运行 `pica setup` 选择",
     Key::SyncBackendsNotArray => "repo[{0}]（{1}）的 backends 必须是后端名数组",
     Key::SyncUnsupportedBackend => "repo[{0}]（{1}）的 backends 含不支持的后端 {2}（支持：{3}）",
     Key::SyncBackendsEmpty => "repo[{0}]（{1}）的 backends 为空；至少写一个后端",
     Key::SyncRootRejected => "{0}：软件源根地址 {1}：{2}",
     Key::SyncFetchFailed => "{0}：从 {2} 获取 {1} 失败：{3}",
     Key::SyncNotUtf8 => "{0}：{2} 的 {1} 不是 UTF-8",
-    Key::SyncRepoInvalid => "{0}：{1} 的 repo.json 未通过严格的 schema/filename 校验：{2}",
     Key::SyncEntryInvalid => "{0}：{1} 的 index.json 无效：{2}",
     Key::SyncMissingBackend => {
       "{0}：软件源未提供后端 {1}（已声明：{2}）；请调整 backends 或改用提供该后端的源"
     }
-    Key::SyncFallback => "{0}：repo.json 不可用，改用 index.json（声明：{1}）",
     Key::SyncIndexInvalid => "{0}：{2} 的 {1} 索引无效：{3}",
+
+    Key::CommitReadFailed => "无法读取 {0}：{1}",
+    Key::CommitRestored => "写入 {0} 失败；已恢复原有状态",
+    Key::CommitBroken => "写入 {0} 失败，且恢复原有状态同样失败：{1}",
+    Key::CommitFailed => "无法写入 {0}：{1}",
 
     Key::NotFound => "pica 软件源中未找到软件包：{0}{1}",
     Key::NotFoundHintSources => "（后端 {0}；尚未同步软件源，请先运行 -S）",
     Key::NotFoundHintRepos => "（后端 {0}；{1}）",
-    Key::NotFoundHintLegacy => "所有后端（schema 2）",
     Key::Provides => "{0} 提供 {1}",
 
     Key::InstallBackendNoManager => "{0}：该后端没有包管理器，请改用 pica 软件源中的选择器",
@@ -582,46 +557,32 @@ mod tests {
   }
 
   /// Every key, so the coverage test above cannot pass by looking at a subset.
-  /// Every key, so the coverage test above cannot pass by looking at a subset.
   const ALL_KEYS: &[Key] = &[
     Key::SetupTitle,
-    Key::SetupLanguagePrompt,
-    Key::SetupSourceMenuPrompt,
-    Key::SetupSourceUrlNew,
-    Key::SetupUrlEmpty,
-    Key::SetupAddAnother,
-    Key::SetupConfUnreadable,
-    Key::SetupWriteFailed,
-    Key::SetupRestoreFailed,
-    Key::SetupInvalidChoice,
-    Key::SetupCancelled,
     Key::SetupNeedsTerminal,
+    Key::SetupConfUnreadable,
+    Key::SetupNotAnObject,
+    Key::SetupCancelled,
+    Key::SetupInvalidChoice,
+    Key::SetupLanguagePrompt,
     Key::SetupSources,
-    Key::SetupSourceMenuOfficial,
-    Key::SetupSourceMenuCustom,
-    Key::SetupSourceMenuAdd,
-    Key::SetupSourceMenuEdit,
-    Key::SetupSourceMenuKeep,
     Key::SetupSourceLine,
-    Key::SetupPickSource,
-    Key::SetupSourceName,
-    Key::SetupSourceUrl,
-    Key::SetupOfficialUnavailable,
-    Key::SetupUrlRejected,
+    Key::SetupSourcePrompt,
+    Key::SetupSourceOfficial,
+    Key::SetupSourceCustom,
+    Key::SetupSourceKeep,
     Key::SetupAllowHttp,
-    Key::SetupFetchFailed,
-    Key::SetupDescriptorInvalid,
-    Key::SetupBackendDevice,
-    Key::SetupBackendsDeclared,
-    Key::SetupBackendsPrompt,
-    Key::SetupUnknownBackend,
-    Key::SetupNoBackends,
+    Key::SetupYes,
+    Key::SetupNo,
+    Key::SetupSourceUrl,
+    Key::SetupUrlEmpty,
+    Key::SetupOfficialMissing,
+    Key::SetupNoCommonBackend,
+    Key::SetupBackends,
     Key::SetupSaved,
-    Key::SetupSyncFailed,
     Key::SetupComplete,
     Key::SetupNextSteps,
     Key::SetupNotJson,
-    Key::SetupRootIsRelative,
     Key::SyncStarted,
     Key::SyncDownloading,
     Key::SyncUpdated,
@@ -629,21 +590,23 @@ mod tests {
     Key::SyncReposNotArray,
     Key::SyncRepoMissingName,
     Key::SyncRepoMissingUrl,
+    Key::SyncBackendsMissing,
     Key::SyncBackendsNotArray,
     Key::SyncUnsupportedBackend,
     Key::SyncBackendsEmpty,
     Key::SyncRootRejected,
     Key::SyncFetchFailed,
     Key::SyncNotUtf8,
-    Key::SyncRepoInvalid,
     Key::SyncEntryInvalid,
     Key::SyncMissingBackend,
-    Key::SyncFallback,
     Key::SyncIndexInvalid,
+    Key::CommitReadFailed,
+    Key::CommitRestored,
+    Key::CommitBroken,
+    Key::CommitFailed,
     Key::NotFound,
     Key::NotFoundHintSources,
     Key::NotFoundHintRepos,
-    Key::NotFoundHintLegacy,
     Key::Provides,
     Key::FileOne,
     Key::FileMany,

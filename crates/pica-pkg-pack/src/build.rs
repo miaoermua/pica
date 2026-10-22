@@ -10,7 +10,10 @@ use pica_pkg_core::io::{
   copy_dir_recursive, ensure_dir, make_temp_dir, resolve_script_dir_from_exe, write_atomic,
 };
 use pica_pkg_core::manifest::Manifest;
-use pica_pkg_core::repo::{Package, PackageIndex, REPO_SCHEMA, package_filename, parse_repo_json};
+use pica_pkg_core::repo::{
+  BACKEND_INDEX_SCHEMA, BackendIndex, ENTRY_SCHEMA, EntryDescriptor, EntryManager, Package,
+  package_filename, parse_backend_index, parse_entry_descriptor,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -548,9 +551,12 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
   })
 }
 
-/// Writes the per-backend repo index. Top-level fields are filled from the
-/// built manifest so the index is queryable without unpacking the artifact,
-/// and the embedded manifest keeps full array semantics for repeated keys.
+/// Writes the index of the backend this artifact belongs to, then points the
+/// source root's `index.json` at it.
+///
+/// Top-level fields are filled from the built manifest so the index is
+/// queryable without unpacking the artifact, and the embedded manifest keeps
+/// full array semantics for repeated keys.
 ///
 /// `install_size` is passed rather than read back from `manifest`: the index
 /// advertises what an install will cost, and the manifest's own value is written
@@ -563,14 +569,9 @@ fn write_repo_index(
   csize: u64,
   install_size: u64,
 ) -> PicaResult<()> {
-  let index_path = req.output_dir.join("repo.json");
-  let mut index = if index_path.is_file() {
-    let content = fs::read_to_string(&index_path)?;
-    parse_repo_json(&content).unwrap_or(PackageIndex { schema: REPO_SCHEMA, packages: Vec::new() })
-  } else {
-    PackageIndex { schema: REPO_SCHEMA, packages: Vec::new() }
-  };
-  index.schema = REPO_SCHEMA;
+  let index_path = req.output_dir.join("index.json");
+  let mut index = read_backend_index(&index_path, req.backend.as_str());
+  index.schema = BACKEND_INDEX_SCHEMA;
   index.packages.retain(|package| package.filename != filename);
 
   let text = |key: &str| -> Option<String> {
@@ -608,6 +609,57 @@ fn write_repo_index(
 
   let content = serde_json::to_vec_pretty(&index)?;
   write_atomic(&index_path, &content)?;
+  write_entry_descriptor(req)
+}
+
+/// The index this backend already published, or an empty one to start from.
+///
+/// A file that does not parse is replaced: it can only be the output of an
+/// older generator or a corrupt write, and appending to it would publish
+/// packages the client would refuse to read.
+fn read_backend_index(path: &Path, mgr: &str) -> BackendIndex {
+  let parsed =
+    fs::read_to_string(path).ok().and_then(|content| parse_backend_index(&content, mgr).ok());
+  parsed.unwrap_or(BackendIndex {
+    schema: BACKEND_INDEX_SCHEMA,
+    mgr: mgr.to_string(),
+    generated_at: None,
+    packages: Vec::new(),
+    extra: serde_json::Map::default(),
+  })
+}
+
+/// Points the source root's entry descriptor at this backend's index.
+///
+/// The descriptor is shared by every backend built into the same output root,
+/// so an existing one is read and extended rather than replaced; its other
+/// managers, unknown fields and `name`/`description` survive.
+fn write_entry_descriptor(req: &BuildRequest<'_>) -> PicaResult<()> {
+  let Some(root) = req.output_dir.parent() else {
+    return Ok(());
+  };
+  let Some(dir_name) = req.output_dir.file_name().and_then(|name| name.to_str()) else {
+    return Ok(());
+  };
+
+  let path = root.join("index.json");
+  let existing =
+    fs::read_to_string(&path).ok().and_then(|content| parse_entry_descriptor(&content).ok());
+  let mut descriptor = existing.unwrap_or(EntryDescriptor {
+    schema: ENTRY_SCHEMA,
+    name: None,
+    description: None,
+    managers: std::collections::BTreeMap::new(),
+    extra: serde_json::Map::default(),
+  });
+  descriptor.schema = ENTRY_SCHEMA;
+  descriptor.managers.insert(
+    req.backend.as_str().to_string(),
+    EntryManager { path: format!("{dir_name}/index.json") },
+  );
+
+  let content = serde_json::to_vec_pretty(&descriptor)?;
+  write_atomic(&path, &content)?;
   Ok(())
 }
 
@@ -617,7 +669,7 @@ mod tests {
     BuildRequest, copy_packages_flat, list_extensions, main_build, unpacked_size, write_repo_index,
   };
   use crate::backend::BuildBackend;
-  use pica_pkg_core::repo::parse_repo_json;
+  use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor};
   use std::fs;
   use std::path::Path;
 
@@ -796,8 +848,8 @@ mod tests {
     )
     .expect("write index");
 
-    let text = fs::read_to_string(output.join("repo.json")).expect("read index");
-    let parsed = parse_repo_json(&text).expect("index must satisfy schema 2");
+    let text = fs::read_to_string(output.join("index.json")).expect("read index");
+    let parsed = parse_backend_index(&text, "apk").expect("index must satisfy schema 1");
     let pkg = &parsed.packages[0];
 
     assert_eq!(pkg.pkgmgr, "apk");
@@ -825,9 +877,63 @@ mod tests {
     )
     .expect("rewrite index");
     let replaced =
-      parse_repo_json(&fs::read_to_string(output.join("repo.json")).expect("read")).expect("valid");
+      parse_backend_index(&fs::read_to_string(output.join("index.json")).expect("read"), "apk")
+        .expect("valid");
     assert_eq!(replaced.packages.len(), 1);
     assert_eq!(replaced.packages[0].sha256, "2".repeat(64));
+
+    let entry = parse_entry_descriptor(
+      &fs::read_to_string(output.parent().expect("output has a parent").join("index.json"))
+        .expect("read entry descriptor"),
+    )
+    .expect("the source root must carry an entry descriptor");
+    assert_eq!(entry.managers["apk"].path, "output/index.json");
+  }
+
+  #[test]
+  fn the_entry_descriptor_keeps_the_other_backends_and_its_metadata() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let pkgdir = tmp.path().join("pkgdir");
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&pkgdir).expect("mkdir pkgdir");
+    fs::create_dir_all(&output).expect("mkdir output");
+    fs::write(
+      pkgdir.join("manifest"),
+      "pkgname = demo\nappname = demo\npkgver = 1.0.0\npkgrel = 1\nos = openwrt\n\
+       branch = stable\nprotocol = luci\nurl = https://example.invalid/demo\npkgdesc = demo\n\
+       builddate = 1\nsize = 0\n",
+    )
+    .expect("write manifest");
+    fs::write(
+      tmp.path().join("index.json"),
+      r#"{"schema":1,"name":"demo feed","description":"hand written","managers":{"pica":{"path":"pica/index.json"}},"owner":"someone"}"#,
+    )
+    .expect("write descriptor");
+
+    let manifest =
+      pica_pkg_core::manifest::Manifest::from_file(pkgdir.join("manifest")).expect("parse");
+    let req = BuildRequest {
+      pkgdir: &pkgdir,
+      output_dir: &output,
+      pkgname: "demo",
+      pkgver: "1.0.0",
+      pkgrel: "1",
+      build_platform: "all",
+      build_arch: "all",
+      pica: "",
+      has_matrix: false,
+      backend: BuildBackend::Opkg,
+    };
+    write_repo_index(&req, &manifest, "demo-1.0.0-1-all-opkg.pkg.tar.gz", &"3".repeat(64), 1, 0)
+      .expect("write index");
+
+    let text = fs::read_to_string(tmp.path().join("index.json")).expect("read descriptor");
+    let entry = parse_entry_descriptor(&text).expect("descriptor stays valid");
+    assert_eq!(entry.name.as_deref(), Some("demo feed"));
+    assert_eq!(entry.description.as_deref(), Some("hand written"));
+    assert_eq!(entry.extra["owner"], "someone", "unknown fields survive: {text}");
+    assert_eq!(entry.managers["pica"].path, "pica/index.json");
+    assert_eq!(entry.managers["opkg"].path, "output/index.json");
   }
 
   #[test]
@@ -992,8 +1098,8 @@ mod tests {
       "10 bytes of container plus a 4 byte root/ file:\n{manifest}"
     );
 
-    let index = fs::read_to_string(root.join("out/opkg/repo.json")).expect("read index");
-    let parsed = parse_repo_json(&index).expect("valid index");
+    let index = fs::read_to_string(root.join("out/opkg/index.json")).expect("read index");
+    let parsed = parse_backend_index(&index, "opkg").expect("valid index");
     assert_eq!(parsed.packages[0].size, Some(14), "the index advertises the same number");
   }
 

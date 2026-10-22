@@ -68,16 +68,19 @@ pub(crate) fn not_found_hint(app: &App) -> String {
 
   let mut parts = Vec::new();
   for (name, repo) in repos {
-    let provided = match repo.get("backends").and_then(Value::as_array) {
-      Some(list) if !list.is_empty() => {
-        list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
-      }
-      // A schema-2 source carries every backend in one file.
-      _ => app.text(Key::NotFoundHintLegacy).to_string(),
+    let Some(list) = repo.get("backends").and_then(Value::as_array) else {
+      continue;
     };
+    let provided = list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+    if provided.is_empty() {
+      continue;
+    }
     parts.push(app.args(Key::Provides, &[name, &provided]));
   }
 
+  if parts.is_empty() {
+    return unsynced();
+  }
   app.args(Key::NotFoundHintRepos, &[&backend, &parts.join("; ")])
 }
 
@@ -108,9 +111,8 @@ fn find_candidates_for_host(
     let repo_url = repo_entry.get("url").and_then(Value::as_str).unwrap_or("").to_string();
     let allow_insecure_http =
       repo_entry.get("allow_insecure_http").and_then(Value::as_bool).unwrap_or(false);
-    // The entry descriptor layout keeps one index per backend; the schema-2
-    // layout keeps them all in `data`. Both are searched, and the backend each
-    // entry declares still decides whether it can be installed here.
+    // One index per backend, as the entry descriptor named them; the backend
+    // each package declares still decides whether it can be installed here.
     let package_sets = repo_package_sets(repo_entry);
     if package_sets.is_empty() {
       continue;
@@ -315,17 +317,10 @@ mod tests {
     })
   }
 
+  /// One synced source, written the way the new protocol stores it: an index
+  /// per backend, named by the source's `index.json`.
   fn write_index(app: &App, packages: &[Value]) {
-    let index = json!({
-      "repos": {
-        "main": {
-          "url": "https://repo.invalid/main",
-          "data": { "packages": packages },
-        }
-      }
-    });
-    fs::create_dir_all(&app.paths.state_dir).expect("create state dir");
-    fs::write(&app.paths.index_file, index.to_string()).expect("write index");
+    write_backend_indexes(app, &[("pica", packages.to_vec())]);
   }
 
   /// One synced entry-descriptor source: one index per backend, exactly as
@@ -348,7 +343,6 @@ mod tests {
       "repos": {
         "main": {
           "url": "https://repo.invalid/main",
-          "kind": "entry",
           "backends": indexes.iter().map(|(mgr, _)| *mgr).collect::<Vec<_>>(),
           "indexes": map,
         }
@@ -427,7 +421,14 @@ mod tests {
         "main": {
           "url": "http://mirror.lan/main",
           "allow_insecure_http": true,
-          "data": { "packages": [backend_entry("demo", "1.0.0", "pica")] },
+          "indexes": {
+            "pica": {
+              "url": "http://mirror.lan/main/pica/index.json",
+              "schema": 1,
+              "mgr": "pica",
+              "packages": [backend_entry("demo", "1.0.0", "pica")],
+            }
+          },
         }
       }
     });

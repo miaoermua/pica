@@ -6,6 +6,7 @@ mod format;
 mod i18n;
 mod installed;
 mod lock;
+mod menu;
 mod pkgmgr;
 mod platform;
 mod source;

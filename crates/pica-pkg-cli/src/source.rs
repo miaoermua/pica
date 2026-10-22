@@ -158,6 +158,18 @@ pub(crate) struct UrlParts<'a> {
   pub(crate) path: &'a str,
 }
 
+/// Whether `url` is exactly the case [`FetchPolicy::check`] refuses by default:
+/// plain HTTP to somewhere that is not this machine or the local network.
+///
+/// The wizard asks about this one case and nothing else, so it needs the same
+/// rule as the check rather than a second opinion on what "public" means.
+#[must_use]
+pub(crate) fn needs_insecure_http_opt_in(url: &str) -> bool {
+  split(url).is_some_and(|parts| {
+    parts.scheme == "http" && !parts.authority.is_empty() && !host_scope(parts.authority).is_local()
+  })
+}
+
 /// Split `url` into scheme, authority and path. Returns `None` for anything
 /// that is not `scheme://...` with a scheme this client could ever fetch.
 #[must_use]

@@ -1,8 +1,13 @@
-//! `pica setup` and the language it writes.
+//! `pica setup`: the questions it asks, and what reaches the disk.
 //!
-//! The wizard reads answers from stdin, so every test here feeds a script and
-//! checks what reached the disk. Sources are `file://` directories, which means
-//! no network, no package manager, and no dependency on the host.
+//! Sources are `file://` directories, so no test here needs a network or any
+//! package manager on the host: `PICA_ASSUME_TTY` makes a pipe stand in for a
+//! terminal, which also means the numbered menu is what runs - the arrow-key
+//! path needs a real tty and is covered from a pty at the bottom of the file.
+//!
+//! Every test that ends in a cancel or a failure asserts on the files as well as
+//! on the message: the promise of this command is that a run which did not
+//! finish writes nothing, and only the disk can prove it.
 
 #![cfg(unix)]
 
@@ -35,6 +40,14 @@ impl Sandbox {
     self.etc().join("pica.json")
   }
 
+  fn index_path(&self) -> PathBuf {
+    self.dir.path().join("state/index.json")
+  }
+
+  fn cache_dir(&self) -> PathBuf {
+    self.dir.path().join("state/cache/repos")
+  }
+
   fn source_dir(&self) -> PathBuf {
     let root = self.dir.path().join("source");
     fs::create_dir_all(&root).expect("create source dir");
@@ -45,7 +58,8 @@ impl Sandbox {
     format!("file://{}", self.source_dir().display())
   }
 
-  /// A source that serves an `index.json` declaring `backends`.
+  /// A source that serves an `index.json` declaring `managers`, with a backend
+  /// index for each of them.
   fn publish_source(&self, backends: &[&str]) {
     let managers: Value = backends
       .iter()
@@ -80,8 +94,30 @@ impl Sandbox {
   }
 
   fn index(&self) -> Value {
-    let raw = fs::read_to_string(self.dir.path().join("state/index.json")).expect("read index");
+    let raw = fs::read_to_string(self.index_path()).expect("read index");
     serde_json::from_str(&raw).expect("parse index")
+  }
+
+  /// Every regular file under the state and etc directories, by path, with its
+  /// bytes - the snapshot a failure must not change.
+  fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+      let Ok(entries) = fs::read_dir(root) else { return };
+      for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+          walk(&path, out);
+        } else if let Ok(bytes) = fs::read(&path) {
+          out.push((path.clone(), bytes));
+        }
+      }
+    }
+
+    let mut out = Vec::new();
+    walk(&self.dir.path().join("state"), &mut out);
+    walk(&self.etc(), &mut out);
+    out.sort();
+    out
   }
 
   /// A command with no `opkg`/`apk` on `PATH`, so the device backend is `pica`.
@@ -115,12 +151,14 @@ impl Sandbox {
     cmd.assert()
   }
 
-  /// The files a run that wrote nothing of its own still leaves behind: every
-  /// command creates the empty `pica.json` skeleton before it does anything.
-  fn assert_skeleton_only(&self) {
-    let conf = self.conf();
-    assert_eq!(conf["repos"], json!([]), "{conf}");
-    assert!(conf.get("language").is_none(), "{conf}");
+  /// Nothing at all: no configuration, no index, no cache.
+  fn assert_nothing_written(&self) {
+    assert!(!self.conf_path().exists(), "a run that did not finish wrote a configuration");
+    assert!(!self.index_path().exists(), "a run that did not finish wrote an index");
+    assert!(
+      !self.cache_dir().join("main.json").exists(),
+      "a run that did not finish wrote a source cache"
+    );
   }
 
   fn conf_exists(&self) -> bool {
@@ -137,6 +175,8 @@ fn json_line(assert: &Assert) -> Value {
   serde_json::from_str(first).expect("parse json")
 }
 
+// -- What the wizard asks -----------------------------------------------------
+
 #[test]
 fn nothing_is_written_before_the_first_answer() {
   let sandbox = Sandbox::new();
@@ -150,36 +190,50 @@ fn nothing_is_written_before_the_first_answer() {
 fn end_of_input_at_the_language_menu_cancels_without_writing() {
   let sandbox = Sandbox::new();
 
-  sandbox.interactive(&["setup"], "").success().stdout(contains("Setup cancelled"));
+  sandbox.interactive(&["setup"], "").success().stderr(contains("Setup cancelled"));
 
-  // The only file that appears is the empty skeleton every command creates;
-  // the wizard itself contributed neither a language nor a source.
-  let conf = sandbox.conf();
-  assert_eq!(conf["repos"], json!([]));
-  assert!(conf.get("language").is_none(), "{conf}");
+  sandbox.assert_nothing_written();
 }
 
 #[test]
 fn an_invalid_choice_is_asked_again_instead_of_guessed() {
   let sandbox = Sandbox::new();
-  sandbox.publish_source(&["pica"]);
 
-  // "9" and "abc" are not languages; the third answer is English, then the
-  // custom source, then its URL, then "no, that is all".
-  let answers = format!("9\nabc\n2\n2\n{}\n\nn\n", sandbox.source_url());
+  // Two answers that are not numbers, then end of input: the menu says what it
+  // accepts, and a closed stdin ends the loop rather than spinning on it.
   sandbox
-    .interactive(&["setup"], &answers)
+    .interactive(&["setup"], "9\nabc\n")
     .success()
-    .stdout(contains("Invalid choice: pick a number from 1 to 2"));
-  assert_eq!(sandbox.conf()["language"], json!("en-US"));
+    .stdout(contains("Invalid choice: pick a number from 1 to 2").count(2));
+
+  sandbox.assert_nothing_written();
 }
 
 #[test]
-fn the_answers_become_a_configuration_and_a_synced_index() {
+fn the_official_source_is_reported_missing_rather_than_invented() {
+  let sandbox = Sandbox::new();
+
+  // This build ships no official address, so the wizard has to say so. A made
+  // up default would look like a working source until the first sync.
+  sandbox
+    .interactive(&["setup"], "\n")
+    .success()
+    .stdout(contains("OFFICIAL_REPO_ROOT"))
+    .stderr(contains("Setup cancelled"));
+
+  sandbox.assert_nothing_written();
+}
+
+// -- The happy path -----------------------------------------------------------
+
+#[test]
+fn bare_enter_answers_english_and_the_default_source() {
   let sandbox = Sandbox::new();
   sandbox.publish_source(&["pica"]);
 
-  let answers = format!("2\n2\n{}\n\nn\n", sandbox.source_url());
+  // Enter for the language (English), Enter for the source (the only one there
+  // is), the address, then the sync.
+  let answers = format!("\n\n{}\n", sandbox.source_url());
   sandbox.interactive(&["setup"], &answers).success();
 
   let conf = sandbox.conf();
@@ -190,8 +244,7 @@ fn the_answers_become_a_configuration_and_a_synced_index() {
 
   // The source is not merely stored: it was fetched, and `-S` ran through the
   // same code path every later command uses.
-  let index = sandbox.index();
-  assert!(index["repos"]["main"].is_object(), "{index}");
+  assert!(sandbox.index()["repos"]["main"].is_object(), "{:?}", sandbox.index());
 }
 
 #[test]
@@ -199,70 +252,153 @@ fn choosing_chinese_speaks_chinese_from_the_next_question_on() {
   let sandbox = Sandbox::new();
   sandbox.publish_source(&["pica"]);
 
-  let answers = format!("1\n2\n{}\n\nn\n", sandbox.source_url());
+  let answers = format!("1\n\n{}\n", sandbox.source_url());
   sandbox
     .interactive(&["setup"], &answers)
     .success()
     // The source menu is printed after the language was chosen.
-    .stdout(contains("请选择"))
+    .stdout(contains("选择软件源"))
     .stdout(contains("初始化完成"));
 
   assert_eq!(sandbox.conf()["language"], json!("zh-CN"));
 }
 
 #[test]
-fn a_device_backend_the_source_publishes_is_the_default_choice() {
+fn arrow_keys_move_the_cursor() {
   let sandbox = Sandbox::new();
-  // Both are published; this host has no opkg/apk, so its backend is pica and
-  // that is what the default answer selects.
-  sandbox.publish_source(&["opkg", "pica"]);
+  sandbox.publish_source(&["pica"]);
 
-  let answers = format!("2\n2\n{}\n\n\nn\n", sandbox.source_url());
-  sandbox.interactive(&["setup"], &answers).success();
+  // The cursor starts on English; one Down moves it to the other language, and
+  // the empty line after it is the Enter that takes the highlight. The next
+  // empty line then answers the source menu.
+  let answers = format!("\x1b[B\n\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success().stdout(contains("简体中文 (zh-CN)"));
 
-  assert_eq!(sandbox.conf()["repos"][0]["backends"], json!(["pica"]));
+  assert_eq!(sandbox.conf()["language"], json!("zh-CN"));
 }
 
 #[test]
-fn every_published_backend_can_be_enabled_by_name() {
+fn an_explicit_language_skips_the_question() {
   let sandbox = Sandbox::new();
-  sandbox.publish_source(&["opkg", "pica"]);
+  sandbox.publish_source(&["pica"]);
 
-  let answers = format!("2\n2\n{}\nopkg,pica\n\nn\n", sandbox.source_url());
-  sandbox.interactive(&["setup"], &answers).success();
+  let answers = format!("\n{}\n", sandbox.source_url());
+  sandbox
+    .interactive(&["setup", "--lang", "zh-CN"], &answers)
+    .success()
+    .stdout(contains("选择软件源"));
 
-  assert_eq!(sandbox.conf()["repos"][0]["backends"], json!(["opkg", "pica"]));
+  assert_eq!(sandbox.conf()["language"], json!("zh-CN"));
 }
 
+// -- Backends -----------------------------------------------------------------
+
 #[test]
-fn a_backend_the_source_does_not_publish_is_refused_by_name() {
+fn only_the_backends_this_host_and_the_source_share_are_used() {
   let sandbox = Sandbox::new();
+  // The source publishes both; this host has no opkg, so only pica is usable.
   sandbox.publish_source(&["opkg", "pica"]);
 
-  // `apk` is a backend Pica knows but this source does not serve; it is
-  // refused by name, then the default is accepted.
-  let answers = format!("2\n2\n{}\napk\n\n\nn\n", sandbox.source_url());
+  let answers = format!("\n\n{}\n", sandbox.source_url());
   sandbox
     .interactive(&["setup"], &answers)
     .success()
-    .stderr(contains("apk is not declared by this source"));
+    .stdout(contains("main: using backend(s) pica"))
+    .stdout(contains("sources: main (pica)"));
+
   assert_eq!(sandbox.conf()["repos"][0]["backends"], json!(["pica"]));
+}
+
+#[test]
+fn a_source_without_a_common_backend_is_refused_and_nothing_is_written() {
+  let sandbox = Sandbox::new();
+  // Neither is available here: the intersection is empty, and "empty" must not
+  // turn into "every backend the source declares" or into a literal `auto`.
+  sandbox.publish_source(&["opkg", "apk"]);
+
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox
+    .interactive(&["setup"], &answers)
+    .success()
+    .stderr(contains("no backend in common").and(contains("nothing was written")))
+    .stderr(contains("Setup cancelled"));
+
+  sandbox.assert_nothing_written();
+}
+
+#[test]
+fn a_backend_the_source_does_not_publish_is_never_written() {
+  let sandbox = Sandbox::new();
+  // `opkg` runs here (a stub is on PATH), but this source does not serve it, so
+  // the configuration must not name it.
+  let bin = sandbox.empty_bin();
+  fs::write(bin.join("opkg"), "#!/bin/sh\nexit 0\n").expect("write opkg stub");
+  let mut perms = fs::metadata(bin.join("opkg")).expect("stat stub").permissions();
+  perms.set_mode(0o755);
+  fs::set_permissions(bin.join("opkg"), perms).expect("chmod stub");
+  sandbox.publish_source(&["pica"]);
+
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success();
+
+  assert_eq!(sandbox.conf()["repos"][0]["backends"], json!(["pica"]));
+}
+
+// -- Sources already in the configuration -------------------------------------
+
+#[test]
+fn enter_keeps_the_configured_sources() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+  sandbox.write_conf(&json!({
+    "language": "zh-CN",
+    "repos": [{ "name": "mine", "url": sandbox.source_url(), "backends": ["pica"] }],
+  }));
+
+  // English, then Enter: the default is "keep what is there".
+  sandbox.interactive(&["setup"], "\n\n").success().stdout(contains("mine"));
+
+  let conf = sandbox.conf();
+  assert_eq!(conf["language"], json!("en-US"));
+  assert_eq!(conf["repos"][0]["name"], json!("mine"));
+  assert_eq!(conf["repos"][0]["backends"], json!(["pica"]));
+}
+
+#[test]
+fn a_new_source_is_added_beside_the_existing_ones() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+  sandbox.write_conf(&json!({ "repos": [{
+    "name": "mine",
+    "url": sandbox.source_url(),
+    "backends": ["pica"],
+  }] }));
+
+  // English, "custom source" (the first item), then the address.
+  let answers = format!("\n1\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success();
+
+  let conf = sandbox.conf();
+  let repos = conf["repos"].as_array().expect("repos");
+  assert_eq!(repos.len(), 2);
+  assert_eq!(repos[0]["name"], json!("mine"), "the entry that was there stays first");
+  assert_eq!(repos[1]["name"], json!("main"));
 }
 
 #[test]
 fn a_source_that_cannot_be_read_is_never_saved() {
   let sandbox = Sandbox::new();
 
-  // The second round of the source menu gets EOF, which cancels the setup.
-  let answers = format!("2\n2\nfile://{}/missing\n", sandbox.dir.path().display());
+  // The address itself is fine; the `index.json` it should serve is missing.
+  // The question is repeated, and end of input cancels.
+  let answers = format!("\n\n{}\n", sandbox.source_url());
   sandbox
     .interactive(&["setup"], &answers)
     .success()
-    .stderr(contains("Cannot read"))
-    .stdout(contains("Setup cancelled"));
+    .stderr(contains("index.json"))
+    .stderr(contains("Setup cancelled"));
 
-  sandbox.assert_skeleton_only();
-  assert_eq!(sandbox.index()["repos"], json!({}), "an unverified source must not be synced");
+  sandbox.assert_nothing_written();
 }
 
 #[test]
@@ -274,97 +410,80 @@ fn an_entry_descriptor_with_an_unknown_backend_key_is_refused() {
   )
   .expect("write descriptor");
 
-  let answers = format!("2\n2\n{}\nn\n", sandbox.source_url());
-  sandbox
-    .interactive(&["setup"], &answers)
-    .success()
-    .stderr(contains("not a valid source descriptor"));
-  sandbox.assert_skeleton_only();
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success().stderr(contains("unsupported manager rpm"));
+
+  sandbox.assert_nothing_written();
 }
 
 #[test]
-fn existing_sources_can_be_kept_untouched() {
+fn a_source_whose_descriptor_points_outside_the_root_is_refused() {
   let sandbox = Sandbox::new();
   sandbox.publish_source(&["pica"]);
-  let repo = json!({
-    "name": "mine",
-    "url": sandbox.source_url(),
-    "backends": ["pica"],
-  });
-  sandbox.write_conf(&json!({ "language": "zh-CN", "repos": [repo] }));
-
-  // English, then "keep what is there", then "no more sources".
-  sandbox.interactive(&["setup"], "2\n3\nn\n").success().stdout(contains("mine"));
-
-  let conf = sandbox.conf();
-  assert_eq!(conf["language"], json!("en-US"));
-  assert_eq!(conf["repos"][0]["name"], json!("mine"));
-  assert_eq!(conf["repos"][0]["backends"], json!(["pica"]));
-}
-
-#[test]
-fn a_second_source_is_added_beside_the_first() {
-  let sandbox = Sandbox::new();
-  sandbox.publish_source(&["pica"]);
-  sandbox.write_conf(&json!({ "repos": [{
-    "name": "mine",
-    "url": sandbox.source_url(),
-    "backends": ["pica"],
-  }] }));
-
-  // English, "add", custom, URL, default name, default backends, then stop.
-  let answers = format!("2\n1\n2\n{}\n\n\nn\n", sandbox.source_url());
-  sandbox.interactive(&["setup"], &answers).success();
-
-  let conf = sandbox.conf();
-  let repos = conf["repos"].as_array().expect("repos");
-  assert_eq!(repos.len(), 2);
-  assert_eq!(repos[0]["name"], json!("mine"));
-  // The default name is taken, so the second source gets a free one.
-  assert_eq!(repos[1]["name"], json!("main"));
-}
-
-#[test]
-fn a_source_whose_descriptor_cannot_find_its_index_is_not_synced() {
-  let sandbox = Sandbox::new();
-  sandbox.publish_source(&["pica"]);
-  // The descriptor names a file that is not there: setup must say so and let
-  // the user try again rather than store a source sync would then fail on.
   fs::write(
     sandbox.source_dir().join("index.json"),
     json!({ "schema": 1, "managers": { "pica": { "path": "../escape.json" } } }).to_string(),
   )
   .expect("write descriptor");
 
-  let answers = format!("2\n2\n{}\nn\n", sandbox.source_url());
-  sandbox
-    .interactive(&["setup"], &answers)
-    .success()
-    .stderr(contains("not a valid source descriptor"));
-  sandbox.assert_skeleton_only();
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success().stderr(contains("must not contain . or .."));
+
+  sandbox.assert_nothing_written();
 }
 
 #[test]
-fn a_sync_that_fails_after_saving_puts_the_previous_state_back() {
+fn plain_http_to_a_public_host_is_asked_about_and_never_assumed() {
+  let sandbox = Sandbox::new();
+
+  // Nothing is fetched: the answer is "no", which drops the address and asks
+  // again; end of input then cancels.
+  sandbox
+    .interactive(&["setup"], "\n\nhttp://example.invalid/pica\n2\n")
+    .success()
+    .stdout(contains("plain HTTP"))
+    .stderr(contains("Setup cancelled"));
+
+  sandbox.assert_nothing_written();
+}
+
+// -- One transaction ----------------------------------------------------------
+
+#[test]
+fn a_source_that_fails_after_another_succeeded_changes_nothing() {
   let sandbox = Sandbox::new();
   sandbox.publish_source(&["pica"]);
-
-  // A working configuration with its index already on disk, so "restored"
-  // means "exactly what was there before" rather than "empty".
-  let before = json!({
+  let working = sandbox.source_url();
+  sandbox.write_conf(&json!({
     "language": "en-US",
-    "repos": [{ "name": "main", "url": sandbox.source_url(), "backends": ["pica"] }],
-  });
-  sandbox.write_conf(&before);
+    "repos": [{ "name": "main", "url": working, "backends": ["pica"] }],
+  }));
   sandbox.run(&["-S"]).success();
-  let conf_before = fs::read_to_string(sandbox.conf_path()).expect("read conf");
-  let index_before =
-    fs::read_to_string(sandbox.dir.path().join("state/index.json")).expect("read index");
 
-  // Descriptor still validates; the index it names is gone, so the failure only
-  // shows up during the sync that follows the write.
-  fs::remove_file(sandbox.source_dir().join("pica/index.json")).expect("remove backend index");
+  // Give the working source new content, so a successful second sync would have
+  // to replace its cache: that is what makes "unchanged" meaningful.
+  let new_index = json!({
+    "schema": 1,
+    "mgr": "pica",
+    "generated_at": "2026-10-21T00:00:00Z",
+    "packages": [{
+      "pkgname": "late-demo",
+      "appname": "late-demo",
+      "pkgver": "1.0.0",
+      "pkgrel": "1",
+      "pkgmgr": "pica",
+      "platform": "all",
+      "arch": "all",
+      "os": "all",
+      "filename": "late-demo-1.0.0-1-all-pica.pkg.tar.gz",
+      "sha256": "0".repeat(64),
+    }],
+  });
+  fs::write(sandbox.source_dir().join("pica/index.json"), new_index.to_string())
+    .expect("rewrite backend index");
 
+  // A second source: its descriptor validates, but the index it names is gone,
+  // so the failure only shows up once the first source was already read.
   let second = sandbox.dir.path().join("second");
   fs::create_dir_all(&second).expect("create second source");
   fs::write(
@@ -373,23 +492,173 @@ fn a_sync_that_fails_after_saving_puts_the_previous_state_back() {
   )
   .expect("write descriptor");
 
-  let answers = format!("2\n1\n2\nfile://{}\n\n\nn\n", second.display());
+  let before = sandbox.snapshot();
+  let answers = format!("\n1\nfile://{}\n", second.display());
   sandbox
     .interactive(&["setup"], &answers)
     .failure()
-    .stderr(contains("Sync failed, so the previous configuration was restored"));
+    .stderr(contains("pica/index.json").and(contains("failed")));
 
   assert_eq!(
-    fs::read_to_string(sandbox.conf_path()).expect("read conf"),
-    conf_before,
-    "the configuration on disk must be byte for byte what it was"
-  );
-  assert_eq!(
-    fs::read_to_string(sandbox.dir.path().join("state/index.json")).expect("read index"),
-    index_before,
-    "a failed sync must not touch the verified index cache"
+    sandbox.snapshot(),
+    before,
+    "a source that fails must leave the configuration and every cache as it was"
   );
 }
+
+#[test]
+fn a_failed_first_run_leaves_no_configuration_index_or_cache() {
+  let sandbox = Sandbox::new();
+  // The descriptor is valid, so the wizard accepts the address; the sync then
+  // fails on the index the descriptor names.
+  fs::write(
+    sandbox.source_dir().join("index.json"),
+    json!({ "schema": 1, "managers": { "pica": { "path": "pica/index.json" } } }).to_string(),
+  )
+  .expect("write descriptor");
+
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).failure().stderr(contains("failed"));
+
+  sandbox.assert_nothing_written();
+}
+
+#[test]
+fn a_successful_run_leaves_no_temporary_files() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox.interactive(&["setup"], &answers).success().stdout(contains("Setup complete"));
+
+  let stray: Vec<PathBuf> = sandbox
+    .snapshot()
+    .into_iter()
+    .map(|(path, _)| path)
+    .filter(|path| {
+      path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(".pica-"))
+    })
+    .collect();
+  assert!(stray.is_empty(), "temp files were left behind: {stray:?}");
+
+  // Everything the run promised is there.
+  assert!(sandbox.conf_exists());
+  assert!(sandbox.index()["repos"]["main"].is_object());
+  assert!(sandbox.cache_dir().join("main.json").is_file());
+}
+
+/// A failure on the *third* file still undoes the first two: the commit writes
+/// the configuration, then the caches, then the index, and a cache directory
+/// that cannot be written to makes the run fail after the configuration had
+/// already been replaced.
+#[test]
+fn a_write_that_fails_midway_puts_the_previous_files_back() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+  let url = sandbox.source_url();
+  sandbox.write_conf(&json!({
+    "language": "en-US",
+    "repos": [{ "name": "main", "url": url, "backends": ["pica"] }],
+  }));
+  sandbox.run(&["-S"]).success();
+
+  // New content in the source, so a successful run would have to overwrite it.
+  let newer = json!({
+    "schema": 1,
+    "mgr": "pica",
+    "generated_at": "2026-10-21T00:00:00Z",
+    "packages": [{
+      "pkgname": "late-demo",
+      "appname": "late-demo",
+      "pkgver": "1.0.0",
+      "pkgrel": "1",
+      "pkgmgr": "pica",
+      "platform": "all",
+      "arch": "all",
+      "os": "all",
+      "filename": "late-demo-1.0.0-1-all-pica.pkg.tar.gz",
+      "sha256": "0".repeat(64),
+    }],
+  });
+  fs::write(sandbox.source_dir().join("pica/index.json"), newer.to_string())
+    .expect("rewrite backend index");
+
+  let cache = sandbox.cache_dir();
+  let mut perms = fs::metadata(&cache).expect("stat cache").permissions();
+  perms.set_mode(0o555);
+  fs::set_permissions(&cache, perms).expect("chmod cache");
+  if fs::write(cache.join(".probe"), b"x").is_ok() {
+    let _ = fs::remove_file(cache.join(".probe"));
+    let _ = fs::set_permissions(&cache, fs::Permissions::from_mode(0o755));
+    return;
+  }
+
+  let before = sandbox.snapshot();
+  // Chinese this time: the configuration would change, so restoring it is
+  // visible, not just "identical bytes written twice".
+  let answers = format!("1\n\n{}\n", sandbox.source_url());
+  sandbox
+    .interactive(&["setup"], &answers)
+    .failure()
+    // The run speaks Chinese by now, so the message it prints does too.
+    .stderr(contains("已恢复"));
+
+  let _ = fs::set_permissions(&cache, fs::Permissions::from_mode(0o755));
+  assert_eq!(
+    sandbox.snapshot(),
+    before,
+    "a failed commit must restore every file it had already written"
+  );
+}
+
+#[test]
+fn a_configuration_that_cannot_be_saved_is_reported_as_such() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+
+  // A directory that cannot be written to is the simplest honest way to make
+  // the save fail. Root ignores the mode, so there is nothing to test then.
+  let etc = sandbox.etc();
+  let mut perms = fs::metadata(&etc).expect("stat etc").permissions();
+  perms.set_mode(0o555);
+  fs::set_permissions(&etc, perms).expect("chmod etc");
+  if fs::write(etc.join(".probe"), b"x").is_ok() {
+    let _ = fs::remove_file(etc.join(".probe"));
+    return;
+  }
+
+  let answers = format!("\n\n{}\n", sandbox.source_url());
+  sandbox
+    .interactive(&["setup"], &answers)
+    .failure()
+    .stderr(contains("could not write").and(contains("pica.json")));
+
+  // The configuration was the first file to be written, so the index and the
+  // cache that follow it were never committed.
+  assert!(!sandbox.conf_exists());
+  assert!(!sandbox.index_path().exists());
+  assert!(!sandbox.cache_dir().join("main.json").exists());
+}
+
+#[test]
+fn an_unreadable_configuration_is_not_silently_replaced() {
+  let sandbox = Sandbox::new();
+  // A directory where the config file should be: reading it fails, and setup
+  // must refuse rather than treat the file as absent and overwrite it later.
+  fs::create_dir(sandbox.conf_path()).expect("create conf dir");
+
+  sandbox.interactive(&["setup"], "\n").failure().stderr(contains("Cannot read"));
+}
+
+#[test]
+fn setup_is_not_a_json_command() {
+  let sandbox = Sandbox::new();
+
+  sandbox.run(&["--json", "setup"]).failure().stderr(contains("--json"));
+  assert!(!sandbox.conf_exists());
+}
+
+// -- Language plumbing that shares this binary --------------------------------
 
 #[test]
 fn sync_says_so_in_the_language_the_config_speaks() {
@@ -463,48 +732,6 @@ fn the_error_code_is_the_same_in_every_language() {
 }
 
 #[test]
-fn setup_is_not_a_json_command() {
-  let sandbox = Sandbox::new();
-
-  sandbox.run(&["--json", "setup"]).failure().stderr(contains("--json"));
-  assert!(!sandbox.conf_exists());
-}
-
-#[test]
-fn a_configuration_that_cannot_be_saved_is_reported_as_such() {
-  let sandbox = Sandbox::new();
-  sandbox.publish_source(&["pica"]);
-
-  // A directory that cannot be written to is the simplest honest way to make
-  // the save fail. Root ignores the mode, so there is nothing to test then.
-  let etc = sandbox.etc();
-  let mut perms = fs::metadata(&etc).expect("stat etc").permissions();
-  perms.set_mode(0o555);
-  fs::set_permissions(&etc, perms).expect("chmod etc");
-  if fs::write(etc.join(".probe"), b"x").is_ok() {
-    let _ = fs::remove_file(etc.join(".probe"));
-    return;
-  }
-
-  let answers = format!("2\n2\n{}\n\nn\n", sandbox.source_url());
-  sandbox
-    .interactive(&["setup"], &answers)
-    .failure()
-    .stderr(contains("Cannot save the configuration"));
-  assert!(!sandbox.conf_exists());
-}
-
-#[test]
-fn an_unreadable_configuration_is_not_silently_replaced() {
-  let sandbox = Sandbox::new();
-  // A directory where the config file should be: reading it fails, and setup
-  // must refuse rather than treat the file as absent and overwrite it later.
-  fs::create_dir(sandbox.conf_path()).expect("create conf dir");
-
-  sandbox.interactive(&["setup"], "2\n").failure().stderr(contains("Cannot read"));
-}
-
-#[test]
 fn an_unsupported_language_argument_is_refused_by_code() {
   let sandbox = Sandbox::new();
 
@@ -512,4 +739,122 @@ fn an_unsupported_language_argument_is_refused_by_code() {
     .run(&["--lang", "de-DE", "-Q"])
     .failure()
     .stderr(contains("invalid --lang").and(contains("de-DE")));
+}
+
+// -- A real terminal ----------------------------------------------------------
+
+/// The arrow keys only exist on a terminal: the menu switches the line off
+/// canonical mode and reads single bytes, which a pipe cannot exercise. `script`
+/// hands the child a pty, which is the only way to reach that code without a
+/// new dependency.
+///
+/// The shell asks for its line settings before and after the wizard, so this
+/// also checks the promise `Terminal` makes: whatever it changes, it puts back -
+/// on the way out of a successful run as much as out of a cancelled one.
+#[test]
+fn arrow_keys_work_on_a_terminal_and_the_line_settings_come_back() {
+  let sandbox = Sandbox::new();
+  sandbox.publish_source(&["pica"]);
+  // The menu needs `stty` on PATH; a symlink keeps opkg and apk out of it.
+  let bin = sandbox.empty_bin();
+  let stty = which("stty").expect("stty on PATH");
+  std::os::unix::fs::symlink(stty, bin.join("stty")).expect("link stty");
+
+  let inner = format!(
+    "stty -g; env PICA_ETC_DIR='{etc}' PICA_STATE_DIR='{state}' PATH='{bin}' '{pica}' setup; stty -g",
+    etc = sandbox.etc().display(),
+    state = sandbox.dir.path().join("state").display(),
+    bin = bin.display(),
+    pica = env!("CARGO_BIN_EXE_pica"),
+  );
+
+  let Some(mut child) = Script::spawn(&inner) else {
+    eprintln!("skipping: no `script` on this host");
+    return;
+  };
+
+  // Typed at a person's pace: the terminal is in cooked mode until the wizard
+  // switches it, so the bytes have to arrive while it is ready for them.
+  for chunk in [&b"\x1b[B"[..], b"\r", b"\r", format!("{}\r", sandbox.source_url()).as_bytes()] {
+    child.type_bytes(chunk);
+  }
+
+  let output = child.finish();
+  let text = String::from_utf8_lossy(&output.stdout).into_owned();
+  assert!(output.status.success(), "{text}");
+
+  // The escape-coded redraw, and no numbered list: the raw path really ran.
+  assert!(text.contains("\x1b[K"), "the menu was not drawn in place: {text}");
+  assert!(!text.contains("  1. "), "the numbered fallback ran instead: {text}");
+
+  let settings = line_settings(&text);
+  assert_eq!(settings.len(), 2, "two `stty -g` readings: {text}");
+  assert_eq!(settings[0], settings[1], "the line settings must come back: {text}");
+
+  assert_eq!(sandbox.conf()["language"], json!("zh-CN"), "{text}");
+}
+
+/// A pty for the child, fed a chunk at a time.
+struct Script {
+  child: std::process::Child,
+}
+
+impl Script {
+  /// `None` when `script` is not installed, so a host without it skips instead
+  /// of failing.
+  fn spawn(inner: &str) -> Option<Self> {
+    let mut command = std::process::Command::new("script");
+    // BSD `script` takes the file first, util-linux takes `-c`.
+    #[cfg(target_os = "macos")]
+    command.args(["-q", "/dev/null", "sh", "-c", inner]);
+    #[cfg(not(target_os = "macos"))]
+    // util-linux needs `-e` to hand the child's exit status back.
+    command.args(["-q", "-e", "-c", inner, "/dev/null"]);
+
+    let child = command
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .ok()?;
+    Some(Self { child })
+  }
+
+  fn type_bytes(&mut self, bytes: &[u8]) {
+    use std::io::Write;
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let stdin = self.child.stdin.as_mut().expect("stdin");
+    stdin.write_all(bytes).expect("write to the pty");
+    stdin.flush().expect("flush");
+  }
+
+  fn finish(mut self) -> std::process::Output {
+    // Give the last answer time to be read before the pipe closes: closing it
+    // early turns the end of input into the wizard's next key press.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    drop(self.child.stdin.take());
+    self.child.wait_with_output().expect("wait for script")
+  }
+}
+
+/// The `stty -g` readings in `text`, in order, whichever format the platform
+/// prints.
+fn line_settings(text: &str) -> Vec<String> {
+  text
+    .lines()
+    .map(str::trim)
+    .filter(|line| {
+      let bsd = line.starts_with("gfmt");
+      let util_linux =
+        line.contains(':') && line.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
+      bsd || util_linux
+    })
+    .map(str::to_string)
+    .collect()
+}
+
+/// The absolute path of `name` on this process's `PATH`.
+fn which(name: &str) -> Option<PathBuf> {
+  let path = std::env::var_os("PATH")?;
+  std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file())
 }

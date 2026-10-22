@@ -127,7 +127,8 @@ PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 
 ### 命令底层微观事务工作流
 
-- **同步（-S）**：读取配置表的 `url`（源根地址）-> 按该源的 `backends` 抓 `<root>/index.json` 入口描述与对应后端索引；没有 `backends` 时先按旧行为抓 `<root>/repo.json`，不可用才回退入口描述 -> 校验后写入 `state/index.json` 的 `repos.<name>`（`kind` / `backends` / `entry` / `indexes`）。
+- **同步（-S）**：读取配置表的 `url`（源根地址）-> 按该源的 `backends` 抓 `<root>/index.json` 入口描述与对应后端索引 -> 校验后写入 `state/index.json` 的 `repos.<name>`（`backends` / `entry` / `indexes`）。`index.json` 是唯一入口：缺失、读不到或不合规都直接失败，不读 `<root>/repo.json`，也没有旧格式回退分支。
+- **初始化（`pica setup`）**：`src/menu.rs` 提供上下键菜单（终端上切 raw 模式逐字节读，非终端退回编号输入，`Terminal` 在 `Drop` 里用 `stty <saved>` 还原行设置）；`src/commands/setup.rs` 按"语言 -> 软件源 -> 抓入口描述求后端交集 -> 同步"推进。语言菜单的标签是各语言的自称（`English (en-US)`），不随界面语言翻译。任何一步失败都不落盘：`sync::build` 先把配置、索引与缓存全部算出，`state::Transaction` 再一次性提交，写入失败按逆序恢复已写文件，恢复失败时错误消息同时带上原始原因。
 - **地址与策略（`src/source.rs`）**：`join_child` 把源发布的相对路径拼到根地址上，`join_sibling` 把入口描述给的 manager path 拼到描述文件所在目录，两者都要求安全相对路径；`FetchPolicy` 决定哪些 scheme 与主机可被抓取（公网明文默认拒绝、局域网允许、`file://` 只对本地源开放、重定向禁止 https→http），下载与同步共用同一份判定。
 - **索引刷新防抖（-U 生命周期部分）**：
   - 当通过 `-S` 引发的远程依赖（base/app/kmod）安装前发现缺少依赖必须拉外网资源执行 `opkg install` 之前。

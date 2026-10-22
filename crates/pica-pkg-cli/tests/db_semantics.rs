@@ -1566,7 +1566,10 @@ impl Sandbox {
   }
 }
 
-/// One schema-2 index entry pointing at `artifact`, served over `file://`.
+/// One synced source holding a single pica index entry for `artifact`.
+///
+/// The shape is the one a sync writes: the configuration keeps a backend list,
+/// and each backend's own `index.json` is kept under `indexes`.
 fn repo_index(
   pkgname: &str,
   version: &str,
@@ -1577,26 +1580,34 @@ fn repo_index(
 ) -> String {
   let filename = artifact.file_name().and_then(|name| name.to_str()).expect("artifact filename");
   serde_json::json!({
+      "schema": 1,
       "repos": {
           "sandbox": {
+              "name": "sandbox",
               "url": "",
-              "data": {
-                  "schema": 2,
-                  "packages": [{
-                      "pkgname": pkgname,
-                      "appname": pkgname,
-                      "pkgver": version,
-                      "pkgrel": "1",
-                      "pkgmgr": "pica",
-                      "platform": "all",
-                      "arch": "all",
-                      "os": "all",
-                      "filename": filename,
-                      "sha256": sha256,
-                      "size": size,
-                      "csize": csize,
-                      "download_url": format!("file://{}", artifact.display()),
-                  }]
+              "backends": ["pica"],
+              "platform": "all",
+              "indexes": {
+                  "pica": {
+                      "url": "",
+                      "schema": 1,
+                      "mgr": "pica",
+                      "packages": [{
+                          "pkgname": pkgname,
+                          "appname": pkgname,
+                          "pkgver": version,
+                          "pkgrel": "1",
+                          "pkgmgr": "pica",
+                          "platform": "all",
+                          "arch": "all",
+                          "os": "all",
+                          "filename": filename,
+                          "sha256": sha256,
+                          "size": size,
+                          "csize": csize,
+                          "download_url": format!("file://{}", artifact.display()),
+                      }]
+                  }
               }
           }
       }

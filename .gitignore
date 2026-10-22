@@ -1,6 +1,13 @@
 # Local agent cache docs (do not upload)
 docs/local_agent_cache/*
-target/*
-examples/*
+
 .codebuddy/*
 .workbuddy/*
+
+target/*
+examples/*
+
+state
+
+# macOS Finder metadata
+.DS_Store
