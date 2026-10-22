@@ -1,8 +1,9 @@
 use crate::app::{
   App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, ensure_dirs,
 };
-use crate::candidate::find_pica_candidates_in_index;
+use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
 use crate::installed;
+use crate::source;
 use crate::state::read_json_file;
 use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
@@ -81,7 +82,7 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
   if candidates.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("package not found in pica repos: {selector}"),
+      format!("package not found in pica repos: {selector}{}", not_found_hint(app)),
     ));
   }
 
@@ -92,10 +93,11 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
-  let download_url = if let Some(url) = &best.download_url {
-    url.clone()
-  } else {
-    format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename)
+  // `-Si` shows the address the install would actually use, so a relative
+  // `download_url` is resolved here the same way.
+  let download_url = match &best.download_url {
+    Some(url) => source::join_child(&best.url, url).unwrap_or_else(|_| url.clone()),
+    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
   };
 
   println!("Repository      : {}", best.repo);

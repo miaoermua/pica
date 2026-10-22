@@ -1,12 +1,19 @@
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID, ensure_dirs,
 };
+use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_platform;
-use crate::state::{ensure_json_object_field, read_json_file, write_json_atomic_pretty};
+use crate::source::{self, FetchPolicy};
+use crate::state::{
+  ensure_json_object_field, read_json_file, repo_package_sets, write_json_atomic_pretty,
+};
 use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::repo::{is_supported_url, parse_repo_json};
+use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor, parse_repo_json};
 use serde_json::{Value, json};
+
+/// Backends a source may advertise. Kept as text so an error can list them.
+const SUPPORTED_BACKENDS: &str = "opkg, apk, pica";
 
 pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
@@ -41,6 +48,8 @@ pub fn repos(app: &mut App) -> CliResult<()> {
     let name = repo_entry.get("name").and_then(Value::as_str).unwrap_or("").trim();
     let url = repo_entry.get("url").and_then(Value::as_str).unwrap_or("").trim();
     let repo_platform = repo_entry.get("platform").and_then(Value::as_str).unwrap_or("").trim();
+    let allow_insecure_http =
+      repo_entry.get("allow_insecure_http").and_then(Value::as_bool).unwrap_or(false);
 
     if name.is_empty() {
       return Err(CliError::new(E_CONFIG_INVALID, format!("repo[{repo_index}] missing name")));
@@ -49,41 +58,60 @@ pub fn repos(app: &mut App) -> CliResult<()> {
       return Err(CliError::new(E_CONFIG_INVALID, format!("repo[{repo_index}] missing url")));
     }
 
+    // The root is what every address below it is derived from, and what the
+    // policy is anchored to; a root the client would refuse to fetch from is a
+    // configuration error, not a repository one.
+    let policy = FetchPolicy::source(allow_insecure_http);
+    policy.check(url).map_err(|err| {
+      CliError::new(E_CONFIG_INVALID, format!("{name}: source root {url}: {}", err.message))
+    })?;
+
+    let wanted = configured_backends(repo_index, name, repo_entry)?;
+
     app.log_info(format!("{name} downloading..."));
-    let repo_json_url = format!("{}/repo.json", url.trim_end_matches('/'));
-    let repo_raw = fetch_url(
-      &repo_json_url,
-      is_supported_url,
-      app.options.fetch_timeout,
-      app.options.fetch_retry,
-      app.options.fetch_retry_delay,
-    )?;
-    let repo_text = String::from_utf8(repo_raw).map_err(|_| {
-      CliError::new(E_REPO_INVALID, format!("{name}: repo.json is not valid UTF-8"))
-    })?;
-    let parsed_repo = parse_repo_json(&repo_text).map_err(|error| {
-      CliError::new(
-        E_REPO_INVALID,
-        format!("{name}: repo.json failed strict schema/filename validation: {error}"),
-      )
-    })?;
-
-    let repo_value = serde_json::to_value(&parsed_repo)
-      .map_err(|error| CliError::new(E_REPO_INVALID, error.to_string()))?;
-
-    let repo_cache_file = app.paths.repos_cache_dir.join(format!("{name}.json"));
-    write_json_atomic_pretty(&repo_cache_file, &repo_value)?;
 
     let effective_platform =
       if repo_platform.is_empty() { host_platform.clone() } else { repo_platform.to_string() };
+
+    let body = match wanted {
+      Some(backends) => sync_from_descriptor(app, name, url, &backends, policy, now)?,
+      // No `backends` key is a configuration written for the schema-2 layout.
+      // It keeps working exactly as it did; a source that only ships the entry
+      // descriptor is reached through the descriptor instead, and that attempt
+      // is reported only if both fail.
+      None => match sync_legacy(app, name, url, policy, now) {
+        Ok(body) => body,
+        Err(legacy_error) => {
+          let Ok(declared) = all_declared_backends(app, url, policy) else {
+            return Err(legacy_error);
+          };
+          app.log_warn(format!(
+            "{name}: repo.json unavailable, using index.json (declares: {})",
+            join_backends(&declared)
+          ));
+          let mut body = sync_from_descriptor(app, name, url, &declared, policy, now)?;
+          body["legacy_error"] = json!(legacy_error.message);
+          body
+        }
+      },
+    };
 
     let repo_obj = json!({
         "name": name,
         "url": url,
         "updated_at": now,
         "platform": effective_platform,
-        "data": repo_value,
+        "allow_insecure_http": allow_insecure_http,
+        "kind": body["kind"].clone(),
+        "backends": body["backends"].clone(),
+        "entry": body["entry"].clone(),
+        "indexes": body["indexes"].clone(),
+        "data": body["data"].clone(),
+        "legacy_error": body["legacy_error"].clone(),
     });
+
+    let repo_cache_file = app.paths.repos_cache_dir.join(format!("{name}.json"));
+    write_json_atomic_pretty(&repo_cache_file, &repo_obj)?;
 
     let index_repos = index
       .get_mut("repos")
@@ -98,6 +126,196 @@ pub fn repos(app: &mut App) -> CliResult<()> {
 
   check_index_dependencies(app);
   Ok(())
+}
+
+/// The backend combination this source was configured for, in the order it was
+/// written. `None` means the configuration predates the key and the source is
+/// read the old way.
+fn configured_backends(
+  repo_index: usize,
+  name: &str,
+  repo_entry: &Value,
+) -> CliResult<Option<Vec<String>>> {
+  let Some(value) = repo_entry.get("backends") else {
+    return Ok(None);
+  };
+  let list = value.as_array().ok_or_else(|| {
+    CliError::new(
+      E_CONFIG_INVALID,
+      format!("repo[{repo_index}] ({name}) backends must be an array of backend names"),
+    )
+  })?;
+
+  let mut backends = Vec::new();
+  for item in list {
+    let text = item.as_str().map_or("", str::trim);
+    let kind = PackageManagerKind::parse(text).ok_or_else(|| {
+      CliError::new(
+        E_CONFIG_INVALID,
+        format!(
+          "repo[{repo_index}] ({name}) backends contains unsupported backend {text:?} \
+           (supported: {SUPPORTED_BACKENDS})"
+        ),
+      )
+    })?;
+    if !backends.iter().any(|existing| existing == kind.as_str()) {
+      backends.push(kind.as_str().to_string());
+    }
+  }
+
+  if backends.is_empty() {
+    return Err(CliError::new(
+      E_CONFIG_INVALID,
+      format!("repo[{repo_index}] ({name}) backends is empty; name at least one backend"),
+    ));
+  }
+
+  Ok(Some(backends))
+}
+
+/// Fetch one of a source's files, refusing anything the policy would not have
+/// fetched on its own.
+fn fetch_text(
+  app: &App,
+  name: &str,
+  what: &str,
+  url: &str,
+  policy: FetchPolicy,
+) -> CliResult<String> {
+  let raw = fetch_url(
+    url,
+    policy,
+    app.options.fetch_timeout,
+    app.options.fetch_retry,
+    app.options.fetch_retry_delay,
+  )
+  .map_err(|err| {
+    CliError::new(err.code, format!("{name}: fetching {what} from {url} failed: {}", err.message))
+  })?;
+
+  String::from_utf8(raw)
+    .map_err(|_| CliError::new(E_REPO_INVALID, format!("{name}: {what} at {url} is not UTF-8")))
+}
+
+/// The schema-2 layout: one `repo.json` describing every package of a source.
+fn sync_legacy(
+  app: &App,
+  name: &str,
+  root: &str,
+  policy: FetchPolicy,
+  now: u64,
+) -> CliResult<Value> {
+  let repo_url = source::join_child(root, "repo.json")?;
+  let text = fetch_text(app, name, "repo.json", &repo_url, policy)?;
+
+  let parsed = parse_repo_json(&text).map_err(|error| {
+    CliError::new(
+      E_REPO_INVALID,
+      format!("{name}: repo.json at {repo_url} failed strict schema/filename validation: {error}"),
+    )
+  })?;
+
+  let data = serde_json::to_value(&parsed)
+    .map_err(|error| CliError::new(E_REPO_INVALID, error.to_string()))?;
+
+  Ok(json!({
+    "kind": "legacy",
+    "backends": Vec::<String>::new(),
+    "entry": Value::Null,
+    "indexes": Value::Null,
+    "data": data,
+    "updated_at": now,
+  }))
+}
+
+/// The entry-descriptor layout: `index.json` names a path per backend, and each
+/// of those paths is fetched as its own index.
+fn sync_from_descriptor(
+  app: &App,
+  name: &str,
+  root: &str,
+  wanted: &[String],
+  policy: FetchPolicy,
+  now: u64,
+) -> CliResult<Value> {
+  let entry_url = source::join_child(root, "index.json")?;
+  let text = fetch_text(app, name, "index.json", &entry_url, policy)?;
+
+  let descriptor = parse_entry_descriptor(&text).map_err(|error| {
+    CliError::new(E_REPO_INVALID, format!("{name}: index.json at {entry_url} is invalid: {error}"))
+  })?;
+
+  let declared: Vec<&str> = descriptor.managers.keys().map(String::as_str).collect();
+
+  // A backend the user asked for but the source does not publish is a hard
+  // error: installing through the other one would be a different package.
+  let missing: Vec<&str> = wanted
+    .iter()
+    .map(String::as_str)
+    .filter(|mgr| !descriptor.managers.contains_key(*mgr))
+    .collect();
+  if !missing.is_empty() {
+    return Err(CliError::new(
+      E_REPO_INVALID,
+      format!(
+        "{name}: source does not provide backend(s) {} (declares: {}); \
+         adjust its backends list or use a source that does",
+        join_backends(&missing.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
+        join_backends(&declared.iter().map(|m| (*m).to_string()).collect::<Vec<_>>())
+      ),
+    ));
+  }
+
+  let mut indexes = serde_json::Map::new();
+  for mgr in wanted {
+    let path = &descriptor.managers[mgr].path;
+    // Relative to the descriptor's own location, never to a guess about the
+    // deployment (GitHub raw, a Worker and a self-hosted prefix all differ).
+    let url = source::join_sibling(&entry_url, path)?;
+    let text = fetch_text(app, name, &format!("{mgr} index"), &url, policy)?;
+
+    let parsed = parse_backend_index(&text, mgr).map_err(|error| {
+      CliError::new(E_REPO_INVALID, format!("{name}: {mgr} index at {url} is invalid: {error}"))
+    })?;
+
+    indexes.insert(
+      mgr.clone(),
+      json!({
+        "url": url,
+        "schema": parsed.schema,
+        "mgr": parsed.mgr,
+        "generated_at": parsed.generated_at,
+        "fetched_at": now,
+        "packages": parsed.packages,
+      }),
+    );
+  }
+
+  Ok(json!({
+    "kind": "entry",
+    "backends": wanted,
+    "entry": {
+      "url": entry_url,
+      "schema": descriptor.schema,
+      "name": descriptor.name,
+      "description": descriptor.description,
+    },
+    "indexes": indexes,
+    "data": Value::Null,
+    "updated_at": now,
+  }))
+}
+
+fn all_declared_backends(app: &App, root: &str, policy: FetchPolicy) -> CliResult<Vec<String>> {
+  let entry_url = source::join_child(root, "index.json")?;
+  let text = fetch_text(app, "source", "index.json", &entry_url, policy)?;
+  let descriptor = parse_entry_descriptor(&text)
+    .map_err(|error| CliError::new(E_REPO_INVALID, format!("{entry_url}: {error}")))?;
+  Ok(descriptor.managers.keys().cloned().collect())
+}
+
+fn join_backends(backends: &[String]) -> String {
+  if backends.is_empty() { "none".to_string() } else { backends.join(", ") }
 }
 
 fn check_index_dependencies(app: &mut App) {
@@ -150,17 +368,16 @@ fn collect_declared_dependencies(index: &Value) -> Vec<String> {
   };
 
   for repo in repos.values() {
-    let Some(packages) =
-      repo.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
-    else {
-      continue;
-    };
-
-    for package in packages {
-      let manifest = package.get("manifest").unwrap_or(&Value::Null);
-      append_dep_list(&mut values, manifest.get("base"));
-      append_dep_list(&mut values, manifest.get("kmod"));
-      append_dep_list(&mut values, manifest.get("app"));
+    // A source read through its entry descriptor keeps one index per backend;
+    // a schema-2 source keeps all of them in `data`. Both are read here so a
+    // dependency is never invisible just because of the layout it arrived in.
+    for packages in repo_package_sets(repo) {
+      for package in packages {
+        let manifest = package.get("manifest").unwrap_or(&Value::Null);
+        append_dep_list(&mut values, manifest.get("base"));
+        append_dep_list(&mut values, manifest.get("kmod"));
+        append_dep_list(&mut values, manifest.get("app"));
+      }
     }
   }
 

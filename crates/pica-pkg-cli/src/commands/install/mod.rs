@@ -7,9 +7,10 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID, E_REPO_INVALID,
   E_VERSION_INCOMPATIBLE, conf_get_i18n, ensure_dirs,
 };
-use crate::candidate::find_pica_candidates_in_index;
+use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
 use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
+use crate::source;
 use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
 use crate::system::{fetch_url, need_cmd};
 use pica_pkg_core::PICA_VERSION;
@@ -164,7 +165,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
   if candidates.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("package not found in pica repos: {selector}"),
+      format!("package not found in pica repos: {selector}{}", not_found_hint(app)),
     ));
   }
 
@@ -202,17 +203,22 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  let download_url = if let Some(url) = &best.download_url {
-    if !is_supported_url(url) {
-      return Err(CliError::new(
+  // `download_url` is used whenever the index publishes one; a relative value
+  // is resolved against the source root, which is the same base the descriptor
+  // uses. The `/packages/` form stays as the fallback for indexes written
+  // before `download_url` was universal.
+  let download_url = match &best.download_url {
+    Some(url) if is_supported_url(url) => url.clone(),
+    Some(url) => source::join_child(&best.url, url).map_err(|err| {
+      CliError::new(
         E_REPO_INVALID,
-        format!("{}: invalid download_url for {}: {url}", best.repo, best.pkgname),
-      ));
-    }
-    url.clone()
-  } else {
-    format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename)
+        format!("{}: invalid download_url for {}: {}", best.repo, best.pkgname, err.message),
+      )
+    })?,
+    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
   };
+
+  let policy = source::download_policy(&best.url, best.allow_insecure_http);
 
   let cache_pkgs = app.paths.cache_dir.join("pkgs");
   pica_pkg_core::io::ensure_dir(&cache_pkgs).map_err(CliError::from)?;
@@ -221,7 +227,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
   app.log_info(format!("Downloading {} ({}) from {}...", best.pkgname, best.cmpver, best.repo));
   let raw = fetch_url(
     &download_url,
-    is_supported_url,
+    policy,
     app.options.fetch_timeout,
     app.options.fetch_retry,
     app.options.fetch_retry_delay,
@@ -274,9 +280,11 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
     let cached = cache_pkgs.join(guessed);
 
     app.log_info(format!("Downloading pkg from URL: {source}"));
+    // A URL the user typed is the trust anchor itself, so it is not held to
+    // the rules a source has to satisfy.
     let raw = fetch_url(
       source,
-      is_supported_url,
+      source::FetchPolicy::explicit(),
       app.options.fetch_timeout,
       app.options.fetch_retry,
       app.options.fetch_retry_delay,

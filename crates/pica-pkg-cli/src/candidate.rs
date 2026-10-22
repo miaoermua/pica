@@ -1,7 +1,7 @@
 use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::{ArchVerdict, HostArches, check_arch, detect_os, detect_package_arches};
-use crate::state::read_json_file;
+use crate::state::{read_json_file, repo_package_sets};
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::pkgver_cmp_key;
 use serde_json::Value;
@@ -39,6 +39,45 @@ fn arch_offerable(app: &App, host_arches: &OnceCell<HostArches>, pkg_arch: &str)
   !matches!(check_arch(pkg_arch, host_arches), ArchVerdict::Mismatch)
 }
 
+/// A clause for the "not found" error that says which backends each synced
+/// source actually offers.
+///
+/// The distinction matters: a package that exists only in a backend this source
+/// does not publish is a different problem from a misspelled name, and saying
+/// which backends were searched keeps the client from quietly answering with
+/// the wrong artifact.
+#[must_use]
+pub(crate) fn not_found_hint(app: &App) -> String {
+  let backend = app
+    .package_manager()
+    .map_or_else(|_| "unknown".to_string(), |manager| manager.kind().as_str().to_string());
+
+  let Ok(index) = read_json_file(&app.paths.index_file) else {
+    return format!(" (backend {backend}; no synced sources, run -S first)");
+  };
+  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
+    return format!(" (backend {backend}; no synced sources, run -S first)");
+  };
+
+  if repos.is_empty() {
+    return format!(" (backend {backend}; no synced sources, run -S first)");
+  }
+
+  let mut parts = Vec::new();
+  for (name, repo) in repos {
+    let provided = match repo.get("backends").and_then(Value::as_array) {
+      Some(list) if !list.is_empty() => {
+        list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+      }
+      // A schema-2 source carries every backend in one file.
+      _ => "every backend (schema 2)".to_string(),
+    };
+    parts.push(format!("{name} provides {provided}"));
+  }
+
+  format!(" (backend {backend}; {})", parts.join("; "))
+}
+
 /// The search itself, judged against a host the caller names.
 ///
 /// Split from the entry point so a test can state the host instead of asking
@@ -64,13 +103,17 @@ fn find_candidates_for_host(
 
   for (repo_name, repo_entry) in repos {
     let repo_url = repo_entry.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-    let Some(packages) =
-      repo_entry.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
-    else {
+    let allow_insecure_http =
+      repo_entry.get("allow_insecure_http").and_then(Value::as_bool).unwrap_or(false);
+    // The entry descriptor layout keeps one index per backend; the schema-2
+    // layout keeps them all in `data`. Both are searched, and the backend each
+    // entry declares still decides whether it can be installed here.
+    let package_sets = repo_package_sets(repo_entry);
+    if package_sets.is_empty() {
       continue;
-    };
+    }
 
-    for pkg in packages {
+    for pkg in package_sets.iter().flat_map(|packages| packages.iter()) {
       let pkgname = pkg.get("pkgname").and_then(Value::as_str).unwrap_or("").to_string();
       let appname = pkg.get("appname").and_then(Value::as_str).unwrap_or(&pkgname).to_string();
       let branch = pkg.get("branch").and_then(Value::as_str).unwrap_or("").to_string();
@@ -158,6 +201,7 @@ fn find_candidates_for_host(
         min_pica,
         sha256,
         pkgname,
+        allow_insecure_http,
       });
     }
   }
@@ -205,6 +249,10 @@ pub(crate) struct RepoCandidate {
   pub(crate) min_pica: Option<String>,
   pub(crate) sha256: String,
   pub(crate) pkgname: String,
+  /// The source's own answer to "may a public host be reached over plain
+  /// HTTP". It travels with the candidate so the download is judged by the
+  /// policy of the source that offered it, not by a global setting.
+  pub(crate) allow_insecure_http: bool,
 }
 
 #[cfg(test)]
@@ -276,8 +324,121 @@ mod tests {
     fs::write(&app.paths.index_file, index.to_string()).expect("write index");
   }
 
+  /// One synced entry-descriptor source: one index per backend, exactly as
+  /// `-S` stores it.
+  fn write_backend_indexes(app: &App, indexes: &[(&str, Vec<Value>)]) {
+    let mut map = serde_json::Map::new();
+    for (mgr, packages) in indexes {
+      map.insert(
+        (*mgr).to_string(),
+        json!({
+          "url": format!("https://repo.invalid/main/{mgr}/index.json"),
+          "schema": 1,
+          "mgr": mgr,
+          "packages": packages,
+        }),
+      );
+    }
+
+    let index = json!({
+      "repos": {
+        "main": {
+          "url": "https://repo.invalid/main",
+          "kind": "entry",
+          "backends": indexes.iter().map(|(mgr, _)| *mgr).collect::<Vec<_>>(),
+          "indexes": map,
+        }
+      }
+    });
+    fs::create_dir_all(&app.paths.state_dir).expect("create state dir");
+    fs::write(&app.paths.index_file, index.to_string()).expect("write index");
+  }
+
+  fn backend_entry(pkgname: &str, version: &str, pkgmgr: &str) -> Value {
+    json!({
+      "pkgname": pkgname,
+      "appname": pkgname,
+      "pkgver": version,
+      "pkgrel": "1",
+      "platform": "all",
+      "arch": "all",
+      "pkgmgr": pkgmgr,
+      "os": "all",
+      "filename": format!("{pkgname}-{version}-1-all-{pkgmgr}.pkg.tar.gz"),
+      "sha256": "0".repeat(64),
+    })
+  }
+
   fn kernel(uname: &str) -> HostArches {
     HostArches::Kernel { uname: uname.to_string() }
+  }
+
+  #[test]
+  fn the_same_name_in_two_backends_stays_two_packages() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let app = test_app(tmp.path());
+    write_backend_indexes(
+      &app,
+      &[
+        ("opkg", vec![backend_entry("demo", "2.0.0", "opkg")]),
+        ("pica", vec![backend_entry("demo", "1.0.0", "pica")]),
+      ],
+    );
+
+    // This host runs the pica backend, so the opkg artifact of the same name is
+    // a different package and must not be offered — not even as a fallback.
+    let found =
+      find_candidates_for_host(&app, "demo", &OnceCell::from(kernel("x86_64"))).expect("search");
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].pkgmgr, "pica");
+    assert_eq!(found[0].pkgver, "1.0.0");
+  }
+
+  #[test]
+  fn every_index_of_a_source_is_searched() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let app = test_app(tmp.path());
+    write_backend_indexes(
+      &app,
+      &[
+        ("opkg", vec![backend_entry("other", "1.0.0", "opkg")]),
+        ("pica", vec![backend_entry("demo", "1.0.0", "pica")]),
+      ],
+    );
+
+    let found =
+      find_candidates_for_host(&app, "demo", &OnceCell::from(kernel("x86_64"))).expect("search");
+
+    assert_eq!(found.len(), 1, "a match in any backend's index is a match");
+    assert_eq!(found[0].pkgname, "demo");
+  }
+
+  #[test]
+  fn a_source_states_whether_its_public_host_may_be_plain_http() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let app = test_app(tmp.path());
+    let mut index = json!({
+      "repos": {
+        "main": {
+          "url": "http://mirror.lan/main",
+          "allow_insecure_http": true,
+          "data": { "packages": [backend_entry("demo", "1.0.0", "pica")] },
+        }
+      }
+    });
+    fs::create_dir_all(&app.paths.state_dir).expect("create state dir");
+    fs::write(&app.paths.index_file, index.to_string()).expect("write index");
+
+    let found =
+      find_candidates_for_host(&app, "demo", &OnceCell::from(kernel("x86_64"))).expect("search");
+    assert!(found[0].allow_insecure_http, "the source's own answer travels with the candidate");
+
+    index["repos"]["main"]["allow_insecure_http"] = json!(false);
+    fs::write(&app.paths.index_file, index.to_string()).expect("rewrite index");
+    let found =
+      find_candidates_for_host(&app, "demo", &OnceCell::from(kernel("x86_64"))).expect("search");
+    assert!(!found[0].allow_insecure_http);
   }
 
   #[test]

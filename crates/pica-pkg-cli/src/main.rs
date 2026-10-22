@@ -7,6 +7,7 @@ mod installed;
 mod lock;
 mod pkgmgr;
 mod platform;
+mod source;
 mod state;
 mod system;
 

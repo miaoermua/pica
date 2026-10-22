@@ -91,6 +91,163 @@ pub fn parse_repo_json(content: &str) -> PicaResult<PackageIndex> {
   Ok(parsed)
 }
 
+/// Version of the entry descriptor (`index.json`) at a source root.
+pub const ENTRY_SCHEMA: i64 = 1;
+/// Version of one backend's index, reachable from an entry descriptor.
+pub const BACKEND_INDEX_SCHEMA: i64 = 1;
+
+/// Where one backend's index lives, relative to the entry descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryManager {
+  pub path: String,
+}
+
+/// The `index.json` a source root serves: which backends it provides and where
+/// their indexes are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryDescriptor {
+  pub schema: i64,
+  #[serde(default)]
+  pub name: Option<String>,
+  #[serde(default)]
+  pub description: Option<String>,
+  pub managers: std::collections::BTreeMap<String, EntryManager>,
+  #[serde(flatten)]
+  pub extra: Map<String, Value>,
+}
+
+/// One backend's view of a source, split out of the `repo.json` it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendIndex {
+  pub schema: i64,
+  pub mgr: String,
+  #[serde(default)]
+  pub generated_at: Option<String>,
+  pub packages: Vec<Package>,
+  #[serde(flatten)]
+  pub extra: Map<String, Value>,
+}
+
+/// # Errors
+/// Returns an error when the descriptor is not schema 1, declares no manager,
+/// names an unsupported backend, or gives a path that is not safely relative.
+pub fn parse_entry_descriptor(content: &str) -> PicaResult<EntryDescriptor> {
+  let parsed: EntryDescriptor = serde_json::from_str(content)?;
+  if parsed.schema != ENTRY_SCHEMA {
+    return Err(PicaError::msg(format!("entry descriptor schema must be {ENTRY_SCHEMA}")));
+  }
+  if parsed.managers.is_empty() {
+    return Err(PicaError::msg("entry descriptor declares no managers"));
+  }
+
+  for (mgr, entry) in &parsed.managers {
+    if !SUPPORTED_PKGMGRS.contains(&mgr.as_str()) {
+      return Err(PicaError::msg(format!(
+        "entry descriptor: unsupported manager {mgr} (supported: {})",
+        SUPPORTED_PKGMGRS.join(", ")
+      )));
+    }
+    if let Some(reason) = relative_path_problem(&entry.path) {
+      return Err(PicaError::msg(format!(
+        "entry descriptor: manager {mgr} path {:?}: {reason}",
+        entry.path
+      )));
+    }
+  }
+
+  Ok(parsed)
+}
+
+/// # Errors
+/// Returns an error when the index is not schema 1, belongs to another backend
+/// than `expected_mgr`, or carries a package that belongs to another backend.
+/// The `mgr` check is the second half of package identity: a source cannot
+/// smuggle an `opkg` entry into its `apk` index, and a client never has to
+/// re-derive a backend from a filename.
+pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<BackendIndex> {
+  let parsed: BackendIndex = serde_json::from_str(content)?;
+  if parsed.schema != BACKEND_INDEX_SCHEMA {
+    return Err(PicaError::msg(format!(
+      "backend index schema must be {BACKEND_INDEX_SCHEMA}, got {}",
+      parsed.schema
+    )));
+  }
+  if parsed.mgr != expected_mgr {
+    return Err(PicaError::msg(format!(
+      "backend index declares manager {}, but it was fetched as {expected_mgr}",
+      parsed.mgr
+    )));
+  }
+
+  for pkg in &parsed.packages {
+    if pkg.pkgmgr != parsed.mgr {
+      return Err(PicaError::msg(format!(
+        "package {}: pkgmgr {} does not match the index's {}",
+        pkg.pkgname, pkg.pkgmgr, parsed.mgr
+      )));
+    }
+  }
+
+  validate_packages(&parsed.packages)?;
+  Ok(parsed)
+}
+
+/// Whether `path` is a relative path a source may hand a client: no scheme, no
+/// absolute root, no parent segment, no encoding tricks, no query or fragment.
+///
+/// Returns the reason it is unusable, so the caller can say why instead of
+/// printing a bare rejection.
+#[must_use]
+pub fn relative_path_problem(path: &str) -> Option<&'static str> {
+  if path.is_empty() {
+    return Some("empty path");
+  }
+  if path.starts_with('/') || path.starts_with('\\') {
+    return Some("must not start at the root");
+  }
+  if path.contains('\\') {
+    return Some("must use / as its separator");
+  }
+  if path.contains('%') {
+    return Some("must not use percent-encoding");
+  }
+  if path.contains('?') || path.contains('#') {
+    return Some("must not carry a query or fragment");
+  }
+  if path.contains(':') {
+    return Some("must not carry a scheme or a drive letter");
+  }
+
+  for segment in path.split('/') {
+    if segment.is_empty() {
+      return Some("must not contain an empty segment");
+    }
+    if segment == "." || segment == ".." {
+      return Some("must not contain . or ..");
+    }
+    if !segment.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+    {
+      return Some("may only use ASCII letters, digits, . _ and -");
+    }
+  }
+
+  None
+}
+
+fn validate_download_url(pkgname: &str, value: &str) -> PicaResult<()> {
+  if is_supported_url(value) {
+    return Ok(());
+  }
+
+  if let Some(reason) = relative_path_problem(value) {
+    return Err(PicaError::msg(format!(
+      "package {pkgname}: invalid download_url {value:?}: {reason}"
+    )));
+  }
+
+  Ok(())
+}
+
 /// # Errors
 /// Returns an error if the schema version is wrong or any package entry is invalid.
 pub fn validate(repo: &PackageIndex) -> PicaResult<()> {
@@ -98,7 +255,14 @@ pub fn validate(repo: &PackageIndex) -> PicaResult<()> {
     return Err(PicaError::msg(format!("schema must be {REPO_SCHEMA}")));
   }
 
-  for pkg in &repo.packages {
+  validate_packages(&repo.packages)
+}
+
+/// # Errors
+/// Returns an error naming the first package entry that breaks the rules every
+/// index shares, whichever file it came from.
+pub fn validate_packages(packages: &[Package]) -> PicaResult<()> {
+  for pkg in packages {
     if pkg.pkgname.is_empty()
       || pkg.pkgver.is_empty()
       || pkg.pkgrel.is_empty()
@@ -125,12 +289,7 @@ pub fn validate(repo: &PackageIndex) -> PicaResult<()> {
     validate_sha256(pkg)?;
 
     if let Some(download_url) = &pkg.download_url {
-      if !is_supported_url(download_url) {
-        return Err(PicaError::msg(format!(
-          "package {}: invalid download_url {}",
-          pkg.pkgname, download_url
-        )));
-      }
+      validate_download_url(pkg.pkgname.as_str(), download_url)?;
     }
   }
 
@@ -218,7 +377,10 @@ pub fn is_supported_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{Package, REPO_SCHEMA, filename_suffix, package_filename, parse_repo_json};
+  use super::{
+    BACKEND_INDEX_SCHEMA, Package, REPO_SCHEMA, filename_suffix, package_filename,
+    parse_backend_index, parse_entry_descriptor, parse_repo_json, relative_path_problem,
+  };
   use serde_json::{Value, json};
 
   fn entry(filename: &str, pkgmgr: &str) -> Value {
@@ -383,5 +545,142 @@ mod tests {
       json!({"nested": [1, 2, 3]}),
       "sync must not strip fields the struct does not model"
     );
+  }
+
+  fn descriptor(managers: &Value) -> String {
+    json!({
+      "schema": super::ENTRY_SCHEMA,
+      "name": "official",
+      "description": "test source",
+      "managers": managers,
+    })
+    .to_string()
+  }
+
+  #[test]
+  fn an_entry_descriptor_says_which_backends_a_source_provides() {
+    let parsed = parse_entry_descriptor(&descriptor(&json!({
+      "opkg": {"path": "opkg/index.json"},
+      "pica": {"path": "pica/index.json"},
+    })))
+    .expect("valid descriptor");
+
+    assert_eq!(
+      parsed.managers.keys().collect::<Vec<_>>(),
+      vec!["opkg", "pica"],
+      "the descriptor is the only place a source advertises its backends"
+    );
+    assert_eq!(parsed.managers["opkg"].path, "opkg/index.json");
+  }
+
+  #[test]
+  fn an_entry_descriptor_may_not_name_a_backend_we_cannot_install_with() {
+    let err =
+      parse_entry_descriptor(&descriptor(&json!({"pacman": {"path": "pacman/index.json"}})))
+        .expect_err("undeclared backend");
+    assert!(err.to_string().contains("unsupported manager pacman"), "{err}");
+  }
+
+  #[test]
+  fn an_entry_descriptor_may_not_point_outside_itself() {
+    for path in [
+      "../secret/index.json",
+      "/etc/index.json",
+      "https://elsewhere.invalid/index.json",
+      "opkg/../../index.json",
+      "opkg%2f..%2findex.json",
+      "opkg/index.json?x=1",
+      "opkg\\index.json",
+      "",
+    ] {
+      let err =
+        parse_entry_descriptor(&descriptor(&json!({"opkg": {"path": path}}))).expect_err(path);
+      assert!(
+        err.to_string().contains("path"),
+        "the error must say which field is wrong for {path:?}: {err}"
+      );
+    }
+  }
+
+  #[test]
+  fn an_entry_descriptor_must_declare_something() {
+    let err = parse_entry_descriptor(&descriptor(&json!({}))).expect_err("empty managers");
+    assert!(err.to_string().contains("declares no managers"), "{err}");
+  }
+
+  fn backend_index(mgr: &str, packages: &[Value]) -> String {
+    json!({
+      "schema": BACKEND_INDEX_SCHEMA,
+      "mgr": mgr,
+      "generated_at": "2026-10-20T00:00:00Z",
+      "packages": packages,
+    })
+    .to_string()
+  }
+
+  #[test]
+  fn a_backend_index_is_read_as_the_backend_that_was_asked_for() {
+    let parsed = parse_backend_index(
+      &backend_index("opkg", &[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg")]),
+      "opkg",
+    )
+    .expect("valid opkg index");
+
+    assert_eq!(parsed.mgr, "opkg");
+    assert_eq!(parsed.packages.len(), 1);
+  }
+
+  #[test]
+  fn a_backend_index_for_another_backend_is_not_used() {
+    let err = parse_backend_index(
+      &backend_index("opkg", &[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg")]),
+      "apk",
+    )
+    .expect_err("mgr must match the path it came from");
+    assert!(err.to_string().contains("declares manager opkg"), "{err}");
+  }
+
+  #[test]
+  fn a_backend_index_may_not_smuggle_in_another_backends_package() {
+    let err = parse_backend_index(
+      &backend_index("apk", &[entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg")]),
+      "apk",
+    )
+    .expect_err("same name in another backend is another package");
+    assert!(err.to_string().contains("does not match"), "{err}");
+  }
+
+  #[test]
+  fn a_backend_index_is_held_to_the_same_package_rules_as_repo_json() {
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    pkg["sha256"] = json!("xyz");
+    let err = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect_err("bad hash");
+    assert!(err.to_string().contains("sha256"), "{err}");
+  }
+
+  #[test]
+  fn a_download_url_may_be_relative_to_the_source_root() {
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    pkg["download_url"] = json!("opkg/hello-1.0.0-1-all-opkg.pkg.tar.gz");
+    parse_repo_json(&index(&[pkg])).expect("a relative download_url is resolved by the client");
+  }
+
+  #[test]
+  fn a_download_url_may_not_climb_out_of_the_source() {
+    for bad in ["../../etc/passwd", "/etc/passwd", "opkg/../../x.pkg.tar.gz", "opkg%2f..%2fx"] {
+      let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+      pkg["download_url"] = json!(bad);
+      let err = parse_repo_json(&index(&[pkg])).expect_err(bad);
+      assert!(err.to_string().contains("download_url"), "{bad}: {err}");
+    }
+  }
+
+  #[test]
+  fn path_problems_are_named_for_the_user() {
+    assert_eq!(relative_path_problem("apk/index.json"), None);
+    assert_eq!(relative_path_problem("index.json"), None);
+    assert!(relative_path_problem("../index.json").is_some());
+    assert!(relative_path_problem("a//b").is_some());
+    assert!(relative_path_problem("/index.json").is_some());
   }
 }
