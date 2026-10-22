@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use crate::app::{CliError, CliResult, E_IO, E_LOCK_BUSY, E_RUNTIME};
+use crate::i18n::{Key, Lang};
 
 pub struct LockGuard {
   lock_dir: PathBuf,
 }
 
 impl LockGuard {
-  pub fn acquire(lock_file: &Path) -> CliResult<Self> {
+  pub fn acquire(lock_file: &Path, lang: Lang) -> CliResult<Self> {
     if let Some(parent) = lock_file.parent() {
       ensure_dir(parent)?;
     }
@@ -24,32 +25,26 @@ impl LockGuard {
       Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
         if let Some(lock_holder) = read_lock_pid(&lock_dir) {
           if pid_is_running(lock_holder) {
-            return Err(CliError::new(
-              E_LOCK_BUSY,
-              format!(
-                "cannot lock pica database: {} exists (held by pid {lock_holder})",
-                lock_dir.display()
-              ),
-            ));
+            let path = lock_dir.display().to_string();
+            let pid = lock_holder.to_string();
+            return Err(CliError::new(E_LOCK_BUSY, lang.args(Key::LockBusy, &[&path, &pid])));
           }
         }
 
         fs::remove_dir_all(&lock_dir).map_err(|remove_err| {
+          let path = lock_dir.display().to_string();
           CliError::new(
             E_RUNTIME,
-            format!(
-              "cannot lock pica database: stale lock cleanup failed for {}: {remove_err}",
-              lock_dir.display()
-            ),
+            lang.args(Key::LockCleanupFailed, &[&path, &remove_err.to_string()]),
           )
         })?;
 
         fs::create_dir(&lock_dir).map_err(|retry_err| {
-          CliError::new(E_RUNTIME, format!("cannot lock pica database: {retry_err}"))
+          CliError::new(E_RUNTIME, lang.args(Key::LockFailed, &[&retry_err.to_string()]))
         })?;
       }
       Err(err) => {
-        return Err(CliError::new(E_RUNTIME, format!("cannot lock pica database: {err}")));
+        return Err(CliError::new(E_RUNTIME, lang.args(Key::LockFailed, &[&err.to_string()])));
       }
     }
 
@@ -95,6 +90,7 @@ fn ensure_dir(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
   use super::LockGuard;
+  use crate::i18n::Lang;
   use std::fs;
   use std::path::PathBuf;
   use std::time::{SystemTime, UNIX_EPOCH};
@@ -118,7 +114,8 @@ mod tests {
     fs::write(lock_dir.join("pid"), "999999").expect("write stale pid");
 
     {
-      let _guard = LockGuard::acquire(&lock_file).expect("must acquire after stale cleanup");
+      let _guard =
+        LockGuard::acquire(&lock_file, Lang::EnUs).expect("must acquire after stale cleanup");
       assert!(lock_dir.exists());
     }
 
@@ -136,7 +133,7 @@ mod tests {
     fs::create_dir_all(&lock_dir).expect("create lock dir");
     fs::write(lock_dir.join("pid"), std::process::id().to_string()).expect("write live pid");
 
-    match LockGuard::acquire(&lock_file) {
+    match LockGuard::acquire(&lock_file, Lang::EnUs) {
       Ok(_) => panic!("must fail when holder is alive"),
       Err(err) => assert!(err.message.contains("held by pid")),
     }

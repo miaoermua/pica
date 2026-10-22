@@ -1,19 +1,21 @@
 use crate::app::{
   App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, ensure_dirs,
 };
-use crate::candidate::find_pica_candidates_in_index;
+use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
+use crate::i18n::Key;
 use crate::installed;
+use crate::source;
 use crate::state::read_json_file;
 use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
-fn installed_entry<'a>(db: &'a Value, pkgname: &str) -> CliResult<&'a Value> {
+fn installed_entry<'a>(app: &App, db: &'a Value, pkgname: &str) -> CliResult<&'a Value> {
   db.get("installed")
     .and_then(Value::as_object)
     .and_then(|installed| installed.get(pkgname))
-    .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))
+    .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))
 }
 
 fn entry_manifest(entry: &Value) -> &Value {
@@ -79,10 +81,8 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
 
   let candidates = find_pica_candidates_in_index(app, selector)?;
   if candidates.is_empty() {
-    return Err(CliError::new(
-      E_CONFIG_INVALID,
-      format!("package not found in pica repos: {selector}"),
-    ));
+    let hint = not_found_hint(app);
+    return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::NotFound, &[selector, &hint])));
   }
 
   let mut best = &candidates[0];
@@ -92,10 +92,11 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
-  let download_url = if let Some(url) = &best.download_url {
-    url.clone()
-  } else {
-    format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename)
+  // `-Si` shows the address the install would actually use, so a relative
+  // `download_url` is resolved here the same way.
+  let download_url = match &best.download_url {
+    Some(url) => source::join_child(&best.url, url).unwrap_or_else(|_| url.clone()),
+    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
   };
 
   println!("Repository      : {}", best.repo);
@@ -144,7 +145,7 @@ fn field(label: &str, value: &str) {
 pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
-  let entry = installed_entry(&db, pkgname)?;
+  let entry = installed_entry(app, &db, pkgname)?;
   let manifest = entry_manifest(entry);
 
   // What the row is, as opposed to what it says about itself: always there.
@@ -252,7 +253,7 @@ fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
 pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
   let db = read_json_file(&app.paths.db_file)?;
-  let entry = installed_entry(&db, pkgname)?;
+  let entry = installed_entry(app, &db, pkgname)?;
 
   for item in entry.get("files").and_then(Value::as_array).into_iter().flatten() {
     if let Some(path) = item.as_str() {

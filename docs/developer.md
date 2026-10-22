@@ -21,7 +21,8 @@
 .
   crates/
     pica-pkg-core/    归档、manifest、repo.json 与基础 IO
-    pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/后端）
+    pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/初始化向导/后端）
+                       src/i18n.rs 放界面语言与全部用户可见文本
     pica-pkg-pack/    pica-pack 命令（构建与打包）
   docs/
     standard.md
@@ -80,7 +81,7 @@ platform = all 时省略 platform 段
 - **基础设施**：`sh` 提供主控与生命周期解析，需保证能够正常调用 BusyBox applet。
 - **环境强制依赖**：原生解包工具 `tar`（JSON 解析、状态存储与校验均由 Rust 侧实现，不再依赖 `jq`）。
 - **底层后端策略**：执行 `-U/-R` 的安装和卸载操作时，`opkg` / `apk` 后端通过调用系统包管理器驱动 `manifest` 中填写的 `app/base/kmod` 执行最终动作；`pkgmgr = pica` 时由 Pica 部署 `root/`、执行生命周期脚本；这类归档不携带 `pkgs/`，带了会在写入任何文件之前被拒绝。
-- **公网连接支持优先级**：`uclient-fetch` -> `wget` -> `curl`。
+- **公网连接支持优先级**：`curl` -> `wget` -> `uclient-fetch`。前两者被要求不要自动跟随重定向，由 `fetch_url` 逐跳检查目标后再决定是否继续；`uclient-fetch` 无法在跟随前报告 `Location`，因此退化为单次抓取（其自身重定向上限生效），这条路径上的包仍受索引 `sha256` 约束。`file://` 源不需要任何下载器，工具在第一次真正需要下载时才探测。
 
 ### 状态目录（VFS Layout）
 
@@ -116,9 +117,18 @@ OpenWrt 的包管理容忍度低（尤其是修改同一个清单或写入），
 PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 ```
 
+### 界面语言（i18n）
+
+- 语言与文本都在 `src/i18n.rs`：`Lang`（`EnUs` / `ZhCn`）负责解析代码、决定配置读写；`Key` 是唯一的文本键，`Lang::text(key)` 取正文，`Lang::args(key, &[...])` 先替换 `{0}`/`{1}` 再用。业务代码里不写语言判断，也不写裸的英文句子。
+- 语言来源优先级：`--lang` > `pica.json` 的 `language` > 英文。`--lang` 只在本次运行生效，不回写配置；写错的代码或未知语言一律按英文继续，不让一个手写配置把工具变成砖头。
+- 加一条文案：在 `Key` 里加一个变体，在 `english()` / `chinese()` 两张表各补一行，并加进 `ALL_KEYS`。两张表都是穷尽 `match`，漏一处编译不过；`ALL_KEYS` 驱动的测试还会检查两边的 `{n}` 占位符个数一致。
+- 不翻译的东西：包名、命令、配置键、协议字段、文件路径、`E_*` 错误码，以及 `--help` / `--version` / `-Qi` 的字段名。`--json-errors` 的 `code` 恒定，只有 `message` 随语言变。
+- 第三方工具的错误原文不丢：本地化的只是外层句式，原始输出（`opkg`/`apk` 的输出、`io::Error` 的文本）作为参数塞进占位符。
+
 ### 命令底层微观事务工作流
 
-- **同步（-S）**：单纯读取配置表的 `url` 到临时队列 -> 下发至后端请求工具并发或串行抓取 `repo.json`。
+- **同步（-S）**：读取配置表的 `url`（源根地址）-> 按该源的 `backends` 抓 `<root>/index.json` 入口描述与对应后端索引；没有 `backends` 时先按旧行为抓 `<root>/repo.json`，不可用才回退入口描述 -> 校验后写入 `state/index.json` 的 `repos.<name>`（`kind` / `backends` / `entry` / `indexes`）。
+- **地址与策略（`src/source.rs`）**：`join_child` 把源发布的相对路径拼到根地址上，`join_sibling` 把入口描述给的 manager path 拼到描述文件所在目录，两者都要求安全相对路径；`FetchPolicy` 决定哪些 scheme 与主机可被抓取（公网明文默认拒绝、局域网允许、`file://` 只对本地源开放、重定向禁止 https→http），下载与同步共用同一份判定。
 - **索引刷新防抖（-U 生命周期部分）**：
   - 当通过 `-S` 引发的远程依赖（base/app/kmod）安装前发现缺少依赖必须拉外网资源执行 `opkg install` 之前。
   - Pica 会先探测本机的依赖索引状态，只有缺索引才会调用昂贵的 `opkg update` / `apk update`：`opkg` 精确到每个 feed 的列表文件（`lists_dir` 下的同名文件），`apk` 精确到每个仓库的缓存文件（`APKINDEX.<索引 URL 的 sha256 前 4 字节>.tar.gz`），因此能说出**是哪一个源**没有索引。因为缓存文件名就是索引 URL 的摘要，仓库列表或 `arch` 一改，期望的文件名随之改变，不需要再比较修改时间。

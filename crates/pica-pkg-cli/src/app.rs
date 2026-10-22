@@ -1,3 +1,4 @@
+use crate::i18n::{Key, Lang};
 use crate::state::{read_json_file, write_json_atomic_pretty};
 use pica_pkg_core::error::PicaError;
 use serde_json::{Value, json};
@@ -26,6 +27,9 @@ pub const E_PACKAGE_INVALID: &str = "E_PACKAGE_INVALID";
 pub const E_PLATFORM_UNSUPPORTED: &str = "E_PLATFORM_UNSUPPORTED";
 pub const E_VERSION_INCOMPATIBLE: &str = "E_VERSION_INCOMPATIBLE";
 pub const E_INTEGRITY_INVALID: &str = "E_INTEGRITY_INVALID";
+/// Something that can only be answered by a person, asked where there is none.
+pub const E_NOT_INTERACTIVE: &str = "E_NOT_INTERACTIVE";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonMode {
   None,
@@ -122,6 +126,9 @@ pub struct Options {
   pub pkgmgr: Option<String>,
   /// What to do with the optional dependencies in a manifest.
   pub optional_deps: OptionalDeps,
+  /// Explicit `--lang` value. Overrides the configured language for this run
+  /// only; it is never written back to the configuration.
+  pub lang: Option<Lang>,
 }
 
 #[derive(Debug)]
@@ -159,12 +166,16 @@ pub struct App {
   pub apk_force_non_repository: bool,
   pub json_last_phase: String,
   pub json_has_text: bool,
+  /// The language this run speaks: `--lang`, else the configured `language`,
+  /// else English. Setup changes it mid-run once the user has picked one.
+  pub lang: Lang,
 }
 
 impl App {
   pub fn new(paths: Paths, options: Options) -> Self {
     let backend = crate::pkgmgr::detect_kind();
     let apk_force_non_repository = true;
+    let lang = options.lang.unwrap_or_else(|| conf_get_language(&paths.conf_file));
     Self {
       paths,
       options,
@@ -173,7 +184,42 @@ impl App {
       apk_force_non_repository,
       json_last_phase: String::new(),
       json_has_text: false,
+      lang,
     }
+  }
+
+  /// The text for `key` in this run's language.
+  pub fn text(&self, key: Key) -> &'static str {
+    self.lang.text(key)
+  }
+
+  /// The text for `key` with its placeholders filled in.
+  pub fn args(&self, key: Key, args: &[&str]) -> String {
+    self.lang.args(key, args)
+  }
+
+  /// A localized progress line, with the same `::` prefix as [`App::log_info`].
+  pub fn info(&mut self, key: Key) {
+    let message = self.text(key);
+    self.log_info(message);
+  }
+
+  /// A localized progress line with placeholders.
+  pub fn info_args(&mut self, key: Key, args: &[&str]) {
+    let message = self.args(key, args);
+    self.log_info(message);
+  }
+
+  /// A localized warning, with the same `warning:` prefix as [`App::log_warn`].
+  pub fn warn(&mut self, key: Key) {
+    let message = self.text(key);
+    self.log_warn(message);
+  }
+
+  /// A localized warning with placeholders.
+  pub fn warn_args(&mut self, key: Key, args: &[&str]) {
+    let message = self.args(key, args);
+    self.log_warn(message);
   }
 
   pub fn package_manager(&self) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
@@ -292,6 +338,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut pkgmgr = None;
   let mut optional_deps = OptionalDeps::Ask;
   let mut optional_given = false;
+  let mut lang = None;
   let mut positional = Vec::new();
 
   let mut index = 0;
@@ -324,43 +371,42 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
         index += 1;
       }
       "--feed-policy" => {
-        let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_POLICY_INVALID, "--feed-policy requires <mode>"));
-        };
+        let value = flag_value(args, index, "--feed-policy", "<mode>", E_POLICY_INVALID)?;
         feed_policy = FeedPolicy::parse(value).ok_or_else(|| {
           CliError::new(E_POLICY_INVALID, format!("invalid --feed-policy: {value}"))
         })?;
         index += 2;
       }
       "--fetch-timeout" => {
-        let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_CONFIG_INVALID, "--fetch-timeout requires <seconds>"));
-        };
+        let value = flag_value(args, index, "--fetch-timeout", "<seconds>", E_CONFIG_INVALID)?;
         fetch_timeout = parse_positive_u64_option("--fetch-timeout", value)?;
         index += 2;
       }
       "--fetch-retry" => {
-        let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_CONFIG_INVALID, "--fetch-retry requires <count>"));
-        };
+        let value = flag_value(args, index, "--fetch-retry", "<count>", E_CONFIG_INVALID)?;
         fetch_retry = parse_u32_option("--fetch-retry", value)?;
         index += 2;
       }
       "--fetch-retry-delay" => {
-        let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_CONFIG_INVALID, "--fetch-retry-delay requires <seconds>"));
-        };
+        let value = flag_value(args, index, "--fetch-retry-delay", "<seconds>", E_CONFIG_INVALID)?;
         fetch_retry_delay = parse_u64_option("--fetch-retry-delay", value)?;
         index += 2;
       }
       "--pkgmgr" => {
-        let Some(value) = args.get(index + 1) else {
-          return Err(CliError::new(E_CONFIG_INVALID, "--pkgmgr requires <opkg|apk|pica>"));
-        };
+        let value = flag_value(args, index, "--pkgmgr", "<opkg|apk|pica>", E_CONFIG_INVALID)?;
         if crate::pkgmgr::PackageManagerKind::parse(value).is_none() {
           return Err(CliError::new(E_CONFIG_INVALID, format!("invalid --pkgmgr: {value}")));
         }
         pkgmgr = Some(value.clone());
+        index += 2;
+      }
+      // The interface language for this run only. What is stored stays stored.
+      "--lang" | "--language" => {
+        let value = flag_value(args, index, "--lang", "<zh-CN|en-US>", E_CONFIG_INVALID)?;
+        lang = Some(
+          Lang::parse(value)
+            .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid --lang: {value}")))?,
+        );
         index += 2;
       }
       other => {
@@ -380,9 +426,21 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       fetch_retry_delay,
       pkgmgr,
       optional_deps,
+      lang,
     },
     positional,
   ))
+}
+
+/// The value a flag takes, or an error naming the flag and what it accepts.
+fn flag_value<'a>(
+  args: &'a [String],
+  index: usize,
+  flag: &str,
+  takes: &str,
+  code: &'static str,
+) -> CliResult<&'a String> {
+  args.get(index + 1).ok_or_else(|| CliError::new(code, format!("{flag} requires {takes}")))
 }
 
 fn parse_positive_u64_option(flag: &str, value: &str) -> CliResult<u64> {
@@ -530,6 +588,16 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
   conf
     .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
     .unwrap_or_else(|| "zh-cn".to_string())
+}
+
+/// The interface language stored in the configuration, or the default.
+///
+/// A config file that cannot be read or parsed is not an error here: every
+/// command that needs the configuration reports that on its own, and refusing
+/// to print a message because the language is unknown would hide the real
+/// problem. An unknown value is the default for the same reason.
+pub(crate) fn conf_get_language(conf_file: &Path) -> Lang {
+  read_json_file(conf_file).map_or(Lang::default(), |conf| Lang::from_config(&conf))
 }
 
 #[cfg(test)]

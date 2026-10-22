@@ -152,6 +152,57 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。
 
+## 软件源地址：根地址、入口描述与后端索引
+
+一个软件源由**根地址**标识（`repos[].url`），下面三样东西的位置都由它推出，客户端不假设固定域名：
+
+```
+<root>/index.json          入口描述（schema 1）
+<root>/<managers[].path>   各后端索引（schema 1）
+<root>/repo.json           旧格式（schema 2），仍受支持
+```
+
+入口描述：
+
+```json
+{
+  "schema": 1,
+  "name": "official",
+  "description": "...",
+  "managers": {
+    "opkg": { "path": "opkg/index.json" },
+    "pica": { "path": "pica/index.json" }
+  }
+}
+```
+
+- `schema` 必须为 `1`；`managers` 必须非空，键只能是 `opkg` / `apk` / `pica`。
+- `managers[].path` 必须是**安全的相对路径**，相对入口描述文件所在目录解析：不得以 `/` 或 `\` 开头、不得含 `..` / `.` 段、不得含 `%`、不得含 query/fragment、不得含 `:`，只用 ASCII 字母数字与 `. _ -`。
+- 客户端只为「该源 `backends` 启用的后端」抓索引；某个启用的后端未被入口描述声明时直接报错，列出源实际声明了什么，不静默改用其他后端。
+
+后端索引：
+
+```json
+{ "schema": 1, "mgr": "opkg", "generated_at": "...", "packages": [ ... ] }
+```
+
+- `schema` 必须为 `1`；`mgr` 必须与取它的入口一致（`opkg` 索引里出现 `mgr: "apk"` 属错误）。
+- 每个条目的 `pkgmgr` 必须等于索引的 `mgr`：同名不同后端是不同包，不能互相顶替。
+- 条目字段、`filename` 约束、`sha256` 要求与下文 `repo.json` 完全一致。
+
+兼容与缓存：
+
+- 源条目没有 `backends` 时按旧行为读 `<root>/repo.json`；该文件不可用时才回退入口描述，并抓取它声明的全部后端（`-S` 会提示这次回退）。
+- 索引缓存是 `state/index.json` 的 `repos.<name>`，记录 `kind`（`legacy` / `entry`）、`backends`、`entry`（入口地址与 schema）、`indexes.<mgr>`（地址、`mgr`、`schema`、抓取时间、条目）。缓存键含源身份与启用的后端：换组合必须重新 `-S`。
+- 读取时两种布局都认：`indexes.*.packages` 与旧的 `data.packages`。
+
+## 下载地址与协议策略
+
+- `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，与入口描述里的 manager path 同一套校验。
+- 公网明文 HTTP 默认拒绝；本机回环、私有网段、链路本地地址允许明文 HTTP（局域网自建源就是这类）；每个源可用 `allow_insecure_http` 单独放行公网明文。远端源不得通过 `file://` 让客户端读本机文件，本地源与旧格式索引不受此限。
+- 重定向逐跳检查：每一跳都按上述策略重新判定，最多 5 跳；`https` 不得重定向到 `http`。
+- `sha256` 校验失败即失败：不换用其他地址、不重试下一个源、不进入缓存。
+
 ## repo.json 强约束（schema + filename）
 
 `pica -S` 同步阶段会对 `repo.json` 做严格校验：
@@ -180,7 +231,7 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 - 未识别的额外字段会被原样保留（`flatten`），不会在同步时丢失
 
 安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与 `repo.json` 的 `sha256` 一致，否则失败。
-- 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，用于覆盖默认下载路径
+- 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，或一条安全的相对路径（相对源根地址解析），用于覆盖默认下载路径
 
 同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 

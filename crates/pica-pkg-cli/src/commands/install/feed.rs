@@ -254,6 +254,7 @@ mod tests {
         fetch_retry_delay: 1,
         pkgmgr: None,
         optional_deps: OptionalDeps::None,
+        lang: None,
       },
     )
   }

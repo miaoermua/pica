@@ -1,6 +1,7 @@
 use super::install;
 use crate::app::{App, CliResult, ensure_dirs};
 use crate::candidate::find_pica_candidates_in_index;
+use crate::i18n::Key;
 use crate::installed;
 use crate::state::read_json_file;
 use pica_pkg_core::constraint;
@@ -13,7 +14,7 @@ pub fn all(app: &mut App) -> CliResult<()> {
 
   let db = read_json_file(&app.paths.db_file)?;
   let Some(installed) = db.get("installed").and_then(Value::as_object) else {
-    app.log_info("No pica packages to upgrade");
+    app.info(Key::UpgradeNone);
     return Ok(());
   };
 
@@ -61,7 +62,7 @@ pub fn all(app: &mut App) -> CliResult<()> {
   }
 
   if candidates.is_empty() {
-    app.log_info("No pica packages to upgrade");
+    app.info(Key::UpgradeNone);
     return Ok(());
   }
 
@@ -70,7 +71,8 @@ pub fn all(app: &mut App) -> CliResult<()> {
   for (pkgname, selector, installed_ver) in candidates {
     let repo_candidates = find_pica_candidates_in_index(app, &selector)?;
     if repo_candidates.is_empty() {
-      app.log_warn(format!("Skip {pkgname}: not found in index"));
+      let name = pkgname.clone();
+      app.warn_args(Key::UpgradeSkip, &[&name]);
       continue;
     }
 
@@ -82,7 +84,9 @@ pub fn all(app: &mut App) -> CliResult<()> {
     }
 
     if pkgver_ge(&installed_ver, &best_ver) {
-      app.log_info(format!("Up to date: {pkgname} ({installed_ver})"));
+      let name = pkgname.clone();
+      let version = installed_ver.clone();
+      app.info_args(Key::UpgradeUpToDate, &[&name, &version]);
       continue;
     }
 
@@ -95,7 +99,7 @@ pub fn all(app: &mut App) -> CliResult<()> {
   if updated_any {
     recheck_constraints(app)?;
   } else {
-    app.log_info("All packages are up to date");
+    app.info(Key::UpgradeAllUpToDate);
   }
 
   Ok(())

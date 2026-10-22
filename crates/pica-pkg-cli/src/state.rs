@@ -183,6 +183,33 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   Ok(())
 }
 
+/// Every package list one synced repo entry holds.
+///
+/// A source read through an entry descriptor keeps one index per backend under
+/// `indexes`; a schema-2 source keeps all of them in `data`. Callers that only
+/// want "the packages of this source" should not have to know which layout they
+/// are looking at, and must not silently see an empty list for the other one.
+#[must_use]
+pub(crate) fn repo_package_sets(repo: &Value) -> Vec<&[Value]> {
+  let mut sets = Vec::new();
+
+  if let Some(indexes) = repo.get("indexes").and_then(Value::as_object) {
+    for index in indexes.values() {
+      if let Some(packages) = index.get("packages").and_then(Value::as_array) {
+        sets.push(packages.as_slice());
+      }
+    }
+  }
+
+  if let Some(packages) =
+    repo.get("data").and_then(|data| data.get("packages")).and_then(Value::as_array)
+  {
+    sets.push(packages.as_slice());
+  }
+
+  sets
+}
+
 /// Drops the cached packages left by this run.
 ///
 /// Silent on success: the cache is Pica's own bookkeeping, and a user who asked
