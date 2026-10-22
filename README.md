@@ -26,6 +26,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 
 ## CLI（当前支持）
 
+- `pica setup`：交互式初始化（界面语言、软件源、每个源启用的后端，随后同步）
 - `pica -S`：同步 pica 仓库索引（repo.json -> index.json）
 - `pica -S <appname>`：按应用名安装（默认：自动在 opkg/pica 源之间决策）
 - `pica -Su`：升级所有已安装的 pica 包（从 index.json 选择最新版本并安装）
@@ -34,6 +35,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 - `pica -So <appname>`：强制走系统包管理器安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
 - `pica -Sp <appname>`：强制走 pica 镜像源安装（从 repo.json 解析并下载 pkg.tar.gz）
 - `pica --pkgmgr <opkg|apk|pica>`：指定安装后端（优先级：`--pkgmgr` > manifest > `pica.json` > 自动探测）
+- `pica --lang <zh-CN|en-US>`：本次运行的界面语言（只影响本次，不写回配置）
 - `pica -U <pkgfile>`：从本地 `.pkg.tar.gz` 安装/更新（类似 pacman -U）
 - `pica -R <pkgname>`：卸载（不处理依赖关系）
 - `pica -Q`：列出已安装的 pica 包
@@ -70,14 +72,22 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 
 ```json
 {
-  "repos": [],
+  "language": "zh-CN",
+  "repos": [
+    {
+      "name": "main",
+      "url": "https://example.com/pica/r",
+      "backends": ["opkg", "pica"]
+    }
+  ],
   "i18n": "zh-cn",
   "apk_force_non_repository": true
 }
 ```
 
-- `repos[]`：pica 仓库列表（`pica -S` 同步与 `pica -Si/-Sp` 查询/安装使用）
-- `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，不影响 pica 自身输出语言）
+- `language`：pica 自身的界面语言，`zh-CN` 或 `en-US`（缺省、写错或写了不支持的语言都按英文）；由 `pica setup` 写入，`pica --lang` 可临时覆盖
+- `repos[]`：pica 仓库列表（`pica -S` 同步与 `pica -Si/-Sp` 查询/安装使用）；`backends` 是该源启用的后端组合，不写则按旧的 `repo.json` 方式读取
+- `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，与 `language` 无关，不影响 pica 自身输出语言）
 - `apk_force_non_repository`（默认 `true`）：apk 后端安装 Pica 归档中的本地 `.apk` 时是否加 `--force-non-repository`。OpenWrt 25.12 起的 apk-tools 3.x 会拒绝不属于任何仓库的软件包，因此默认开启；Pica 会先读 `apk --version`，2.x 不传该参数。详见 `docs/standard.md`
 
 ---

@@ -1,5 +1,6 @@
 use crate::app::{App, CliError, CliResult, E_ARG_INVALID, ensure_dirs};
 use crate::format;
+use crate::i18n::{Key, Lang};
 use crate::installed::entry_backend;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_del_installed, read_json_file};
@@ -24,11 +25,11 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     .and_then(Value::as_object)
     .and_then(|installed| installed.get(pkgname))
     .cloned()
-    .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))?;
+    .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))?;
   let manifest = entry
     .get("manifest")
     .cloned()
-    .ok_or_else(|| CliError::new(E_ARG_INVALID, format!("not installed: {pkgname}")))?;
+    .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))?;
 
   let script_remove = manifest_get_scalar(&manifest, "script_remove");
   // How the package was installed is the only correct way to uninstall it, so
@@ -39,13 +40,17 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   let kind = backend.kind;
   let pkgmgr = kind.as_str().to_string();
   if backend.is_inferred() {
-    app.log_warn(format!("{pkgname}: backend {}; using {pkgmgr}", backend.origin.as_str()));
+    let origin = backend.origin.as_str().to_string();
+    let name = pkgname.to_string();
+    let using = pkgmgr.clone();
+    app.warn_args(Key::RemoveBackendInferred, &[&name, &origin, &using]);
   }
 
   app.select_package_manager(kind.as_str())?;
   // The version is the one the database recorded for the package being taken
   // away, not whatever the index offers now.
-  app.log_info(removal_header(pkgname, &recorded_version(&manifest)));
+  let header = removal_header(app.lang, pkgname, &recorded_version(&manifest));
+  app.log_info(header);
 
   let remove_target = if script_remove.starts_with('/') || script_remove.is_empty() {
     script_remove.clone()
@@ -75,7 +80,7 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
 
   if kind.requires_system_binary() {
     for package_name in remove_set {
-      app.log_info(format!("Removing {pkgmgr} package: {package_name}"));
+      app.info_args(Key::RemovePackage, &[&pkgmgr, &package_name]);
       app.package_manager()?.remove(&package_name)?;
     }
   }
@@ -95,12 +100,13 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
 
   // What actually happened, not what the record claimed: a path that was gone
   // already is counted as neither removed nor kept.
-  if let Some(line) = removal_summary(outcome.removed, kept_owned, outcome.kept, &pkgmgr) {
+  let summary = removal_summary(app.lang, outcome.removed, kept_owned, outcome.kept, &pkgmgr);
+  if let Some(line) = summary {
     app.log_info(format!("  {line}"));
   }
 
   db_del_installed(&app.paths.db_file, pkgname)?;
-  app.log_info("Transaction completed");
+  app.info(Key::TransactionCompleted);
   Ok(())
 }
 
@@ -151,11 +157,11 @@ fn exclude_system_owned(
 
 /// `Removing tailscale (1.104.1-1)`, or just the name when the record has no
 /// version to show.
-fn removal_header(pkgname: &str, version: &str) -> String {
+fn removal_header(lang: Lang, pkgname: &str, version: &str) -> String {
   if version.is_empty() {
-    format!("Removing {pkgname}")
+    lang.args(Key::RemoveHeader, &[pkgname])
   } else {
-    format!("Removing {pkgname} ({version})")
+    lang.args(Key::RemoveHeaderVersioned, &[pkgname, version])
   }
 }
 
@@ -178,6 +184,7 @@ fn recorded_version(manifest: &Value) -> String {
 /// ownership that refused to delete. The reason is only stated when every kept
 /// file has it: a failed unlink is not "owned by opkg".
 fn removal_summary(
+  lang: Lang,
   removed: usize,
   kept_owned: usize,
   kept_failed: usize,
@@ -187,13 +194,19 @@ fn removal_summary(
     return None;
   }
 
-  let mut line = format!("Removed {}", format::files(removed));
+  let removed_text = format::files(lang, removed);
   let kept = kept_owned + kept_failed;
-  if kept > 0 {
-    let reason = if kept_failed == 0 { format!(" owned by {pkgmgr}") } else { String::new() };
-    line = format!("{line}; kept {}{reason}", format::files(kept));
+  if kept == 0 {
+    return Some(lang.args(Key::RemoveSummaryOnly, &[&removed_text]));
   }
-  Some(line)
+
+  let kept_text = format::files(lang, kept);
+  let kept_text = if kept_failed == 0 {
+    lang.args(Key::RemoveSummaryOwned, &[&kept_text, pkgmgr])
+  } else {
+    kept_text
+  };
+  Some(lang.args(Key::RemoveSummary, &[&removed_text, &kept_text]))
 }
 
 fn run_script(app: &mut App, script_rel: &str, label: &str) -> CliResult<()> {
@@ -208,37 +221,39 @@ fn run_script(app: &mut App, script_rel: &str, label: &str) -> CliResult<()> {
   };
 
   if !script_path.is_file() {
-    app.log_info(format!(
-      "Skip {label} script: {script_rel} (not found at {})",
-      script_path.display()
-    ));
+    let path = script_path.display().to_string();
+    app.info_args(Key::RemoveSkipScript, &[label, script_rel, &path]);
     return Ok(());
   }
 
-  app.log_info(format!("Running {label} script: {script_rel}"));
+  app.info_args(Key::RemoveRunScript, &[label, script_rel]);
   run_command_capture_output("sh", &[script_path.to_string_lossy().as_ref()]).map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
   use super::{recorded_version, removal_header, removal_summary};
+  use crate::i18n::Lang;
   use pretty_assertions::assert_eq;
   use serde_json::json;
 
   #[test]
   fn the_header_names_the_version_the_record_holds() {
-    assert_eq!(removal_header("demo", "1.0.0-1"), "Removing demo (1.0.0-1)");
-    assert_eq!(removal_header("demo", ""), "Removing demo");
+    assert_eq!(removal_header(Lang::EnUs, "demo", "1.0.0-1"), "Removing demo (1.0.0-1)");
+    assert_eq!(removal_header(Lang::EnUs, "demo", ""), "Removing demo");
   }
 
   #[test]
   fn the_summary_says_what_was_removed_and_what_survived() {
     assert_eq!(
-      removal_summary(4, 1, 0, "opkg").as_deref(),
+      removal_summary(Lang::EnUs, 4, 1, 0, "opkg").as_deref(),
       Some("Removed 4 files; kept 1 file owned by opkg")
     );
-    assert_eq!(removal_summary(4, 0, 1, "pica").as_deref(), Some("Removed 4 files; kept 1 file"));
-    assert_eq!(removal_summary(0, 0, 0, "pica"), None);
+    assert_eq!(
+      removal_summary(Lang::EnUs, 4, 0, 1, "pica").as_deref(),
+      Some("Removed 4 files; kept 1 file")
+    );
+    assert_eq!(removal_summary(Lang::EnUs, 0, 0, 0, "pica"), None);
   }
 
   #[test]

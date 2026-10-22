@@ -21,7 +21,8 @@
 .
   crates/
     pica-pkg-core/    归档、manifest、repo.json 与基础 IO
-    pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/后端）
+    pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/初始化向导/后端）
+                       src/i18n.rs 放界面语言与全部用户可见文本
     pica-pkg-pack/    pica-pack 命令（构建与打包）
   docs/
     standard.md
@@ -115,6 +116,14 @@ OpenWrt 的包管理容忍度低（尤其是修改同一个清单或写入），
 ```bash
 PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 ```
+
+### 界面语言（i18n）
+
+- 语言与文本都在 `src/i18n.rs`：`Lang`（`EnUs` / `ZhCn`）负责解析代码、决定配置读写；`Key` 是唯一的文本键，`Lang::text(key)` 取正文，`Lang::args(key, &[...])` 先替换 `{0}`/`{1}` 再用。业务代码里不写语言判断，也不写裸的英文句子。
+- 语言来源优先级：`--lang` > `pica.json` 的 `language` > 英文。`--lang` 只在本次运行生效，不回写配置；写错的代码或未知语言一律按英文继续，不让一个手写配置把工具变成砖头。
+- 加一条文案：在 `Key` 里加一个变体，在 `english()` / `chinese()` 两张表各补一行，并加进 `ALL_KEYS`。两张表都是穷尽 `match`，漏一处编译不过；`ALL_KEYS` 驱动的测试还会检查两边的 `{n}` 占位符个数一致。
+- 不翻译的东西：包名、命令、配置键、协议字段、文件路径、`E_*` 错误码，以及 `--help` / `--version` / `-Qi` 的字段名。`--json-errors` 的 `code` 恒定，只有 `message` 随语言变。
+- 第三方工具的错误原文不丢：本地化的只是外层句式，原始输出（`opkg`/`apk` 的输出、`io::Error` 的文本）作为参数塞进占位符。
 
 ### 命令底层微观事务工作流
 

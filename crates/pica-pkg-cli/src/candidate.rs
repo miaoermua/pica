@@ -1,4 +1,5 @@
 use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
+use crate::i18n::Key;
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::{ArchVerdict, HostArches, check_arch, detect_os, detect_package_arches};
 use crate::state::{read_json_file, repo_package_sets};
@@ -52,15 +53,17 @@ pub(crate) fn not_found_hint(app: &App) -> String {
     .package_manager()
     .map_or_else(|_| "unknown".to_string(), |manager| manager.kind().as_str().to_string());
 
+  let unsynced = || app.args(Key::NotFoundHintSources, &[&backend]);
+
   let Ok(index) = read_json_file(&app.paths.index_file) else {
-    return format!(" (backend {backend}; no synced sources, run -S first)");
+    return unsynced();
   };
   let Some(repos) = index.get("repos").and_then(Value::as_object) else {
-    return format!(" (backend {backend}; no synced sources, run -S first)");
+    return unsynced();
   };
 
   if repos.is_empty() {
-    return format!(" (backend {backend}; no synced sources, run -S first)");
+    return unsynced();
   }
 
   let mut parts = Vec::new();
@@ -70,12 +73,12 @@ pub(crate) fn not_found_hint(app: &App) -> String {
         list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
       }
       // A schema-2 source carries every backend in one file.
-      _ => "every backend (schema 2)".to_string(),
+      _ => app.text(Key::NotFoundHintLegacy).to_string(),
     };
-    parts.push(format!("{name} provides {provided}"));
+    parts.push(app.args(Key::Provides, &[name, &provided]));
   }
 
-  format!(" (backend {backend}; {})", parts.join("; "))
+  app.args(Key::NotFoundHintRepos, &[&backend, &parts.join("; ")])
 }
 
 /// The search itself, judged against a host the caller names.
@@ -288,6 +291,7 @@ mod tests {
       fetch_retry_delay: 0,
       pkgmgr: None,
       optional_deps: OptionalDeps::None,
+      lang: None,
     };
 
     let mut app = App::new(paths, options);

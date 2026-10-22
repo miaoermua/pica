@@ -10,6 +10,7 @@ use crate::app::{
   E_RUNTIME, E_VERSION_INCOMPATIBLE, FeedPolicy, ensure_dirs, resolve_lang,
 };
 use crate::format;
+use crate::i18n::{Key, Lang};
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_installed_version, db_set_installed, report_set_install_result};
@@ -283,8 +284,8 @@ fn size_lines(sizes: IndexSizes) -> Vec<String> {
 /// `files` is the payload's file list, which holds the symlinks as well as the
 /// regular files; `size` sums the bytes of the regular files it wrote. Created
 /// directories are not counted as files.
-fn install_summary(payload: &PayloadInstall) -> String {
-  format!("Installed {}, {}", format::files(payload.files.len()), format::bytes(payload.size))
+fn install_summary(lang: Lang, payload: &PayloadInstall) -> String {
+  format!("Installed {}, {}", format::files(lang, payload.files.len()), format::bytes(payload.size))
 }
 
 /// Installs an artifact file into the running system's root.
@@ -1145,29 +1146,25 @@ fn abandon(
   tx: &mut InstallTransaction,
   err: CliError,
 ) -> CliError {
-  app.log_warn(format!("{}: install failed, rolling back", ctx.pkgname));
+  let name = ctx.pkgname.to_string();
+  app.warn_args(Key::InstallRollingBack, &[&name]);
 
   let leftovers = tx.rollback(app, ctx);
   if leftovers.is_empty() {
-    app.log_warn(format!("{}: rolled back to the previous state", ctx.pkgname));
+    app.warn_args(Key::InstallRolledBack, &[&name]);
     return err;
   }
 
-  app.log_warn(format!(
-    "{}: rollback left {} path(s) behind: {}",
-    ctx.pkgname,
-    leftovers.len(),
-    leftovers.join(" ")
-  ));
+  let count = leftovers.len().to_string();
+  let paths = leftovers.join(" ");
+  app.warn_args(Key::InstallRollbackLeftovers, &[&name, &count, &paths]);
 
   if let Err(record_err) = record_installation(app, ctx, precheck, tx, true) {
-    app.log_warn(format!(
-      "{}: could not record the partial install: {}",
-      ctx.pkgname, record_err.message
-    ));
+    let message = record_err.message.clone();
+    app.warn_args(Key::InstallRollbackRecordFailed, &[&name, &message]);
   }
 
-  CliError::new(err.code, format!("{}; rollback incomplete, see the warnings above", err.message))
+  CliError::new(err.code, app.args(Key::InstallRollbackIncomplete, &[&err.message]))
 }
 
 /// Step 9: writes the completed install to the database.
@@ -1230,10 +1227,11 @@ fn record_installation(
   // native backend prints its own summary, and counting Pica's containers for it
   // would be a second, different answer to the same question.
   if !failed && !app.backend().requires_system_binary() && !payload.files.is_empty() {
-    app.log_info(install_summary(&payload));
+    let summary = install_summary(app.lang, &payload);
+    app.log_info(summary);
   }
 
-  app.log_info("Transaction completed");
+  app.info(Key::TransactionCompleted);
 
   Ok(())
 }
@@ -1282,6 +1280,7 @@ arch = all
       fetch_retry_delay: 0,
       pkgmgr: None,
       optional_deps: OptionalDeps::None,
+      lang: None,
     };
 
     let mut app = App::new(paths, options);
@@ -1903,7 +1902,7 @@ arch = all
       size: 1536,
     };
 
-    assert_eq!(install_summary(&payload), "Installed 2 files, 1.5 KiB");
+    assert_eq!(install_summary(Lang::EnUs, &payload), "Installed 2 files, 1.5 KiB");
   }
 
   #[test]

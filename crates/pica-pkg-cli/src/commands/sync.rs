@@ -1,6 +1,7 @@
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, E_REPO_INVALID, ensure_dirs,
 };
+use crate::i18n::{Key, Lang};
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_platform;
 use crate::source::{self, FetchPolicy};
@@ -17,21 +18,27 @@ const SUPPORTED_BACKENDS: &str = "opkg, apk, pica";
 
 pub fn repos(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  app.log_info("Synchronizing package databases...");
+  app.info(Key::SyncStarted);
 
   let conf = read_json_file(&app.paths.conf_file)?;
-  let repos = conf.get("repos").and_then(Value::as_array).ok_or_else(|| {
+  let missing_repos = || {
     CliError::new(
       E_CONFIG_INVALID,
-      format!("no repos configured in {}", app.paths.conf_file.display()),
+      app.args(Key::SyncNoRepos, &[&app.paths.conf_file.display().to_string()]),
     )
-  })?;
+  };
+  let repos = match conf.get("repos") {
+    Some(value) => value.as_array().cloned().ok_or_else(|| {
+      CliError::new(
+        E_CONFIG_INVALID,
+        app.args(Key::SyncReposNotArray, &[&app.paths.conf_file.display().to_string()]),
+      )
+    })?,
+    None => return Err(missing_repos()),
+  };
 
   if repos.is_empty() {
-    return Err(CliError::new(
-      E_CONFIG_INVALID,
-      format!("no repos configured in {}", app.paths.conf_file.display()),
-    ));
+    return Err(missing_repos());
   }
 
   let host_platform = detect_platform();
@@ -52,10 +59,12 @@ pub fn repos(app: &mut App) -> CliResult<()> {
       repo_entry.get("allow_insecure_http").and_then(Value::as_bool).unwrap_or(false);
 
     if name.is_empty() {
-      return Err(CliError::new(E_CONFIG_INVALID, format!("repo[{repo_index}] missing name")));
+      let index = repo_index.to_string();
+      return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::SyncRepoMissingName, &[&index])));
     }
     if url.is_empty() {
-      return Err(CliError::new(E_CONFIG_INVALID, format!("repo[{repo_index}] missing url")));
+      let index = repo_index.to_string();
+      return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::SyncRepoMissingUrl, &[&index])));
     }
 
     // The root is what every address below it is derived from, and what the
@@ -63,12 +72,12 @@ pub fn repos(app: &mut App) -> CliResult<()> {
     // configuration error, not a repository one.
     let policy = FetchPolicy::source(allow_insecure_http);
     policy.check(url).map_err(|err| {
-      CliError::new(E_CONFIG_INVALID, format!("{name}: source root {url}: {}", err.message))
+      CliError::new(E_CONFIG_INVALID, app.args(Key::SyncRootRejected, &[name, url, &err.message]))
     })?;
 
-    let wanted = configured_backends(repo_index, name, repo_entry)?;
+    let wanted = configured_backends(app.lang, repo_index, name, repo_entry)?;
 
-    app.log_info(format!("{name} downloading..."));
+    app.info_args(Key::SyncDownloading, &[name]);
 
     let effective_platform =
       if repo_platform.is_empty() { host_platform.clone() } else { repo_platform.to_string() };
@@ -85,10 +94,7 @@ pub fn repos(app: &mut App) -> CliResult<()> {
           let Ok(declared) = all_declared_backends(app, url, policy) else {
             return Err(legacy_error);
           };
-          app.log_warn(format!(
-            "{name}: repo.json unavailable, using index.json (declares: {})",
-            join_backends(&declared)
-          ));
+          app.warn_args(Key::SyncFallback, &[name, &join_backends(&declared)]);
           let mut body = sync_from_descriptor(app, name, url, &declared, policy, now)?;
           body["legacy_error"] = json!(legacy_error.message);
           body
@@ -119,7 +125,7 @@ pub fn repos(app: &mut App) -> CliResult<()> {
       .ok_or_else(|| CliError::new(E_INDEX_INVALID, "index repos is not object"))?;
     index_repos.insert(name.to_string(), repo_obj);
 
-    app.log_info(format!("{name} updated"));
+    app.info_args(Key::SyncUpdated, &[name]);
   }
 
   write_json_atomic_pretty(&app.paths.index_file, &index)?;
@@ -132,6 +138,7 @@ pub fn repos(app: &mut App) -> CliResult<()> {
 /// written. `None` means the configuration predates the key and the source is
 /// read the old way.
 fn configured_backends(
+  lang: Lang,
   repo_index: usize,
   name: &str,
   repo_entry: &Value,
@@ -140,21 +147,20 @@ fn configured_backends(
     return Ok(None);
   };
   let list = value.as_array().ok_or_else(|| {
-    CliError::new(
-      E_CONFIG_INVALID,
-      format!("repo[{repo_index}] ({name}) backends must be an array of backend names"),
-    )
+    let index = repo_index.to_string();
+    CliError::new(E_CONFIG_INVALID, lang.args(Key::SyncBackendsNotArray, &[&index, name]))
   })?;
 
   let mut backends = Vec::new();
   for item in list {
     let text = item.as_str().map_or("", str::trim);
     let kind = PackageManagerKind::parse(text).ok_or_else(|| {
+      let index = repo_index.to_string();
       CliError::new(
         E_CONFIG_INVALID,
-        format!(
-          "repo[{repo_index}] ({name}) backends contains unsupported backend {text:?} \
-           (supported: {SUPPORTED_BACKENDS})"
+        lang.args(
+          Key::SyncUnsupportedBackend,
+          &[&index, name, &format!("{text:?}"), SUPPORTED_BACKENDS],
         ),
       )
     })?;
@@ -164,9 +170,10 @@ fn configured_backends(
   }
 
   if backends.is_empty() {
+    let index = repo_index.to_string();
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("repo[{repo_index}] ({name}) backends is empty; name at least one backend"),
+      lang.args(Key::SyncBackendsEmpty, &[&index, name]),
     ));
   }
 
@@ -190,11 +197,11 @@ fn fetch_text(
     app.options.fetch_retry_delay,
   )
   .map_err(|err| {
-    CliError::new(err.code, format!("{name}: fetching {what} from {url} failed: {}", err.message))
+    CliError::new(err.code, app.args(Key::SyncFetchFailed, &[name, what, url, &err.message]))
   })?;
 
   String::from_utf8(raw)
-    .map_err(|_| CliError::new(E_REPO_INVALID, format!("{name}: {what} at {url} is not UTF-8")))
+    .map_err(|_| CliError::new(E_REPO_INVALID, app.args(Key::SyncNotUtf8, &[name, what, url])))
 }
 
 /// The schema-2 layout: one `repo.json` describing every package of a source.
@@ -211,7 +218,7 @@ fn sync_legacy(
   let parsed = parse_repo_json(&text).map_err(|error| {
     CliError::new(
       E_REPO_INVALID,
-      format!("{name}: repo.json at {repo_url} failed strict schema/filename validation: {error}"),
+      app.args(Key::SyncRepoInvalid, &[name, &repo_url, &error.to_string()]),
     )
   })?;
 
@@ -242,7 +249,10 @@ fn sync_from_descriptor(
   let text = fetch_text(app, name, "index.json", &entry_url, policy)?;
 
   let descriptor = parse_entry_descriptor(&text).map_err(|error| {
-    CliError::new(E_REPO_INVALID, format!("{name}: index.json at {entry_url} is invalid: {error}"))
+    CliError::new(
+      E_REPO_INVALID,
+      app.args(Key::SyncEntryInvalid, &[name, &entry_url, &error.to_string()]),
+    )
   })?;
 
   let declared: Vec<&str> = descriptor.managers.keys().map(String::as_str).collect();
@@ -257,11 +267,13 @@ fn sync_from_descriptor(
   if !missing.is_empty() {
     return Err(CliError::new(
       E_REPO_INVALID,
-      format!(
-        "{name}: source does not provide backend(s) {} (declares: {}); \
-         adjust its backends list or use a source that does",
-        join_backends(&missing.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
-        join_backends(&declared.iter().map(|m| (*m).to_string()).collect::<Vec<_>>())
+      app.args(
+        Key::SyncMissingBackend,
+        &[
+          name,
+          &join_backends(&missing.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
+          &join_backends(&declared.iter().map(|m| (*m).to_string()).collect::<Vec<_>>()),
+        ],
       ),
     ));
   }
@@ -275,7 +287,10 @@ fn sync_from_descriptor(
     let text = fetch_text(app, name, &format!("{mgr} index"), &url, policy)?;
 
     let parsed = parse_backend_index(&text, mgr).map_err(|error| {
-      CliError::new(E_REPO_INVALID, format!("{name}: {mgr} index at {url} is invalid: {error}"))
+      CliError::new(
+        E_REPO_INVALID,
+        app.args(Key::SyncIndexInvalid, &[name, mgr, &url, &error.to_string()]),
+      )
     })?;
 
     indexes.insert(
@@ -309,8 +324,12 @@ fn sync_from_descriptor(
 fn all_declared_backends(app: &App, root: &str, policy: FetchPolicy) -> CliResult<Vec<String>> {
   let entry_url = source::join_child(root, "index.json")?;
   let text = fetch_text(app, "source", "index.json", &entry_url, policy)?;
-  let descriptor = parse_entry_descriptor(&text)
-    .map_err(|error| CliError::new(E_REPO_INVALID, format!("{entry_url}: {error}")))?;
+  let descriptor = parse_entry_descriptor(&text).map_err(|error| {
+    CliError::new(
+      E_REPO_INVALID,
+      app.args(Key::SyncEntryInvalid, &["source", &entry_url, &error.to_string()]),
+    )
+  })?;
   Ok(descriptor.managers.keys().cloned().collect())
 }
 

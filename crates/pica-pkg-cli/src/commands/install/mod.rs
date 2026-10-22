@@ -8,6 +8,7 @@ use crate::app::{
   E_VERSION_INCOMPATIBLE, conf_get_i18n, ensure_dirs,
 };
 use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
+use crate::i18n::Key;
 use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
 use crate::source;
@@ -89,10 +90,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   if !app.backend().requires_system_binary() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!(
-        "{}: backend has no package manager, use selectors from pica repos instead",
-        app.backend().as_str()
-      ),
+      app.args(Key::InstallBackendNoManager, &[app.backend().as_str()]),
     ));
   }
 
@@ -118,7 +116,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   if to_install.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("{}: package not found: {appname}", package_manager.kind().as_str()),
+      app.args(Key::InstallPackageNotFound, &[package_manager.kind().as_str(), &appname]),
     ));
   }
 
@@ -163,10 +161,8 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   let candidates = find_pica_candidates_in_index(app, selector)?;
   if candidates.is_empty() {
-    return Err(CliError::new(
-      E_CONFIG_INVALID,
-      format!("package not found in pica repos: {selector}{}", not_found_hint(app)),
-    ));
+    let hint = not_found_hint(app);
+    return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::NotFound, &[selector, &hint])));
   }
 
   // Strictly greater, so the first candidate is only a baseline and equal
@@ -184,7 +180,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     if !min_pica.is_empty() && !ver_ge(PICA_VERSION, min_pica) {
       return Err(CliError::new(
         E_VERSION_INCOMPATIBLE,
-        format!("pica too old: pkg requires >= {min_pica}, cli is {PICA_VERSION}"),
+        app.args(Key::InstallPicaTooOld, &[min_pica, PICA_VERSION]),
       ));
     }
   }
@@ -192,14 +188,14 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
   if best.filename.contains('/') || !best.filename.ends_with(".pkg.tar.gz") {
     return Err(CliError::new(
       E_REPO_INVALID,
-      format!("{}: invalid filename: {}", best.repo, best.filename),
+      app.args(Key::InstallInvalidFilename, &[&best.repo, &best.filename]),
     ));
   }
 
   if best.sha256.len() != 64 || !best.sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
     return Err(CliError::new(
       E_REPO_INVALID,
-      format!("{}: invalid sha256 for {}", best.repo, best.pkgname),
+      app.args(Key::InstallInvalidSha, &[&best.repo, &best.pkgname]),
     ));
   }
 
@@ -212,7 +208,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     Some(url) => source::join_child(&best.url, url).map_err(|err| {
       CliError::new(
         E_REPO_INVALID,
-        format!("{}: invalid download_url for {}: {}", best.repo, best.pkgname, err.message),
+        app.args(Key::InstallInvalidDownloadUrl, &[&best.repo, &best.pkgname, &err.message]),
       )
     })?,
     None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
@@ -224,7 +220,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
   pica_pkg_core::io::ensure_dir(&cache_pkgs).map_err(CliError::from)?;
   let cached = cache_pkgs.join(&best.filename);
 
-  app.log_info(format!("Downloading {} ({}) from {}...", best.pkgname, best.cmpver, best.repo));
+  app.info_args(Key::InstallDownloading, &[&best.pkgname, &best.cmpver, &best.repo]);
   let raw = fetch_url(
     &download_url,
     policy,
@@ -235,15 +231,12 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   // Only a repository install has a trusted expected hash. A local file or a
   // bare URL is described by nothing but itself, so neither reaches this line.
-  app.log_info("Verifying SHA-256...");
+  app.info(Key::InstallVerifying);
   let actual_sha256 = pica_pkg_core::io::sha256_hex(&raw);
   if !actual_sha256.eq_ignore_ascii_case(&best.sha256) {
     return Err(CliError::new(
       E_INTEGRITY_INVALID,
-      format!(
-        "sha256 mismatch for {}: expected {}, got {}",
-        best.filename, best.sha256, actual_sha256
-      ),
+      app.args(Key::InstallShaMismatch, &[&best.filename, &best.sha256, &actual_sha256]),
     ));
   }
 
@@ -279,7 +272,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
     );
     let cached = cache_pkgs.join(guessed);
 
-    app.log_info(format!("Downloading pkg from URL: {source}"));
+    app.info_args(Key::InstallDownloadingUrl, &[source]);
     // A URL the user typed is the trust anchor itself, so it is not held to
     // the rules a source has to satisfy.
     let raw = fetch_url(
@@ -293,7 +286,7 @@ pub fn pkg_source(app: &mut App, source: &str, selector: Option<String>) -> CliR
     return pipeline::pkgfile(app, &cached, selector, EntrySource::Url, IndexSizes::default());
   }
 
-  Err(CliError::new(E_CONFIG_INVALID, format!("pkg source not found or unsupported URL: {source}")))
+  Err(CliError::new(E_CONFIG_INVALID, app.args(Key::InstallSourceInvalid, &[source])))
 }
 
 pub fn sanitize_cache_filename(value: &str) -> String {

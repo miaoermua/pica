@@ -1,5 +1,7 @@
 //! Formatting shared by the screens that show a size.
 
+use crate::i18n::{Key, Lang};
+
 /// A byte count the way a package manager prints one: `512 B`, `1.5 KiB`,
 /// `74.2 MiB`, `2.0 GiB`.
 ///
@@ -22,9 +24,13 @@ pub(crate) fn bytes(bytes: u64) -> String {
   format!("{bytes} B")
 }
 
-/// `1 file`, `2 files`.
-pub(crate) fn files(count: usize) -> String {
-  format!("{count} file{}", if count == 1 { "" } else { "s" })
+/// `1 file`, `2 files`, in the language the run speaks.
+pub(crate) fn files(lang: Lang, count: usize) -> String {
+  if count == 1 {
+    lang.text(Key::FileOne).to_string()
+  } else {
+    lang.args(Key::FileMany, &[&count.to_string()])
+  }
 }
 
 #[cfg(test)]
@@ -49,8 +55,8 @@ mod tests {
 
   #[test]
   fn a_single_file_is_not_pluralised() {
-    assert_eq!(files(0), "0 files");
-    assert_eq!(files(1), "1 file");
-    assert_eq!(files(2), "2 files");
+    assert_eq!(files(Lang::EnUs, 0), "0 files");
+    assert_eq!(files(Lang::EnUs, 1), "1 file");
+    assert_eq!(files(Lang::EnUs, 2), "2 files");
   }
 }
