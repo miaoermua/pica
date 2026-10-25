@@ -535,7 +535,7 @@ luci = lua1
 - 可在 `scripts/.env` 中声明保留策略：`PICA_KEEP_SCRIPT_INSTALL/PICA_KEEP_SCRIPT_UPDATE/PICA_KEEP_SCRIPT_REMOVE/PICA_KEEP_SCRIPT_ALL`（布尔值）。
 - 升级时旧的一组保留脚本不是直接删除，而是先重命名到 `/usr/lib/pica/scripts/<pkgname>.rollback`，并在旁边写一份 `<pkgname>.rollback.json`：`schema` / `txid` / `pkgname` / `pkgver` / `pkgrel` / `state`。`state=pending` 在复制新脚本**之前**写入；`state=committed` 只在 `record_installation` 返回成功后写入，因此它同时证明数据库记录已落盘——这是 marker 与数据库之间唯一的对应关系，版本号相同并不能证明任何事。
 - 备份生命周期：安装成功 → 标 `committed` → 删除备份与 marker；安装失败（含之后 `root/` 部署失败）→ 本次写入的脚本被清掉、备份改回原名恢复、marker 一并删除。
-- 下一次安装如果发现遗留的 `.rollback`：`committed` 的**删除**（旧脚本已被取代）；`pending`、marker 缺失、marker 损坏或 schema 不认识的一律**移到了 `<pkgname>.rollback.<txid>` 并原样保留**，只告警并给出新路径——它可能是这些脚本的唯一副本，不能猜它已完成。只要 marker、没有对应备份目录时（两次改名之间中断，或 marker 删除失败），marker 会被改名为 `.orphan.<txid>` 保留，不会被下一次备份覆盖。移走时目标名先用独占创建占位：那里已经有文件、空目录或非空目录时一律不改动它，按移走失败处理（本次升级不做备份，新脚本不随回滚删除）；marker 的目标名同样先占位，占不到时把备份目录移回原名，避免出现"目录走了、marker 留在原处"的错位。
+- 下一次安装如果发现遗留的 `.rollback`：`committed` 的**删除**（旧脚本已被取代）；`pending`、marker 缺失、marker 损坏或 schema 不认识的一律**移到了 `<pkgname>.rollback.<txid>` 并原样保留**，只告警并给出新路径——它可能是这些脚本的唯一副本，不能猜它已完成。marker **文件只要存在就随备份一起迁移**，解析失败也照样搬走、内容不动，不会被新备份覆盖；`committed` 的备份目录已删但 marker 删不掉时，本次升级**不做新备份**。只有 marker、没有对应备份目录时（两次改名之间中断，或 marker 删除失败），marker 会被改名为 `.orphan.<txid>` 保留；这个目标名同样先独占占位，占不到就保持原样、本次不备份。移走时目录目标名也用独占创建占位：那里已经有文件、空目录或非空目录时一律不改动它，按移走失败处理（本次升级不做备份，新脚本不随回滚删除）；marker 的目标名占不到时把备份目录移回原名，避免出现“目录走了、marker 留在原处”的错位。
 - 恢复失败时备份留在原处，路径写进错误信息，且不写进失败记录，`-R` 不会删它。marker 写不进去时，旧目录会被改回原名并继续安装（本次没有脚本回滚）；改回也失败则安装中止并报出备份路径。
 - 这套 marker 只解决"遗留备份如何安全分类与让路"，**不是完整的崩溃恢复**：进程在任意时刻被终止时，仍可能出现记录与磁盘不一致、需要人工处理的状态。
 - 每次命令事务结束都会打印 `正在清理 pica 缓存`，并清理 `/var/lib/pica/cache/pkgs/` 目录内容。

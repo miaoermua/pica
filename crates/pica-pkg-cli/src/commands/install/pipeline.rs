@@ -1286,7 +1286,10 @@ fn move_aside_scripts_backup(
     return false;
   }
 
-  if marker.is_some() && marker_path.exists() {
+  // The file's existence decides this, not whether it parses: a marker this
+  // build cannot read still belongs to the backup being moved, and leaving it
+  // at the canonical name would let the next backup overwrite it.
+  if marker_path.exists() {
     let marker_target = kept_scripts_marker(&stale);
     match fs::OpenOptions::new().write(true).create_new(true).open(&marker_target) {
       Ok(_) => {
@@ -1350,48 +1353,95 @@ fn reconcile_scripts_backup(app: &mut App, backup: &Path) -> bool {
     // are not one operation, so this is what a crash between them leaves. It
     // describes a backup that is no longer at this name, so it is moved aside —
     // never overwritten by the marker this install is about to write.
-    if marker_path.exists() {
-      let stale = PathBuf::from(format!("{}.orphan.{}", marker_path.display(), new_txid()));
-      match fs::rename(&marker_path, &stale) {
-        Ok(()) => app.log_warn(format!(
-          "a marker without its backup was found at {} and moved to {}; its backup is no longer \
-           at that path",
-          marker_path.display(),
-          stale.display()
-        )),
-        Err(err) => app.log_warn(format!(
-          "a marker without its backup is at {} and could not be moved aside ({err}); the next \
-           backup will overwrite it",
-          marker_path.display()
-        )),
-      }
-    }
-    return true;
+    return move_orphan_marker_aside(app, &marker_path, &new_txid());
   }
 
   let marker = fs::read_to_string(&marker_path).ok().and_then(|text| ScriptsMarker::parse(&text));
 
   match backup_disposition(marker.as_ref()) {
     BackupDisposition::DeleteCommitted => {
-      if let Err(err) = fs::remove_dir_all(backup) {
-        app.log_warn(format!(
-          "a finished upgrade left its previous kept scripts at {}, which could not be removed \
-           ({err}); this upgrade will not back up the current ones",
-          backup.display()
-        ));
-        return false;
-      }
-      if let Err(err) = fs::remove_file(&marker_path) {
-        app.log_warn(format!(
-          "the previous kept scripts at {} were removed, but their marker could not be ({err}); \
-           the next upgrade will move it aside",
-          backup.display()
-        ));
-      }
-      true
+      delete_committed_backup(app, backup, &marker_path, |file| fs::remove_file(file))
     }
     BackupDisposition::MoveAside => {
       move_aside_scripts_backup(app, backup, &marker_path, marker.as_ref())
+    }
+  }
+}
+
+/// Removes a backup whose transaction finished, and its marker.
+///
+/// Returns whether both canonical names are free. A marker that cannot be
+/// removed blocks the new backup: writing over it would erase the only
+/// description of a backup the next run may still need to classify.
+fn delete_committed_backup(
+  app: &mut App,
+  backup: &Path,
+  marker_path: &Path,
+  remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> bool {
+  if let Err(err) = fs::remove_dir_all(backup) {
+    app.log_warn(format!(
+      "a finished upgrade left its previous kept scripts at {}, which could not be removed \
+       ({err}); this upgrade will not back up the current ones",
+      backup.display()
+    ));
+    return false;
+  }
+
+  match remove_marker(marker_path) {
+    Ok(()) => true,
+    Err(err) => {
+      app.log_warn(format!(
+        "the previous kept scripts at {} were removed, but their marker could not be ({err}); \
+         this upgrade will not back up the current ones",
+        backup.display()
+      ));
+      false
+    }
+  }
+}
+
+/// Moves a marker that has no backup beside it out of the canonical name.
+///
+/// Returns whether the canonical name is free. The destination is claimed with
+/// an exclusive create first, so an existing file or directory there is never
+/// replaced; when the claim fails the marker stays where it is and this install
+/// takes no backup, because writing its own marker would overwrite this one.
+fn move_orphan_marker_aside(app: &mut App, marker_path: &Path, suffix: &str) -> bool {
+  if !marker_path.exists() {
+    return true;
+  }
+
+  let stale = PathBuf::from(format!("{}.orphan.{suffix}", marker_path.display()));
+  match fs::OpenOptions::new().write(true).create_new(true).open(&stale) {
+    Ok(_) => match fs::rename(marker_path, &stale) {
+      Ok(()) => {
+        app.log_warn(format!(
+          "a marker without its backup was found at {} and moved to {}; its backup is no longer \
+           at that path",
+          marker_path.display(),
+          stale.display()
+        ));
+        true
+      }
+      Err(err) => {
+        let _ = fs::remove_file(&stale);
+        app.log_warn(format!(
+          "a marker without its backup is at {} and could not be moved aside ({err}); this \
+           upgrade will not back up the current ones",
+          marker_path.display()
+        ));
+        false
+      }
+    },
+    Err(err) => {
+      app.log_warn(format!(
+        "a marker without its backup is at {}, and {} is already in the way ({err}); this upgrade \
+         will not back up the current ones",
+        marker_path.display(),
+        stale.display()
+      ));
+      false
     }
   }
 }
@@ -3021,6 +3071,106 @@ arch = all
     assert_eq!(
       fs::read_to_string(moved[0].join("stale")).expect("read the moved copy"),
       "old copy"
+    );
+    assert_eq!(
+      fs::read_to_string(PathBuf::from(format!("{}.json", moved[0].display())))
+        .expect("read the moved marker"),
+      r#"{"schema":99,"state":"committed"}"#,
+      "the marker this build cannot read travels with the backup instead of being overwritten"
+    );
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.json").exists(),
+      "and its canonical name is free"
+    );
+  }
+
+  #[test]
+  fn a_corrupt_marker_moves_with_its_backup() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+    // Not even valid JSON: the state is unknown, but the file is still the
+    // description of the backup beside it.
+    fs::write(fixture.path("usr/lib/pica/scripts/demo.rollback.json"), "{ not json")
+      .expect("write the corrupt marker");
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    assert!(!backup.exists(), "the canonical backup name is free again");
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.json").exists(),
+      "and so is the marker name"
+    );
+    let moved = moved_aside(&fixture, "demo.rollback");
+    assert_eq!(moved.len(), 1, "the backup is kept under another name: {moved:?}");
+    assert_eq!(fs::read_to_string(moved[0].join("stale")).expect("read"), "old copy");
+    assert_eq!(
+      fs::read_to_string(PathBuf::from(format!("{}.json", moved[0].display())))
+        .expect("read the moved marker"),
+      "{ not json",
+      "the corrupt marker travels with the backup instead of being overwritten"
+    );
+  }
+
+  #[test]
+  fn a_committed_backup_whose_marker_cannot_be_removed_blocks_the_next_backup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backup = dir.path().join("scripts.rollback");
+    fs::create_dir_all(&backup).expect("mkdir");
+    fs::write(backup.join("stale"), "old copy").expect("write");
+    let marker_path = dir.path().join("scripts.rollback.json");
+    fs::write(&marker_path, "anything").expect("write the marker");
+    let mut app = test_app(dir.path());
+
+    let free = delete_committed_backup(&mut app, &backup, &marker_path, |_| {
+      Err(std::io::Error::other("simulated marker removal failure"))
+    });
+
+    assert!(!free, "the canonical marker name is not free");
+    assert!(!backup.exists(), "the backup itself was removed");
+    assert!(marker_path.is_file(), "the marker it could not remove is still there");
+  }
+
+  #[test]
+  fn an_orphan_marker_whose_name_is_taken_is_left_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker_path = dir.path().join("scripts.rollback.json");
+    fs::write(&marker_path, "marker").expect("write the marker");
+    let blocker = dir.path().join("scripts.rollback.json.orphan.cafe");
+    fs::write(&blocker, "not ours").expect("write the file in the way");
+    let mut app = test_app(dir.path());
+
+    let free = move_orphan_marker_aside(&mut app, &marker_path, "cafe");
+
+    assert!(!free, "the canonical marker name is still taken");
+    assert_eq!(
+      fs::read_to_string(&blocker).expect("read the file in the way"),
+      "not ours",
+      "the occupied name is untouched"
+    );
+    assert_eq!(
+      fs::read_to_string(&marker_path).expect("read the marker"),
+      "marker",
+      "and the orphan marker stays where it was"
     );
   }
 
