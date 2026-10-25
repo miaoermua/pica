@@ -23,6 +23,37 @@ pub(crate) const GROUPS: [&str; 3] = ["kmod", "base", "app"];
 pub(crate) const BOUND_UNMET: &str =
   "the installed version does not satisfy the declared constraint";
 
+/// The bounds one declaration fails, or `None` when there is nothing to judge.
+///
+/// `Some(Vec::new())` is a verdict: the installed version was read and the bound
+/// holds. `None` is the absence of one — no bound was declared, nothing is
+/// installed, or the backend cannot report the version. The caller must keep the
+/// two apart: a bound pica never checked is not a bound that passed, and a
+/// backend that answers "installed" without a version cannot be said to satisfy
+/// anything.
+pub(crate) fn verdict(
+  app: &App,
+  requester: &str,
+  group: &str,
+  constraint: &Constraint,
+) -> Option<Vec<String>> {
+  if !constraint.has_bound() {
+    return None;
+  }
+  let package_manager = app.package_manager().ok()?;
+  if !package_manager.is_installed(&constraint.name) {
+    return None;
+  }
+  let installed = package_manager.installed_version(&constraint.name)?;
+  if constraint.is_met_by(&installed) {
+    return Some(Vec::new());
+  }
+  Some(vec![format!(
+    "{requester} requires {group}:{}, but {installed} is installed",
+    constraint.raw
+  )])
+}
+
 /// The bounds in `constraints` that the installed system does not satisfy.
 ///
 /// Each message names the package that declared the bound, the bound as it was
@@ -41,27 +72,9 @@ pub(crate) fn unmet(
   group: &str,
   constraints: &[Constraint],
 ) -> Vec<String> {
-  if constraints.iter().all(|constraint| !constraint.has_bound()) {
-    return Vec::new();
-  }
-  let Ok(package_manager) = app.package_manager() else {
-    return Vec::new();
-  };
-
-  let mut messages = Vec::new();
-  for constraint in constraints {
-    if !constraint.has_bound() || !package_manager.is_installed(&constraint.name) {
-      continue;
-    }
-    let Some(installed) = package_manager.installed_version(&constraint.name) else {
-      continue;
-    };
-    if !constraint.is_met_by(&installed) {
-      messages.push(format!(
-        "{requester} requires {group}:{}, but {installed} is installed",
-        constraint.raw
-      ));
-    }
-  }
-  messages
+  constraints
+    .iter()
+    .filter_map(|constraint| verdict(app, requester, group, constraint))
+    .flatten()
+    .collect()
 }

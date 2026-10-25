@@ -455,14 +455,26 @@ impl PackageManager for OpkgBackend {
     }
   }
 
-  fn installed(&self) -> Vec<(String, String)> {
-    let Ok(output) = Command::new("opkg").arg("list-installed").output() else {
-      return Vec::new();
-    };
+  fn installed(&self) -> CliResult<Vec<(String, String)>> {
+    let output = Command::new("opkg").arg("list-installed").output().map_err(|err| {
+      let (code, message) = if err.kind() == ErrorKind::NotFound {
+        (E_MISSING_COMMAND, "missing required command: opkg".to_string())
+      } else {
+        (E_RUNTIME, format!("opkg list-installed failed: {err}"))
+      };
+      CliError::new(code, message)
+    })?;
+    if !output.status.success() {
+      let detail = stderr_or_stdout(&output.stdout, &output.stderr);
+      return Err(CliError::new(
+        E_RUNTIME,
+        format!("opkg list-installed failed ({}): {detail}", exit_status_text(output.status)),
+      ));
+    }
     let mut packages = parse_installed_list(&String::from_utf8_lossy(&output.stdout));
     packages.sort();
     packages.dedup();
-    packages
+    Ok(packages)
   }
 
   fn depends(&self, name: &str) -> Vec<String> {

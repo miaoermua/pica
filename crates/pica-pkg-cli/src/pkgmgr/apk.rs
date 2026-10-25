@@ -286,15 +286,28 @@ impl PackageManager for ApkBackend {
     }
   }
 
-  fn installed(&self) -> Vec<(String, String)> {
-    let Ok(output) = Command::new("apk").args(["list", "--installed", "-q"]).output() else {
-      return Vec::new();
-    };
+  fn installed(&self) -> CliResult<Vec<(String, String)>> {
+    let output =
+      Command::new("apk").args(["list", "--installed", "-q"]).output().map_err(|err| {
+        let (code, message) = if err.kind() == ErrorKind::NotFound {
+          (E_MISSING_COMMAND, "missing required command: apk".to_string())
+        } else {
+          (E_RUNTIME, format!("apk list --installed failed: {err}"))
+        };
+        CliError::new(code, message)
+      })?;
+    if !output.status.success() {
+      let detail = stderr_or_stdout(&output.stdout, &output.stderr);
+      return Err(CliError::new(
+        E_RUNTIME,
+        format!("apk list --installed failed ({}): {detail}", output.status),
+      ));
+    }
     let mut packages: Vec<(String, String)> =
       String::from_utf8_lossy(&output.stdout).lines().filter_map(split_installed_line).collect();
     packages.sort();
     packages.dedup();
-    packages
+    Ok(packages)
   }
 
   fn depends(&self, name: &str) -> Vec<String> {

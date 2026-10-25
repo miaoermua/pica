@@ -441,6 +441,10 @@ fn pkgfile_into(
     return Err(abandon(app, &ctx, &precheck, &mut tx, err));
   }
 
+  // Only now is the install complete: the backup can be marked, then removed.
+  tx.mark_committed(app);
+  tx.finish(app);
+
   Ok(())
 }
 
@@ -568,9 +572,10 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   let missing = summarize_missing_precheck(&report);
   if !missing.is_empty() {
     app.log_warn(format!("dependency precheck: missing {}", missing.join(" ")));
+    let hint = pica_package_hint(app, &missing);
     return Err(CliError::new(
       E_RUNTIME,
-      format!("dependency precheck failed, missing: {}", missing.join(" ")),
+      format!("dependency precheck failed, missing: {}{hint}", missing.join(" ")),
     ));
   }
 
@@ -590,6 +595,52 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   }
 
   Ok(DependencyPrecheck { report, deps, source, optional })
+}
+
+/// Says, for the missing names that are published as Pica packages, why that
+/// does not make them installable.
+///
+/// A dependency name is resolved against the backend's installed set, the
+/// backend's feeds and the artifact's own `pkgs/`. A Pica package is in none of
+/// those: pica keeps its own ledger and never reads another artifact's manifest,
+/// so "it is in the source" and "it can be a dependency" are different things.
+/// Naming that difference is the whole point — otherwise the user reads "missing"
+/// and goes looking for the package they just saw listed.
+///
+/// The synced index is read directly, without the host filters the selector
+/// applies: the question here is whether the name is published at all, not
+/// whether it would install on this machine. No network request is made. An
+/// index that cannot be read is not an answer about the sources, so the hint is
+/// omitted rather than claiming the package is unavailable.
+fn pica_package_hint(app: &App, missing: &[String]) -> String {
+  let Ok(index) = crate::state::read_json_file(&app.paths.index_file) else {
+    return String::new();
+  };
+  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
+    return String::new();
+  };
+
+  let mut found = Vec::new();
+  for entry in missing {
+    let name = entry.split_once(':').map_or(entry.as_str(), |(_, name)| name);
+    let published = repos.values().flat_map(crate::state::repo_package_sets).any(|packages| {
+      packages.iter().any(|pkg| {
+        pkg.get("appname").and_then(Value::as_str) == Some(name)
+          || pkg.get("pkgname").and_then(Value::as_str) == Some(name)
+      })
+    });
+    if published {
+      found.push(name.to_string());
+    }
+  }
+  if found.is_empty() {
+    return String::new();
+  }
+  format!(
+    "; {} exist in the Pica sources, but pica does not resolve Pica packages as dependencies — \
+     declare a system package name instead, or ship the container in this artifact's pkgs/",
+    found.join(" ")
+  )
 }
 
 /// The container-or-feeds decision, taken once in the precheck.
@@ -672,6 +723,41 @@ fn phase_names(
   names
 }
 
+/// Installs one dependency phase, skipping what is already installed.
+///
+/// The filter is what keeps an install from touching packages it did not come
+/// for: a backend asked for a name it already has may upgrade it, and pica has
+/// no upgrade policy on this path — that decision belongs to `-Su`. A dependency
+/// whose installed version misses a declared bound never reaches here: the
+/// precheck refuses it when it is required, and the selector never offers it
+/// when it is optional.
+///
+/// The bookkeeping runs whatever the command returned, because a backend that
+/// fails partway has still installed part of the request. See
+/// [`InstallTransaction::record_backend_changes`].
+fn install_phase(
+  app: &mut App,
+  tx: &mut InstallTransaction,
+  label: &str,
+  names: &[String],
+) -> CliResult<()> {
+  if names.is_empty() {
+    return Ok(());
+  }
+
+  let missing: Vec<String> = {
+    let manager = app.package_manager()?;
+    names.iter().filter(|name| !manager.is_installed(name)).cloned().collect()
+  };
+  if missing.is_empty() {
+    return Ok(());
+  }
+
+  let result = app.package_manager()?.install(label, &missing);
+  tx.record_backend_changes(app);
+  result
+}
+
 /// Step 5: installs whatever the artifact's dependencies need, and nothing when
 /// it has none.
 ///
@@ -712,12 +798,11 @@ fn install_dependency_containers(
   // kmods are always resolved through the feeds: an OpenWrt kernel module is not
   // something an application artifact can carry (see `build_precheck_report`).
   // One request for the missing ones, so the backend sees the set at once.
-  // A chosen optional kmod joins that one request; an installed one never does.
-  let package_manager = app.package_manager()?;
-  let mut missing_kmods = required_names(&precheck.deps.kmod);
-  missing_kmods.extend(precheck.optional.selected_names("kmod"));
-  missing_kmods.retain(|dep| !package_manager.is_installed(dep));
-  package_manager.install("kmod", &missing_kmods)?;
+  // A chosen optional kmod joins that one request; an installed one never does,
+  // which is the rule every other phase follows too (`install_phase`).
+  let mut kmods = required_names(&precheck.deps.kmod);
+  kmods.extend(precheck.optional.selected_names("kmod"));
+  install_phase(app, tx, "kmod", &kmods)?;
 
   // The source was decided in the precheck (see `dependency_source_for`), so the
   // selector could only offer what this install can deliver.
@@ -732,19 +817,36 @@ fn install_dependency_containers(
     // Only the names go into the requests: the bounds are pica's to check, and
     // opkg would read `libfoo>=1.2` as a package called that.
     DependencySource::Feeds => {
-      let package_manager = app.package_manager()?;
-      package_manager.install("base", &phase_names(&precheck.deps.base, precheck, "base"))?;
-      let snap_before_app = package_manager.snapshot_installed();
-      package_manager.install("app", &phase_names(&precheck.deps.app, precheck, "app"))?;
-      let snap_after_app = app.package_manager()?.snapshot_installed();
-      tx.app_added = pkg_list_diff_added(&snap_before_app, &snap_after_app);
+      install_phase(app, tx, "base", &phase_names(&precheck.deps.base, precheck, "base"))?;
+      let before_app = app.package_manager()?.snapshot_installed();
+      install_phase(app, tx, "app", &phase_names(&precheck.deps.app, precheck, "app"))?;
+      let after_app = app.package_manager()?.snapshot_installed();
+      match (before_app, after_app) {
+        (Ok(before), Ok(after)) => tx.app_added = pkg_list_diff_added(&before, &after),
+        // Which packages the `app` phase added is a report field; no rollback
+        // depends on it. An unreadable list costs the report, not the install —
+        // and leaving it empty is better than claiming they were all added.
+        (before, after) => {
+          let err = before.err().or(after.err()).expect("one of the two failed");
+          app.log_warn(format!(
+            "could not tell which packages the app phase added: {}",
+            err.message
+          ));
+        }
+      }
     }
     // The artifact's containers are one batch, installed once. Nothing in the
     // artifact says which container serves `base` and which serves `app`, and the
     // containers of one application depend on each other, so the batch is left
     // whole: a split would be a guess, and a guess that separates two dependent
     // containers fails the install outright.
-    DependencySource::Containers => install_pkgs_dir(app, "packaged", &pkgs_dir)?,
+    DependencySource::Containers => {
+      let result = install_pkgs_dir(app, "packaged", &pkgs_dir);
+      // A batch that fails partway has still put some of its containers on the
+      // device, and the backend may have pulled dependencies in with them.
+      tx.record_backend_changes(app);
+      result?;
+    }
   }
 
   Ok(())
@@ -778,7 +880,7 @@ fn recheck_constraints(app: &mut App, ctx: &InstallContext<'_>, precheck: &Depen
   }
 }
 
-/// Steps 4 to 8: the part of an install that changes the system.
+/// Steps 4 to 7: the part of an install that changes the system.
 ///
 /// Each step records what it did in `tx` before it can fail, so the caller can
 /// undo the whole run with one call.
@@ -790,20 +892,35 @@ fn run_install(
 ) -> CliResult<()> {
   // 4. Snapshot before anything is installed. Only a system backend has a
   //    database to snapshot; `pica` keeps its own record of the paths it wrote.
+  //    Versions are kept, not just names: they are what tells a package this
+  //    install added from one it upgraded.
   if app.backend().requires_system_binary() {
-    tx.tx_before = Some(app.package_manager()?.snapshot_installed());
+    // Without a baseline there is nothing a rollback could undo, so an
+    // unreadable list stops the install here — before anything is changed —
+    // instead of letting it proceed with a record that can only be wrong.
+    let mut installed = app.package_manager()?.installed()?;
+    installed.sort();
+    tx.tx_before = Some(installed);
   }
 
-  // 5. Dependency containers.
+  // 5. Dependency containers. Every phase records what it changed, including a
+  //    phase that fails partway (see `install_phase`), so a later failure has
+  //    something to roll back.
   install_dependency_containers(app, ctx, precheck, tx)?;
 
   // 5b. The bounds the precheck could not judge yet.
   recheck_constraints(app, ctx, precheck);
 
-  // 8. What this install added, diffed against the snapshot from step 4.
-  if let Some(before) = &tx.tx_before {
-    let after = app.package_manager()?.snapshot_installed();
-    tx.tx_added = pkg_list_diff_added(before, &after);
+  if !tx.tx_changed.is_empty() {
+    let changes: Vec<String> = tx
+      .tx_changed
+      .iter()
+      .map(|(name, before, after)| format!("{name} {before} -> {after}"))
+      .collect();
+    app.log_warn(format!(
+      "dependencies changed version during this install and a rollback would not restore them: {}",
+      changes.join(", ")
+    ));
   }
 
   // 6. Lifecycle hook.
@@ -830,10 +947,37 @@ fn execute_scripts(
   }
 
   let target_dir = kept_scripts_dir(ctx.target, ctx.pkgname);
-  if target_dir.is_dir() {
-    // An upgrade replaces the kept scripts instead of merging into them.
-    let _ = fs::remove_dir_all(&target_dir);
+  let backup_dir = kept_scripts_backup(&target_dir);
+  let dir_existed = target_dir.is_dir();
+
+  // A backup from an earlier run is dealt with before this one takes its own:
+  // a finished one is removed, anything else is moved to a name of its own so
+  // it cannot be mistaken for this transaction's.
+  let canonical_free = reconcile_scripts_backup(app, &backup_dir);
+
+  // An upgrade replaces the kept scripts instead of merging into them, and the
+  // old ones are the only copy: they are moved aside rather than deleted. The
+  // transaction owns the backup — rollback puts it back, a finished install
+  // marks it committed and removes it — so a failure anywhere later still
+  // restores them. A rename inside the same directory is atomic and copies
+  // nothing.
+  let mut backed_up = false;
+  if dir_existed && canonical_free {
+    let marker = ScriptsMarker::pending(ctx);
+    match begin_scripts_backup(app, &target_dir, &backup_dir, marker, |path, text| {
+      fs::write(path, text)
+    })? {
+      BackupStart::Active(marker) => {
+        backed_up = true;
+        tx.record_scripts_backup(target_dir.clone(), backup_dir, marker);
+      }
+      BackupStart::None => {}
+    }
   }
+  // Everything under the directory is this install's own — unless the old files
+  // are still sitting there, in which case a copy would be a replacement and
+  // the path must stay out of the rollback record.
+  let record_copies = !dir_existed || backed_up;
 
   let mut items: Vec<(&str, bool)> = Vec::new();
   if !scripts.install.is_empty() && !scripts.install.starts_with('/') {
@@ -861,12 +1005,38 @@ fn execute_scripts(
     }
 
     let target = target_dir.join(relative);
+    let mut created = PayloadInstall::default();
+    push_missing_ancestors(ctx.target, &target, &mut created);
+    // Directories are recorded only when the kept-scripts directory did not
+    // exist before this install: an upgrade must not turn a pre-existing
+    // directory into something `-R` may delete later. A rollback of an upgrade
+    // removes the whole directory and renames the backup over it instead.
+    if !dir_existed {
+      tx.record_created(created);
+    }
+
     if let Some(parent) = target.parent() {
       ensure_dir(parent)?;
     }
-    fs::copy(&source, &target)
-      .map_err(|err| CliError::new(E_IO, format!("copy script failed: {err}")))?;
-    kept_any = true;
+
+    let path = target.display().to_string();
+    match fs::copy(&source, &target) {
+      Ok(_) => {
+        if record_copies {
+          tx.record_created(PayloadInstall { files: vec![path], ..PayloadInstall::default() });
+        }
+        kept_any = true;
+      }
+      Err(err) => {
+        // A copy opens the destination first, so a failed one can leave a file
+        // behind — one of this install's own, because the old files are either
+        // gone or were never recorded.
+        if record_copies && target.symlink_metadata().is_ok() {
+          tx.record_created(PayloadInstall { files: vec![path], ..PayloadInstall::default() });
+        }
+        return Err(CliError::new(E_IO, format!("copy script failed: {err}")));
+      }
+    }
   }
 
   if !kept_any && target_dir.is_dir() {
@@ -874,6 +1044,356 @@ fn execute_scripts(
   }
 
   Ok(())
+}
+
+/// Where the previous kept scripts wait while an upgrade writes its own.
+fn kept_scripts_backup(dir: &Path) -> PathBuf {
+  let mut name = dir.as_os_str().to_os_string();
+  name.push(".rollback");
+  PathBuf::from(name)
+}
+
+/// The marker that describes the backup it sits beside: `<backup>.json`.
+fn kept_scripts_marker(backup: &Path) -> PathBuf {
+  let mut name = backup.as_os_str().to_os_string();
+  name.push(".json");
+  PathBuf::from(name)
+}
+
+/// What the marker beside a backup says about the transaction that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptsState {
+  /// The backup was taken and the install has not finished yet.
+  Pending,
+  /// `record_installation` returned Ok: the new scripts are in the database.
+  Committed,
+}
+
+impl ScriptsState {
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::Pending => "pending",
+      Self::Committed => "committed",
+    }
+  }
+
+  fn parse(text: &str) -> Option<Self> {
+    match text {
+      "pending" => Some(Self::Pending),
+      "committed" => Some(Self::Committed),
+      _ => None,
+    }
+  }
+}
+
+/// The marker schema this build writes and understands.
+const SCRIPTS_MARKER_SCHEMA: u64 = 1;
+
+/// One upgrade's backup of the kept scripts.
+struct ScriptsBackup {
+  target: PathBuf,
+  backup: PathBuf,
+  marker: ScriptsMarker,
+}
+
+/// What a backup directory is, written beside it.
+///
+/// It exists so a backup left behind by a crash can be told apart from one that
+/// belongs to a finished install. `state` is the only input to the cleanup
+/// decision: a version that happens to match the database says nothing about
+/// which transaction made the backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptsMarker {
+  txid: String,
+  pkgname: String,
+  pkgver: String,
+  pkgrel: String,
+  state: ScriptsState,
+}
+
+impl ScriptsMarker {
+  fn pending(ctx: &InstallContext<'_>) -> Self {
+    Self {
+      txid: new_txid(),
+      pkgname: ctx.pkgname.to_string(),
+      pkgver: ctx.manifest.get_first("pkgver"),
+      pkgrel: ctx.manifest.get_first("pkgrel"),
+      state: ScriptsState::Pending,
+    }
+  }
+
+  fn to_json(&self) -> String {
+    json!({
+      "schema": SCRIPTS_MARKER_SCHEMA,
+      "txid": self.txid,
+      "pkgname": self.pkgname,
+      "pkgver": self.pkgver,
+      "pkgrel": self.pkgrel,
+      "state": self.state.as_str(),
+    })
+    .to_string()
+  }
+
+  /// `None` for anything this build cannot vouch for: unreadable JSON, another
+  /// schema, a state it does not know.
+  fn parse(text: &str) -> Option<Self> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    if value.get("schema").and_then(Value::as_u64)? != SCRIPTS_MARKER_SCHEMA {
+      return None;
+    }
+    Some(Self {
+      txid: value.get("txid")?.as_str()?.to_string(),
+      pkgname: value.get("pkgname")?.as_str()?.to_string(),
+      pkgver: value.get("pkgver")?.as_str()?.to_string(),
+      pkgrel: value.get("pkgrel")?.as_str()?.to_string(),
+      state: ScriptsState::parse(value.get("state")?.as_str()?)?,
+    })
+  }
+}
+
+fn new_txid() -> String {
+  let nanos = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |elapsed| elapsed.as_nanos());
+  format!("{nanos:x}-{:x}", std::process::id())
+}
+
+/// What to do with a backup found at the start of an install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupDisposition {
+  /// The transaction that made it finished: the scripts it holds are
+  /// superseded, and the database already names their replacements.
+  DeleteCommitted,
+  /// Anything else — pending, missing marker, unreadable marker, unknown
+  /// schema. The backup is kept under a name of its own; it is never guessed to
+  /// be finished, because it may be the only copy of those scripts.
+  MoveAside,
+}
+
+fn backup_disposition(marker: Option<&ScriptsMarker>) -> BackupDisposition {
+  match marker {
+    Some(marker) if marker.state == ScriptsState::Committed => BackupDisposition::DeleteCommitted,
+    _ => BackupDisposition::MoveAside,
+  }
+}
+
+/// The outcome of trying to take a backup.
+enum BackupStart {
+  /// The old scripts are in the backup and the caller must tell the transaction.
+  Active(ScriptsMarker),
+  /// No backup: there was nothing to move, or it could not be tracked.
+  None,
+}
+
+/// Moves the old kept scripts aside and writes the marker that describes them.
+///
+/// The marker is written *after* the rename and before anything else: a backup
+/// nobody can classify is worse than no backup, because the next run could not
+/// tell whether it may clean it up. If the marker cannot be written the old
+/// directory is put back and the caller continues without a backup; if even
+/// that fails the only copy is in the backup, so the error names it and the
+/// install stops.
+fn begin_scripts_backup(
+  app: &mut App,
+  target: &Path,
+  backup: &Path,
+  marker: ScriptsMarker,
+  write: impl FnOnce(&Path, &str) -> std::io::Result<()>,
+) -> CliResult<BackupStart> {
+  if let Err(err) = fs::rename(target, backup) {
+    app.log_warn(format!(
+      "could not move the kept scripts aside ({err}); this upgrade leaves them in place, and the \
+       scripts it writes will not be rolled back"
+    ));
+    return Ok(BackupStart::None);
+  }
+
+  let marker_path = kept_scripts_marker(backup);
+  if let Err(err) = write(&marker_path, &marker.to_json()) {
+    return match fs::rename(backup, target) {
+      Ok(()) => {
+        app.log_warn(format!(
+          "could not write the rollback marker for {} ({err}); the upgrade continues without \
+           script rollback",
+          backup.display()
+        ));
+        Ok(BackupStart::None)
+      }
+      Err(restore) => Err(CliError::new(
+        E_IO,
+        format!(
+          "could not write the rollback marker for {} ({err}), and the previous scripts could not \
+           be moved back from it: {restore}",
+          backup.display()
+        ),
+      )),
+    };
+  }
+
+  Ok(BackupStart::Active(marker))
+}
+
+/// Puts the backup back where the kept scripts belong.
+fn restore_scripts_backup(
+  target: &Path,
+  backup: &Path,
+  mv: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+  // The rename needs its destination gone; everything under it belongs to the
+  // transaction that moved the old scripts aside.
+  let _ = fs::remove_dir_all(target);
+  mv(backup, target)
+}
+
+/// Moves an old backup out of the canonical name and brings its marker along.
+///
+/// Returns whether the canonical name is free for this install. Every
+/// destination is *claimed* before it is used: `create_dir` and an exclusive
+/// create both fail when something is already there, so an existing file or
+/// directory — empty or not — is never replaced. `std` has no
+/// `renameat2(RENAME_NOREPLACE)` and this workspace forbids `unsafe`, so the
+/// claim and the move are two steps: a third party writing into the claimed
+/// path between them can only make the move fail, never lose the backup.
+fn move_aside_scripts_backup(
+  app: &mut App,
+  backup: &Path,
+  marker_path: &Path,
+  marker: Option<&ScriptsMarker>,
+) -> bool {
+  let suffix = marker.map_or_else(new_txid, |marker| marker.txid.clone());
+  let stale = PathBuf::from(format!("{}.{suffix}", backup.display()));
+
+  // Claiming the name atomically: this fails for a file, an empty directory and
+  // a full one alike, and never touches what is already there.
+  if let Err(err) = fs::create_dir(&stale) {
+    app.log_warn(format!(
+      "an earlier upgrade left its previous kept scripts at {}, and {} is already in the way \
+       ({err}); this upgrade will not back up the current ones",
+      backup.display(),
+      stale.display()
+    ));
+    return false;
+  }
+
+  // Renaming onto the empty directory just created replaces only that.
+  if let Err(err) = fs::rename(backup, &stale) {
+    let _ = fs::remove_dir(&stale);
+    app.log_warn(format!(
+      "an earlier upgrade left its previous kept scripts at {}, which could not be moved aside \
+       ({err}); this upgrade will not back up the current ones",
+      backup.display()
+    ));
+    return false;
+  }
+
+  if marker.is_some() && marker_path.exists() {
+    let marker_target = kept_scripts_marker(&stale);
+    match fs::OpenOptions::new().write(true).create_new(true).open(&marker_target) {
+      Ok(_) => {
+        if let Err(err) = fs::rename(marker_path, &marker_target) {
+          let _ = fs::remove_file(&marker_target);
+          let restored = fs::rename(&stale, backup).is_ok();
+          app.log_warn(format!(
+            "the previous kept scripts were moved to {}, but their marker could not follow \
+             ({err}){}",
+            stale.display(),
+            if restored {
+              "; the backup was put back where it was"
+            } else {
+              "; the backup stays there and its marker at its old name"
+            }
+          ));
+          return false;
+        }
+      }
+      Err(err) => {
+        // Whatever occupies the marker's destination is left untouched, and the
+        // directory move is undone so this install cannot overwrite the marker
+        // that still sits at its canonical name.
+        let restored = fs::rename(&stale, backup).is_ok();
+        app.log_warn(format!(
+          "a previous backup marker is in the way at {} ({err}){}",
+          marker_target.display(),
+          if restored {
+            "; the previous backup was put back where it was"
+          } else {
+            "; the backup stays at the name it was moved to"
+          }
+        ));
+        return false;
+      }
+    }
+  }
+
+  app.log_warn(format!(
+    "an earlier upgrade left its previous kept scripts at {}, which may still be the only copy; \
+     they were moved to {} and left there",
+    backup.display(),
+    stale.display()
+  ));
+  true
+}
+
+/// Deals with a backup left by an earlier run, and reports whether the
+/// canonical backup name is free for this one.
+///
+/// A backup whose marker says `committed` is removed: that state is only ever
+/// written after the database record landed, so the scripts it holds are
+/// superseded. Anything else is moved to a name of its own and left alone —
+/// pending (the install never finished) or a marker this build cannot read (it
+/// must not guess). Neither is ever deleted.
+fn reconcile_scripts_backup(app: &mut App, backup: &Path) -> bool {
+  let marker_path = kept_scripts_marker(backup);
+
+  if !backup.exists() {
+    // A marker with no directory beside it: the two renames of an earlier move
+    // are not one operation, so this is what a crash between them leaves. It
+    // describes a backup that is no longer at this name, so it is moved aside —
+    // never overwritten by the marker this install is about to write.
+    if marker_path.exists() {
+      let stale = PathBuf::from(format!("{}.orphan.{}", marker_path.display(), new_txid()));
+      match fs::rename(&marker_path, &stale) {
+        Ok(()) => app.log_warn(format!(
+          "a marker without its backup was found at {} and moved to {}; its backup is no longer \
+           at that path",
+          marker_path.display(),
+          stale.display()
+        )),
+        Err(err) => app.log_warn(format!(
+          "a marker without its backup is at {} and could not be moved aside ({err}); the next \
+           backup will overwrite it",
+          marker_path.display()
+        )),
+      }
+    }
+    return true;
+  }
+
+  let marker = fs::read_to_string(&marker_path).ok().and_then(|text| ScriptsMarker::parse(&text));
+
+  match backup_disposition(marker.as_ref()) {
+    BackupDisposition::DeleteCommitted => {
+      if let Err(err) = fs::remove_dir_all(backup) {
+        app.log_warn(format!(
+          "a finished upgrade left its previous kept scripts at {}, which could not be removed \
+           ({err}); this upgrade will not back up the current ones",
+          backup.display()
+        ));
+        return false;
+      }
+      if let Err(err) = fs::remove_file(&marker_path) {
+        app.log_warn(format!(
+          "the previous kept scripts at {} were removed, but their marker could not be ({err}); \
+           the next upgrade will move it aside",
+          backup.display()
+        ));
+      }
+      true
+    }
+    BackupDisposition::MoveAside => {
+      move_aside_scripts_backup(app, backup, &marker_path, marker.as_ref())
+    }
+  }
 }
 
 /// Step 7: installs the artifact's declarative payload, recording every path it
@@ -893,6 +1413,25 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
     let intended = intended_payload(target, &root_dir);
     match install_payload(&root_dir, target.as_path()) {
       Ok(installed) => {
+        // Recorded here, not at the end of this function: everything below can
+        // fail, and a failure there must not lose the files that are already on
+        // disk. Only the paths this walk created may be removed again — the
+        // result also lists the files it replaced, and deleting one of those
+        // would take away a path that existed before the install, its previous
+        // content already gone. `intended` holds the paths that were missing
+        // before the walk, so the intersection is exactly what this install
+        // created.
+        tx.record_created(PayloadInstall {
+          files: installed
+            .files
+            .iter()
+            .filter(|file| intended.files.contains(file))
+            .cloned()
+            .collect(),
+          // The walker only pushes the directories it had to create.
+          dirs: installed.dirs.clone(),
+          size: installed.size,
+        });
         payload.files.extend(installed.files);
         payload.dirs.extend(installed.dirs);
         payload.size += installed.size;
@@ -901,8 +1440,11 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
         // `install_payload` validates as it copies, so a payload it rejects can
         // still have created files before it got there — and it reports nothing
         // at all when it fails. The intended paths are recorded instead, so the
-        // rollback knows what to look for and can delete whatever exists.
-        tx.record_payload(intended);
+        // rollback knows what to look for and can delete whatever exists. They
+        // are all paths that did not exist before, so they are also what the
+        // rollback is allowed to remove.
+        tx.record_payload(intended.clone());
+        tx.record_created(intended);
         return Err(CliError::from(err));
       }
     }
@@ -911,9 +1453,18 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
   let env_file = ctx.tmpdir.join(SCRIPTS).join(".env");
   if env_file.is_file() {
     let env_dir = target.resolve(ENV_DIR);
-    ensure_dir(&env_dir)?;
     let file = env_dir.join(format!("{}.env", ctx.pkgname));
-    let written = fs::copy(&env_file, &file)
+    // A directory this install had to create is its own; recording it before
+    // the copy means a copy that fails does not leave it behind. Directories
+    // that already existed are not recorded, and `remove_payload` only removes
+    // a recorded one when it ends up empty.
+    let mut created_dirs = PayloadInstall::default();
+    push_missing_ancestors(target, &file, &mut created_dirs);
+    ensure_dir(&env_dir)?;
+    tx.record_created(created_dirs);
+
+    let existed = file.symlink_metadata().is_ok();
+    let written = copy_recording_new_target(tx, &file, existed, || fs::copy(&env_file, &file))
       .map_err(|err| CliError::new(E_IO, format!("copy env file failed: {err}")))?;
     payload.files.push(file.display().to_string());
     payload.size += written;
@@ -956,6 +1507,37 @@ fn intended_payload(target: &TargetRoot, root_dir: &Path) -> PayloadInstall {
   let mut payload = PayloadInstall::default();
   collect_intended(target, root_dir, root_dir, &mut payload);
   payload
+}
+
+/// Copies a file, and keeps the transaction honest when the copy dies after
+/// creating its destination.
+///
+/// A copy truncates and writes the target, so a failure partway leaves a file
+/// behind that no `Ok` value will ever describe. Only a destination that did
+/// not exist before the copy is this install's to remove; one that did is left
+/// alone, even though its previous content is already gone (pica keeps no
+/// backup).
+///
+/// The copy itself is a parameter so a test can fail it at the one point a real
+/// filesystem cannot be made to fail on demand.
+fn copy_recording_new_target(
+  tx: &mut InstallTransaction,
+  to: &Path,
+  existed: bool,
+  copy: impl FnOnce() -> std::io::Result<u64>,
+) -> std::io::Result<u64> {
+  match copy() {
+    Ok(written) => Ok(written),
+    Err(err) => {
+      if !existed && to.symlink_metadata().is_ok() {
+        tx.record_created(PayloadInstall {
+          files: vec![to.display().to_string()],
+          ..PayloadInstall::default()
+        });
+      }
+      Err(err)
+    }
+  }
 }
 
 fn collect_intended(target: &TargetRoot, base: &Path, dir: &Path, payload: &mut PayloadInstall) {
@@ -1017,17 +1599,34 @@ fn push_missing_ancestors(target: &TargetRoot, path: &Path, payload: &mut Payloa
 /// Nothing here is written to the database: the record is step 9, and until it
 /// exists this struct is the only description of the install.
 struct InstallTransaction {
-  /// Packages installed before step 5, when the backend keeps such a list.
-  tx_before: Option<Vec<String>>,
-  /// Packages step 5 added, diffed against `tx_before` once it returned.
+  /// Every installed package and the version the backend reported for it,
+  /// taken before step 5. Names alone cannot tell a dependency this install
+  /// added from one it upgraded.
+  tx_before: Option<Vec<(String, String)>>,
+  /// Packages step 5 added, diffed against `tx_before` after every phase.
+  /// Rollback removes exactly these.
   tx_added: Vec<String>,
+  /// Packages that were already installed and changed version during step 5, as
+  /// `(name, before, after)`. Rollback cannot undo these — pica has no previous
+  /// version to put back — so they are reported instead of silently accepted.
+  tx_changed: Vec<(String, String, String)>,
   /// The part of `tx_added` that came from the `app` stage, which is the `app`
   /// list when the dependencies came from feeds. A container batch is installed
   /// as one request covering `base` and `app` at once, so it appears in
   /// `tx_added` only.
   app_added: Vec<String>,
   /// Paths deployed, in deployment order so removal can replay them backwards.
+  /// This is what the database records, so it lists every file the install
+  /// wrote — including the ones it replaced.
   payload_records: Vec<PayloadInstall>,
+  /// The subset of `payload_records` this transaction **created**. Rollback
+  /// removes only these: a file the install replaced was already on the device,
+  /// and deleting it would take the path itself away on top of the content.
+  created_records: Vec<PayloadInstall>,
+  /// The backup an upgrade took of the kept scripts, with the marker that says
+  /// which transaction made it. Rollback puts it back; a finished install
+  /// removes it.
+  scripts_backup: Option<ScriptsBackup>,
   /// Labels of the hooks that ran, in the order they ran.
   executed_hooks: Vec<String>,
 }
@@ -1037,8 +1636,11 @@ impl InstallTransaction {
     Self {
       tx_before: None,
       tx_added: Vec::new(),
+      tx_changed: Vec::new(),
       app_added: Vec::new(),
       payload_records: Vec::new(),
+      created_records: Vec::new(),
+      scripts_backup: None,
       executed_hooks: Vec::new(),
     }
   }
@@ -1047,8 +1649,126 @@ impl InstallTransaction {
     self.payload_records.push(payload);
   }
 
+  /// Remembers the directory an upgrade moved aside, so rollback can put it
+  /// back and a finished install can drop it.
+  fn record_scripts_backup(&mut self, target: PathBuf, backup: PathBuf, marker: ScriptsMarker) {
+    self.scripts_backup = Some(ScriptsBackup { target, backup, marker });
+  }
+
+  /// Marks the backup as belonging to a finished install.
+  ///
+  /// Written only after `record_installation` returned Ok, which is the whole
+  /// correspondence between the marker and the database: `committed` means the
+  /// record landed, and nothing else does. A write that fails leaves the marker
+  /// saying `pending`, so the next run moves the backup aside instead of
+  /// deleting it.
+  fn mark_committed(&mut self, app: &mut App) {
+    let Some(entry) = self.scripts_backup.as_mut() else {
+      return;
+    };
+    entry.marker.state = ScriptsState::Committed;
+    let marker_path = kept_scripts_marker(&entry.backup);
+    if let Err(err) = fs::write(&marker_path, entry.marker.to_json()) {
+      app.log_warn(format!(
+        "the install completed, but {} could not be updated ({err}); the previous kept scripts \
+         stay at {} and the next upgrade will move them aside",
+        marker_path.display(),
+        entry.backup.display()
+      ));
+    }
+  }
+
+  /// Removes the backup of the previous kept scripts once the install is
+  /// complete. A failure is reported, not hidden: the directory stays at a path
+  /// the message names, and its marker stays with it so a later run can
+  /// classify it.
+  fn finish(&mut self, app: &mut App) {
+    self.finish_with(app, |dir| fs::remove_dir_all(dir), |file| fs::remove_file(file));
+  }
+
+  fn finish_with(
+    &mut self,
+    app: &mut App,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+  ) {
+    let Some(entry) = self.scripts_backup.take() else {
+      return;
+    };
+    let marker_path = kept_scripts_marker(&entry.backup);
+    match remove(&entry.backup) {
+      Ok(()) => {
+        // A marker left without its backup is handled by the next install
+        // (`reconcile_scripts_backup` moves it aside), but the failure is said
+        // out loud instead of being dropped.
+        if let Err(err) = remove_marker(&marker_path) {
+          app.log_warn(format!(
+            "the previous kept scripts were removed, but their marker at {} could not be ({err}); \
+             the next upgrade will move it aside",
+            marker_path.display()
+          ));
+        }
+      }
+      Err(err) => app.log_warn(format!(
+        "the previous kept scripts could not be removed from {} ({err}); the next upgrade will \
+         find them and move them aside",
+        entry.backup.display()
+      )),
+    }
+  }
+
+  /// Records the paths this transaction created, which rollback may remove.
+  ///
+  /// Kept apart from [`Self::record_payload`] on purpose: the database record
+  /// has to name every file the install wrote, while a rollback may only take
+  /// away paths that were not there before it started.
+  fn record_created(&mut self, payload: PayloadInstall) {
+    self.created_records.push(payload);
+  }
+
   fn record_hook(&mut self, label: &str) {
     self.executed_hooks.push(label.to_string());
+  }
+
+  /// Diffs the backend's installed set against the snapshot from step 4, keeping
+  /// an addition and a version change apart: only the first can be undone.
+  ///
+  /// Called after every phase *and* on its error path. A backend that fails
+  /// halfway through a request has still installed part of it, so the exit
+  /// status is not evidence that nothing landed.
+  ///
+  /// A list that cannot be read keeps what earlier phases confirmed. Treating
+  /// the failure as "nothing installed" is what makes a transaction forget the
+  /// packages it just added — and those are exactly the ones rollback is for.
+  fn record_backend_changes(&mut self, app: &mut App) {
+    let Some(before) = &self.tx_before else {
+      return;
+    };
+    let mut after = match app.package_manager().and_then(crate::pkgmgr::PackageManager::installed) {
+      Ok(after) => after,
+      Err(err) => {
+        app.log_warn(format!(
+          "could not read the installed package list; the rollback record may be incomplete: {}",
+          err.message
+        ));
+        return;
+      }
+    };
+    after.sort();
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for (name, version) in &after {
+      match before.iter().find(|(known, _)| known == name) {
+        None => added.push(name.clone()),
+        Some((_, previous)) if previous != version => {
+          changed.push((name.clone(), previous.clone(), version.clone()));
+        }
+        Some(_) => {}
+      }
+    }
+    self.tx_added = added;
+    self.tx_changed = changed;
   }
 
   /// Every path this install created, as one payload.
@@ -1074,7 +1794,7 @@ impl InstallTransaction {
   fn rollback(&mut self, app: &mut App, ctx: &InstallContext<'_>) -> Vec<String> {
     let mut leftovers = Vec::new();
 
-    for record in self.payload_records.iter().rev() {
+    for record in self.created_records.iter().rev() {
       // Its count is dropped because it does not answer the question below: a
       // directory may survive too, and that is not a file.
       let _ = remove_payload(record);
@@ -1085,13 +1805,17 @@ impl InstallTransaction {
     // and kept as this install's payload record, because a `-R` driven by that
     // record is the only way left to clean them.
     //
-    // A recorded directory is one this install created, so a directory that is
-    // still there is a survivor too: it is either not empty (something else —
-    // a hook's file, another package's file — moved in) or could not be removed.
-    // Ignoring it would report a clean rollback while leaving a record nothing
-    // points `-R` at.
+    // A recorded directory is one `remove_payload` was told this install
+    // created, so a directory that is still there is a survivor too: it is
+    // either not empty (something else — a hook's file, another package's file
+    // — moved in) or could not be removed. Ignoring it would report a clean
+    // rollback while leaving a record nothing points `-R` at.
+    //
+    // Only `created_records` is walked: a file the install *replaced* is not a
+    // survivor of this rollback, and listing it here would make `-R` delete a
+    // path the transaction did not create.
     let mut remnant = PayloadInstall::default();
-    for record in &self.payload_records {
+    for record in &self.created_records {
       for file in &record.files {
         if Path::new(file).exists() {
           leftovers.push(file.clone());
@@ -1105,7 +1829,8 @@ impl InstallTransaction {
         }
       }
     }
-    self.payload_records = vec![remnant];
+    self.payload_records = vec![remnant.clone()];
+    self.created_records = vec![remnant];
 
     if !self.executed_hooks.is_empty() {
       // A hook may have changed things only the package knows how to undo, so
@@ -1128,6 +1853,25 @@ impl InstallTransaction {
     }
     self.tx_added.clear();
     self.app_added.clear();
+
+    // The kept scripts: everything under the directory was written by this
+    // transaction, and the old ones are waiting in the backup. Removing the
+    // directory is what makes the rename below possible; anything still in it
+    // that this transaction did not write is reported if the rename fails.
+    if let Some(entry) = self.scripts_backup.take() {
+      let marker_path = kept_scripts_marker(&entry.backup);
+      match restore_scripts_backup(&entry.target, &entry.backup, |from, to| fs::rename(from, to)) {
+        Ok(()) => {
+          let _ = fs::remove_file(&marker_path);
+        }
+        Err(err) => {
+          // The backup holds the only copy of the old scripts, so it is
+          // reported rather than recorded for removal: `-R` must not delete
+          // it. Its marker stays beside it so a later upgrade can classify it.
+          leftovers.push(format!("scripts:{} ({err})", entry.backup.display()));
+        }
+      }
+    }
 
     leftovers
   }
@@ -1335,8 +2079,8 @@ arch = all
       Vec::new()
     }
 
-    fn installed(&self) -> Vec<(String, String)> {
-      Vec::new()
+    fn installed(&self) -> CliResult<Vec<(String, String)>> {
+      Ok(Vec::new())
     }
 
     fn depends(&self, _name: &str) -> Vec<String> {
@@ -1452,6 +2196,40 @@ arch = all
   }
 
   /// The DB record of `pkgname`, or `None` when nothing was recorded.
+  /// Writes the marker beside `name` under the fixture's scripts directory.
+  fn write_marker(fixture: &PicaFixture, name: &str, txid: &str, state: ScriptsState) {
+    let marker = ScriptsMarker {
+      txid: txid.to_string(),
+      pkgname: "demo".to_string(),
+      pkgver: "1.0.0".to_string(),
+      pkgrel: "1".to_string(),
+      state,
+    };
+    fs::write(fixture.path(&format!("usr/lib/pica/scripts/{name}")), marker.to_json())
+      .expect("write the marker");
+  }
+
+  /// Backup directories whose name starts with `prefix.` — the ones moved
+  /// aside to keep the canonical name free.
+  fn moved_aside(fixture: &PicaFixture, prefix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(fixture.path("usr/lib/pica/scripts")) else {
+      return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+      .flatten()
+      .map(|entry| entry.path())
+      .filter(|path| {
+        path.is_dir()
+          && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("{prefix}.")))
+      })
+      .collect();
+    out.sort();
+    out
+  }
+
   fn db_record(app: &App, pkgname: &str) -> Option<Value> {
     let text = fs::read_to_string(&app.paths.db_file).ok()?;
     let db: Value = serde_json::from_str(&text).ok()?;
@@ -1474,6 +2252,10 @@ arch = all
     extra_files: &[(&str, &str)],
   ) -> CliResult<()> {
     let staging = work.join("staging");
+    // Each call builds the artifact it describes. Leftovers from an earlier
+    // call would ship files this one does not have — which is exactly what an
+    // upgrade test drops on purpose.
+    let _ = fs::remove_dir_all(&staging);
     write_file(&staging.join(MANIFEST), manifest);
     for (relative, contents) in root_files {
       write_file(&staging.join(ROOT).join(relative), contents);
@@ -1720,6 +2502,1047 @@ arch = all
        reachable through the paths this step intended to create"
     );
     assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  /// Installs a `pica` artifact with one `root/` file and, when asked, an env
+  /// file — the two steps `deploy_payload` runs in that order.
+  fn deploy_with_env(fixture: &mut PicaFixture, with_env: bool) -> CliResult<()> {
+    let mut extra: Vec<(&str, &str)> = Vec::new();
+    if with_env {
+      extra.push(("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n"));
+    }
+    fixture.install_without_containers(
+      &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+      &[("etc/demo.conf", "payload\n")],
+      &[],
+      &extra,
+    )
+  }
+
+  #[test]
+  fn an_env_copy_failure_rolls_back_the_payload_it_just_deployed() {
+    let mut fixture = PicaFixture::new();
+
+    // The env file's own path is a directory, so `fs::copy` fails with EISDIR.
+    // That is deterministic, needs no privileges, and it is the step that runs
+    // *after* the `root/` files are already on disk.
+    let env_file = fixture.path("etc/pica/env.d/demo.env");
+    fs::create_dir_all(&env_file).expect("create the blocking directory");
+
+    let err =
+      deploy_with_env(&mut fixture, true).expect_err("the env copy cannot land on a directory");
+    assert!(err.message.contains("copy env file failed"), "{}", err.message);
+
+    assert!(
+      !fixture.path("etc/demo.conf").exists(),
+      "the payload deployed before the failure must be removed again"
+    );
+    assert!(db_record(&fixture.app, "demo").is_none(), "a failed install leaves no record behind");
+  }
+
+  #[test]
+  fn an_install_without_an_env_file_still_deploys_its_payload() {
+    let mut fixture = PicaFixture::new();
+
+    deploy_with_env(&mut fixture, false).expect("a package without scripts/.env installs");
+
+    assert!(fixture.path("etc/demo.conf").is_file(), "the payload is deployed");
+    assert!(db_record(&fixture.app, "demo").is_some(), "and recorded");
+  }
+
+  #[test]
+  fn a_failed_env_copy_can_be_retried_and_the_retry_uninstalls_cleanly() {
+    let mut fixture = PicaFixture::new();
+    let env_file = fixture.path("etc/pica/env.d/demo.env");
+    fs::create_dir_all(&env_file).expect("create the blocking directory");
+
+    deploy_with_env(&mut fixture, true).expect_err("the first attempt fails");
+    assert!(!fixture.path("etc/demo.conf").exists(), "the first attempt leaves no orphan behind");
+
+    fs::remove_dir(&env_file).expect("clear the blocker");
+    deploy_with_env(&mut fixture, true).expect("the retry installs");
+
+    let record = db_record(&fixture.app, "demo").expect("the retry is recorded");
+    assert!(record.to_string().contains("etc/demo.conf"), "{record}");
+
+    crate::commands::remove::pkg(&mut fixture.app, "demo").expect("uninstall");
+    assert!(!fixture.path("etc/demo.conf").exists(), "uninstall removes what the retry deployed");
+    assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_rollback_keeps_a_file_that_was_already_on_the_device() {
+    let mut fixture = PicaFixture::new();
+    // The artifact ships this path, so the walk replaces it — but it existed
+    // before the install started, which makes it not the rollback's to remove.
+    let existing = fixture.path("etc/demo.conf");
+    fs::create_dir_all(existing.parent().expect("parent")).expect("mkdir");
+    fs::write(&existing, "original\n").expect("write the pre-existing file");
+
+    let env_file = fixture.path("etc/pica/env.d/demo.env");
+    fs::create_dir_all(&env_file).expect("create the blocking directory");
+
+    deploy_with_env(&mut fixture, true).expect_err("the env copy fails");
+
+    assert!(
+      existing.exists(),
+      "a path that was there before the install must survive the rollback"
+    );
+    // Known limitation, pinned here so a future change is a deliberate one:
+    // pica keeps no copy of what it replaced, so the content is the artifact's.
+    assert_eq!(fs::read_to_string(&existing).expect("read"), "payload\n");
+  }
+
+  #[test]
+  fn an_env_dir_failure_rolls_back_the_payload_it_just_deployed() {
+    let mut fixture = PicaFixture::new();
+    // `/etc/pica` is a regular file here, so creating `/etc/pica/env.d` fails
+    // with ENOTDIR — deterministic, and it needs neither privileges nor a full
+    // disk. It is the step right after the `root/` files land.
+    let blocker = fixture.path("etc/pica");
+    fs::create_dir_all(blocker.parent().expect("parent")).expect("mkdir");
+    fs::write(&blocker, "not a directory\n").expect("write the blocker");
+
+    deploy_with_env(&mut fixture, true).expect_err("the env directory cannot be created");
+
+    assert!(
+      !fixture.path("etc/demo.conf").exists(),
+      "the payload deployed before the failure is rolled back"
+    );
+    assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_failed_copy_that_created_the_target_records_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("demo.env");
+    let mut tx = InstallTransaction::new();
+
+    let err = copy_recording_new_target(&mut tx, &target, false, || {
+      // The failure a real filesystem only produces on a bad day: the target is
+      // opened and written, then the write dies.
+      fs::write(&target, b"half-written").expect("write the partial file");
+      Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect_err("the copy fails");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+      tx.created_records.len(),
+      1,
+      "the file the failed copy left behind has to reach the rollback"
+    );
+    assert_eq!(tx.created_records[0].files, vec![target.display().to_string()]);
+  }
+
+  #[test]
+  fn a_failed_copy_over_an_existing_target_is_not_recorded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("demo.env");
+    fs::write(&target, b"original").expect("write the original file");
+    let mut tx = InstallTransaction::new();
+
+    copy_recording_new_target(&mut tx, &target, true, || {
+      fs::write(&target, b"replaced").expect("overwrite the file");
+      Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect_err("the copy fails");
+
+    assert!(
+      tx.created_records.is_empty(),
+      "a path that was already on the device is not the rollback's to remove"
+    );
+    assert!(target.is_file(), "and it is not removed either");
+  }
+
+  #[test]
+  fn a_failed_copy_that_created_nothing_records_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("demo.env");
+    let mut tx = InstallTransaction::new();
+
+    copy_recording_new_target(&mut tx, &target, false, || {
+      Err(std::io::Error::other("simulated open failure"))
+    })
+    .expect_err("the copy fails");
+
+    assert!(tx.created_records.is_empty(), "there is no path to remove");
+  }
+
+  #[test]
+  fn a_failed_env_copy_over_an_existing_file_is_left_in_place_and_not_restored() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("demo.env");
+    fs::write(&target, b"original\n").expect("write the original env file");
+    let mut tx = InstallTransaction::new();
+
+    copy_recording_new_target(&mut tx, &target, true, || {
+      // Truncate and rewrite, then die — what a partial copy leaves behind.
+      fs::write(&target, b"partial").expect("rewrite the target");
+      Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect_err("the copy fails");
+
+    assert!(
+      tx.created_records.is_empty(),
+      "a path that existed before the copy is not this install's to remove"
+    );
+
+    // What the rollback actually does with this path: nothing. The record is
+    // empty, so the file the failed copy already truncated stays truncated.
+    let mut recorded = PayloadInstall::default();
+    for record in &tx.created_records {
+      recorded.files.extend(record.files.iter().cloned());
+      recorded.dirs.extend(record.dirs.iter().cloned());
+    }
+    let _ = remove_payload(&recorded);
+
+    assert!(target.is_file(), "the pre-existing path survives the rollback");
+    assert_eq!(
+      fs::read_to_string(&target).expect("read the env file"),
+      "partial",
+      "the original bytes are not restored: pica keeps no backup"
+    );
+  }
+
+  #[test]
+  fn a_mid_payload_failure_keeps_a_file_that_was_already_there() {
+    let mut fixture = PicaFixture::new();
+    // The walk goes in name order: `aaa.conf` lands, `etc/demo.conf` — already
+    // on the device — is replaced, and then the escaping symlink fails it.
+    // `intended` never contained the pre-existing path, so the rollback leaves
+    // it alone even though its previous content is gone.
+    let existing = fixture.path("etc/demo.conf");
+    fs::create_dir_all(existing.parent().expect("parent")).expect("mkdir");
+    fs::write(&existing, "original\n").expect("write the pre-existing file");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("aaa.conf", "copied first\n"), ("etc/demo.conf", "payload\n")],
+        &[("zzz-escape", "/etc/passwd")],
+        &[],
+      )
+      .expect_err("the escaping symlink fails the walk");
+
+    assert!(err.message.contains("escapes the target root"), "{}", err.message);
+    assert!(
+      existing.exists(),
+      "a path that was there before the install is not the rollback's to remove"
+    );
+    assert!(
+      !fixture.path("aaa.conf").exists(),
+      "the file this walk created before failing is removed"
+    );
+  }
+
+  #[test]
+  fn a_failure_after_the_first_kept_script_is_copied_rolls_it_back() {
+    let mut fixture = PicaFixture::new();
+    // `update` is copied first; `remove` is declared but absent from the
+    // artifact, so the loop stops right after one successful copy. No lifecycle
+    // hook runs on a first install here, which keeps the rollback limited to
+    // the file this install actually wrote.
+    let manifest = format!(
+      "{MANIFEST_DEMO}pkgmgr = pica\nscript_update = scripts/update\n\
+       script_remove = scripts/remove\n"
+    );
+    let err = fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[
+          ("scripts/update", "#!/bin/sh\nexit 0\n"),
+          ("scripts/.env", "PICA_KEEP_SCRIPT_UPDATE=true\nPICA_KEEP_SCRIPT_REMOVE=true\n"),
+        ],
+      )
+      .expect_err("the declared remove script is not in the artifact");
+
+    assert!(err.message.contains("script not found in package"), "{}", err.message);
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo/scripts/update").exists(),
+      "the script copied before the failure is rolled back"
+    );
+  }
+
+  #[test]
+  fn a_failed_upgrade_restores_the_previous_scripts() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!(
+      "{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n\
+       script_remove = scripts/remove\n"
+    );
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\nPICA_KEEP_SCRIPT_REMOVE=true\n");
+    let install_script = "usr/lib/pica/scripts/demo/scripts/install";
+    let remove_script = "usr/lib/pica/scripts/demo/scripts/remove";
+
+    // Version 1 keeps both scripts, so the upgrade has old files to replace.
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[
+          ("scripts/install", "#!/bin/sh\necho old-install\n"),
+          ("scripts/remove", "#!/bin/sh\necho old-remove\n"),
+          env,
+        ],
+      )
+      .expect("the first install keeps both scripts");
+
+    // Version 2 drops `scripts/remove`: the new `install` is copied, then the
+    // loop stops. The old directory was moved aside, not deleted.
+    let err = fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new-install\n"), env],
+      )
+      .expect_err("version 2 does not ship the declared remove script");
+
+    assert!(err.message.contains("script not found in package"), "{}", err.message);
+    assert_eq!(
+      fs::read_to_string(fixture.path(install_script)).expect("read the old install script"),
+      "#!/bin/sh\necho old-install\n",
+      "the old script is back, not the new copy"
+    );
+    assert_eq!(
+      fs::read_to_string(fixture.path(remove_script)).expect("read the old remove script"),
+      "#!/bin/sh\necho old-remove\n",
+      "the script the new version no longer ships is restored too"
+    );
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback").exists(),
+      "the backup is put back, not left behind"
+    );
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.json").exists(),
+      "and the marker that described it is gone too"
+    );
+  }
+
+  #[test]
+  fn a_failure_after_the_scripts_are_kept_still_restores_the_old_ones() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    let kept = "usr/lib/pica/scripts/demo/scripts/install";
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    // The upgrade replaces the kept scripts and *then* fails on the payload.
+    // The backup belongs to the transaction, not to this one step, so the old
+    // script still comes back.
+    let err = fixture
+      .install_without_containers(
+        &manifest,
+        &[("aaa.conf", "overlay\n")],
+        &[("zzz-escape", "/etc/passwd")],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect_err("the escaping symlink fails the payload");
+
+    assert!(err.message.contains("escapes the target root"), "{}", err.message);
+    assert_eq!(
+      fs::read_to_string(fixture.path(kept)).expect("read the kept script"),
+      "#!/bin/sh\necho old\n",
+      "a failure after the scripts were kept must still put the old ones back"
+    );
+    assert!(!fixture.path("usr/lib/pica/scripts/demo.rollback").exists());
+  }
+
+  #[test]
+  fn a_backup_without_a_marker_is_moved_aside_and_kept() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    // A backup nobody can classify: it may be the only copy of those scripts,
+    // so it is moved to a name of its own and never deleted.
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the untracked backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    assert!(!backup.exists(), "the canonical name is free again");
+    let moved = moved_aside(&fixture, "demo.rollback");
+    assert_eq!(moved.len(), 1, "exactly one backup was moved aside: {moved:?}");
+    assert_eq!(
+      fs::read_to_string(moved[0].join("stale")).expect("read the moved copy"),
+      "old copy",
+      "and the only copy is kept"
+    );
+  }
+
+  #[test]
+  fn a_pending_backup_is_moved_aside_and_kept() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    // What a crash between the rename and the database write leaves behind.
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the pending backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+    write_marker(&fixture, "demo.rollback.json", "cafe", ScriptsState::Pending);
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    assert!(!backup.exists(), "the canonical name is free again");
+    let stale = fixture.path("usr/lib/pica/scripts/demo.rollback.cafe");
+    assert_eq!(
+      fs::read_to_string(stale.join("stale")).expect("read the moved copy"),
+      "old copy",
+      "a pending backup is never deleted"
+    );
+    assert!(
+      fixture.path("usr/lib/pica/scripts/demo.rollback.cafe.json").is_file(),
+      "its marker travels with it"
+    );
+  }
+
+  #[test]
+  fn a_committed_backup_left_behind_is_removed_before_the_next_upgrade() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    // What a crash between the database write and the cleanup leaves behind:
+    // the marker says the record landed, so the backup is superseded.
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the stale backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+    write_marker(&fixture, "demo.rollback.json", "beef", ScriptsState::Committed);
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    assert!(!backup.exists(), "the committed backup is removed");
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.json").exists(),
+      "and so is its marker"
+    );
+    assert_eq!(
+      fs::read_to_string(fixture.path("usr/lib/pica/scripts/demo/scripts/install"))
+        .expect("read the kept script"),
+      "#!/bin/sh\necho new\n"
+    );
+  }
+
+  #[test]
+  fn an_unreadable_marker_is_no_reason_to_delete_a_backup() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+    // A schema this build does not know: it must not be guessed to be done.
+    fs::write(
+      fixture.path("usr/lib/pica/scripts/demo.rollback.json"),
+      r#"{"schema":99,"state":"committed"}"#,
+    )
+    .expect("write the unknown marker");
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    let moved = moved_aside(&fixture, "demo.rollback");
+    assert_eq!(moved.len(), 1, "the unknown backup is kept under another name: {moved:?}");
+    assert_eq!(
+      fs::read_to_string(moved[0].join("stale")).expect("read the moved copy"),
+      "old copy"
+    );
+  }
+
+  #[test]
+  fn a_matching_version_does_not_make_a_pending_backup_committed() {
+    let pending = ScriptsMarker {
+      txid: "t".to_string(),
+      pkgname: "demo".to_string(),
+      pkgver: "1.0.0".to_string(),
+      pkgrel: "1".to_string(),
+      state: ScriptsState::Pending,
+    };
+    assert_eq!(
+      backup_disposition(Some(&pending)),
+      BackupDisposition::MoveAside,
+      "the database version says nothing about which transaction made the backup"
+    );
+    let committed = ScriptsMarker { state: ScriptsState::Committed, ..pending };
+    assert_eq!(backup_disposition(Some(&committed)), BackupDisposition::DeleteCommitted);
+    assert_eq!(backup_disposition(None), BackupDisposition::MoveAside);
+    assert!(ScriptsMarker::parse("not json").is_none());
+    assert!(
+      ScriptsMarker::parse(r#"{"schema":1,"state":"committed"}"#).is_none(),
+      "fields missing"
+    );
+  }
+
+  #[test]
+  fn a_marker_that_cannot_be_written_puts_the_old_directory_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("scripts");
+    fs::create_dir_all(&target).expect("mkdir");
+    fs::write(target.join("install"), "old").expect("write the old script");
+    let backup = dir.path().join("scripts.rollback");
+    let mut app = test_app(dir.path());
+    let marker = ScriptsMarker {
+      txid: "t".to_string(),
+      pkgname: "demo".to_string(),
+      pkgver: "2.0.0".to_string(),
+      pkgrel: "1".to_string(),
+      state: ScriptsState::Pending,
+    };
+
+    let start = begin_scripts_backup(&mut app, &target, &backup, marker, |_, _| {
+      Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect("the failure is handled, not fatal");
+
+    assert!(matches!(start, BackupStart::None), "no untracked backup is left active");
+    assert_eq!(
+      fs::read_to_string(target.join("install")).expect("read the old script"),
+      "old",
+      "the old directory is back where it was"
+    );
+    assert!(!backup.exists(), "and no backup is left behind");
+  }
+
+  #[test]
+  fn a_failed_restore_keeps_the_backup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("scripts");
+    let backup = dir.path().join("scripts.rollback");
+    fs::create_dir_all(&backup).expect("mkdir backup");
+    fs::write(backup.join("install"), "old").expect("write the only copy");
+    fs::create_dir_all(&target).expect("mkdir target");
+    fs::write(target.join("partial"), "new").expect("write a partial script");
+
+    let err = restore_scripts_backup(&target, &backup, |_, _| {
+      Err(std::io::Error::other("simulated rename failure"))
+    })
+    .expect_err("the rename fails");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+      fs::read_to_string(backup.join("install")).expect("read the backup"),
+      "old",
+      "the only copy is still there"
+    );
+  }
+
+  #[test]
+  fn a_finish_that_cannot_remove_the_backup_keeps_it_and_its_marker() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backup = dir.path().join("scripts.rollback");
+    fs::create_dir_all(&backup).expect("mkdir");
+    let marker = ScriptsMarker {
+      txid: "t".to_string(),
+      pkgname: "demo".to_string(),
+      pkgver: "2.0.0".to_string(),
+      pkgrel: "1".to_string(),
+      state: ScriptsState::Committed,
+    };
+    let marker_path = dir.path().join("scripts.rollback.json");
+    fs::write(&marker_path, marker.to_json()).expect("write the marker");
+
+    let mut app = test_app(dir.path());
+    let mut tx = InstallTransaction::new();
+    tx.record_scripts_backup(dir.path().join("scripts"), backup.clone(), marker);
+    tx.finish_with(
+      &mut app,
+      |_| Err(std::io::Error::other("simulated removal failure")),
+      |_| Ok(()),
+    );
+
+    assert!(backup.is_dir(), "the backup is still there");
+    assert!(marker_path.is_file(), "and so is the marker that classifies it");
+  }
+
+  #[test]
+  fn a_finish_that_cannot_remove_the_marker_leaves_it_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backup = dir.path().join("scripts.rollback");
+    fs::create_dir_all(&backup).expect("mkdir");
+    let marker = ScriptsMarker {
+      txid: "t".to_string(),
+      pkgname: "demo".to_string(),
+      pkgver: "2.0.0".to_string(),
+      pkgrel: "1".to_string(),
+      state: ScriptsState::Committed,
+    };
+    let marker_path = dir.path().join("scripts.rollback.json");
+    fs::write(&marker_path, marker.to_json()).expect("write the marker");
+
+    let mut app = test_app(dir.path());
+    let mut tx = InstallTransaction::new();
+    tx.record_scripts_backup(dir.path().join("scripts"), backup.clone(), marker);
+    tx.finish_with(
+      &mut app,
+      |dir| fs::remove_dir_all(dir),
+      |_| Err(std::io::Error::other("simulated marker removal failure")),
+    );
+
+    assert!(!backup.exists(), "the backup is gone");
+    assert!(marker_path.is_file(), "the marker it could not remove is still there");
+  }
+
+  #[test]
+  fn an_orphan_marker_is_moved_aside_instead_of_overwritten() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+
+    // A marker whose directory is gone: what a crash between the two renames of
+    // a move-aside leaves, or a marker whose removal failed.
+    write_marker(&fixture, "demo.rollback.json", "cafe", ScriptsState::Pending);
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade still runs");
+
+    let orphans: Vec<PathBuf> = fs::read_dir(fixture.path("usr/lib/pica/scripts"))
+      .expect("read the scripts dir")
+      .flatten()
+      .map(|entry| entry.path())
+      .filter(|path| {
+        path
+          .file_name()
+          .and_then(|name| name.to_str())
+          .is_some_and(|name| name.starts_with("demo.rollback.json.orphan."))
+      })
+      .collect();
+    assert_eq!(orphans.len(), 1, "the orphan marker is kept under another name");
+    let text = fs::read_to_string(&orphans[0]).expect("read the orphan marker");
+    assert_eq!(
+      ScriptsMarker::parse(&text).map(|marker| marker.txid),
+      Some("cafe".to_string()),
+      "and it still names its own transaction"
+    );
+  }
+
+  #[test]
+  fn a_non_empty_directory_at_the_move_aside_name_is_left_alone() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!(
+      "{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n\
+       script_remove = scripts/remove\n"
+    );
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\nPICA_KEEP_SCRIPT_REMOVE=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[
+          ("scripts/install", "#!/bin/sh\necho old-install\n"),
+          ("scripts/remove", "#!/bin/sh\necho old-remove\n"),
+          env,
+        ],
+      )
+      .expect("the first install keeps both scripts");
+
+    // The name the marker asks for is already a non-empty directory, so the
+    // move-aside fails without needing permissions.
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the pending backup");
+    fs::write(backup.join("stale"), "old copy").expect("write a file in it");
+    write_marker(&fixture, "demo.rollback.json", "cafe", ScriptsState::Pending);
+    let blocker = fixture.path("usr/lib/pica/scripts/demo.rollback.cafe");
+    fs::create_dir_all(&blocker).expect("create the blocker");
+    fs::write(blocker.join("keep"), "not ours").expect("write the blocker");
+
+    // Version 2 fails after its first script, with no backup taken.
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new-install\n"), env],
+      )
+      .expect_err("version 2 does not ship the declared remove script");
+
+    assert_eq!(
+      fs::read_to_string(backup.join("stale")).expect("read the old backup"),
+      "old copy",
+      "the backup that could not be moved is untouched"
+    );
+    assert_eq!(
+      fs::read_to_string(blocker.join("keep")).expect("read the blocker"),
+      "not ours",
+      "and the name in the way is untouched too"
+    );
+  }
+
+  /// Installs the first version with two kept scripts, leaves a pending backup
+  /// behind, lets `create` occupy the name the move-aside would use, and then
+  /// runs an upgrade that fails after its first script.
+  fn failing_upgrade_with_pending_backup(
+    fixture: &mut PicaFixture,
+    create: impl FnOnce(&Path),
+  ) -> (PathBuf, PathBuf) {
+    let manifest = format!(
+      "{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n\
+       script_remove = scripts/remove\n"
+    );
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\nPICA_KEEP_SCRIPT_REMOVE=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[
+          ("scripts/install", "#!/bin/sh\necho old-install\n"),
+          ("scripts/remove", "#!/bin/sh\necho old-remove\n"),
+          env,
+        ],
+      )
+      .expect("the first install keeps both scripts");
+
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the pending backup");
+    fs::write(backup.join("stale"), "old copy").expect("write the only copy");
+    write_marker(fixture, "demo.rollback.json", "cafe", ScriptsState::Pending);
+    let blocker = fixture.path("usr/lib/pica/scripts/demo.rollback.cafe");
+    create(&blocker);
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new-install\n"), env],
+      )
+      .expect_err("version 2 does not ship the declared remove script");
+
+    (backup, blocker)
+  }
+
+  #[test]
+  fn an_empty_directory_at_the_move_aside_name_is_left_alone() {
+    let mut fixture = PicaFixture::new();
+    let (backup, blocker) = failing_upgrade_with_pending_backup(&mut fixture, |path| {
+      fs::create_dir(path).expect("create an empty directory");
+    });
+
+    assert!(blocker.is_dir(), "the empty directory is still there");
+    assert_eq!(fs::read_dir(&blocker).expect("read it").count(), 0, "and still empty");
+    assert_eq!(
+      fs::read_to_string(backup.join("stale")).expect("read the backup"),
+      "old copy",
+      "the old backup is untouched"
+    );
+    assert!(
+      fixture.path("usr/lib/pica/scripts/demo.rollback.json").is_file(),
+      "and so is its marker"
+    );
+  }
+
+  #[test]
+  fn a_file_at_the_move_aside_name_is_left_alone() {
+    let mut fixture = PicaFixture::new();
+    let (backup, blocker) = failing_upgrade_with_pending_backup(&mut fixture, |path| {
+      fs::write(path, "not ours").expect("write the file in the way");
+    });
+
+    assert!(blocker.is_file(), "the file is still there");
+    assert_eq!(fs::read_to_string(&blocker).expect("read it"), "not ours", "with its content");
+    assert_eq!(fs::read_to_string(backup.join("stale")).expect("read the backup"), "old copy");
+  }
+
+  #[test]
+  fn a_marker_that_cannot_follow_the_backup_is_not_overwritten() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!(
+      "{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n\
+       script_remove = scripts/remove\n"
+    );
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\nPICA_KEEP_SCRIPT_REMOVE=true\n");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[
+          ("scripts/install", "#!/bin/sh\necho old-install\n"),
+          ("scripts/remove", "#!/bin/sh\necho old-remove\n"),
+          env,
+        ],
+      )
+      .expect("the first install keeps both scripts");
+
+    let backup = fixture.path("usr/lib/pica/scripts/demo.rollback");
+    fs::create_dir_all(&backup).expect("create the pending backup");
+    fs::write(backup.join("stale"), "old copy").expect("write the only copy");
+    write_marker(&fixture, "demo.rollback.json", "cafe", ScriptsState::Pending);
+    // The backup's new name is free, but its marker's destination is taken.
+    let blocking_marker = fixture.path("usr/lib/pica/scripts/demo.rollback.cafe.json");
+    fs::write(&blocking_marker, "not ours").expect("write the file in the way");
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new-install\n"), env],
+      )
+      .expect_err("version 2 does not ship the declared remove script");
+
+    assert_eq!(
+      fs::read_to_string(&blocking_marker).expect("read the file in the way"),
+      "not ours",
+      "the occupied marker name is left untouched"
+    );
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.cafe").exists(),
+      "the directory move was undone instead of leaving the pair split"
+    );
+    assert_eq!(
+      fs::read_to_string(backup.join("stale")).expect("read the backup"),
+      "old copy",
+      "the backup is back under its canonical name"
+    );
+    let marker_text = fs::read_to_string(fixture.path("usr/lib/pica/scripts/demo.rollback.json"))
+      .expect("read the canonical marker");
+    assert_eq!(
+      ScriptsMarker::parse(&marker_text).map(|marker| marker.txid),
+      Some("cafe".to_string()),
+      "and the marker that could not follow is still there"
+    );
+  }
+
+  #[test]
+  fn a_successful_upgrade_drops_the_backup() {
+    let mut fixture = PicaFixture::new();
+    let manifest = format!("{MANIFEST_DEMO}pkgmgr = pica\nscript_install = scripts/install\n");
+    let env = ("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n");
+    let kept = "usr/lib/pica/scripts/demo/scripts/install";
+    let backup = "usr/lib/pica/scripts/demo.rollback";
+
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho old\n"), env],
+      )
+      .expect("the first install keeps the script");
+    fixture
+      .install_without_containers(
+        &manifest,
+        &[],
+        &[],
+        &[("scripts/install", "#!/bin/sh\necho new\n"), env],
+      )
+      .expect("the upgrade keeps it too");
+
+    assert_eq!(
+      fs::read_to_string(fixture.path(kept)).expect("read the kept script"),
+      "#!/bin/sh\necho new\n",
+      "the upgrade replaces the old bytes"
+    );
+    assert!(!fixture.path(backup).exists(), "and the old copy is cleaned up");
+    assert!(
+      !fixture.path("usr/lib/pica/scripts/demo.rollback.json").exists(),
+      "its marker is cleaned up with it"
+    );
+  }
+
+  /// A system backend whose installed list stops answering on demand.
+  ///
+  /// The transaction builds its rollback record by diffing this list. A backend
+  /// that cannot answer must not be read as an empty system: that is exactly
+  /// how a confirmed addition would be forgotten.
+  struct ListingStub {
+    installed: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    reads: std::rc::Rc<std::cell::RefCell<usize>>,
+    fail_from_call: usize,
+    fail_install_label: &'static str,
+  }
+
+  impl crate::pkgmgr::PackageManager for ListingStub {
+    fn kind(&self) -> PackageManagerKind {
+      PackageManagerKind::Opkg
+    }
+
+    fn update_index(&self) -> CliResult<()> {
+      Ok(())
+    }
+
+    fn package_exists(&self, _name: &str) -> CliResult<bool> {
+      Ok(true)
+    }
+
+    fn feed_candidates(&self, _name: &str) -> CliResult<Vec<FeedCandidate>> {
+      Ok(Vec::new())
+    }
+
+    fn is_installed(&self, name: &str) -> bool {
+      self.installed.borrow().iter().any(|(known, _)| known == name)
+    }
+
+    fn installed_version(&self, name: &str) -> Option<String> {
+      self
+        .installed
+        .borrow()
+        .iter()
+        .find(|(known, _)| known == name)
+        .map(|(_, version)| version.clone())
+    }
+
+    fn install(&self, label: &str, targets: &[String]) -> CliResult<()> {
+      // The request is applied first: a backend that then fails has still
+      // installed what it was asked for.
+      for name in targets {
+        self.installed.borrow_mut().push((name.clone(), "1.0.0".to_string()));
+      }
+      if label == self.fail_install_label {
+        return Err(CliError::new(E_RUNTIME, "simulated install failure"));
+      }
+      Ok(())
+    }
+
+    fn remove(&self, target: &str) -> CliResult<()> {
+      self.installed.borrow_mut().retain(|(name, _)| name != target);
+      Ok(())
+    }
+
+    fn architectures(&self) -> Vec<String> {
+      Vec::new()
+    }
+
+    fn installed(&self) -> CliResult<Vec<(String, String)>> {
+      let mut reads = self.reads.borrow_mut();
+      *reads += 1;
+      if *reads > self.fail_from_call {
+        return Err(CliError::new(E_RUNTIME, "simulated listing failure"));
+      }
+      Ok(self.installed.borrow().clone())
+    }
+
+    fn depends(&self, _name: &str) -> Vec<String> {
+      Vec::new()
+    }
+
+    fn owns_file(&self, _path: &str) -> Option<String> {
+      None
+    }
+  }
+
+  #[test]
+  fn an_unreadable_installed_list_keeps_what_the_transaction_already_recorded() {
+    let installed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let reads = std::rc::Rc::new(std::cell::RefCell::new(0));
+    let stub = ListingStub {
+      installed,
+      reads,
+      // The read after `base` answers; the one after `app` does not.
+      fail_from_call: 1,
+      fail_install_label: "app",
+    };
+
+    let work = tempfile::tempdir().expect("temp dir");
+    let mut app = test_app(work.path());
+    app.package_manager = Some(Box::new(stub));
+
+    let mut tx = InstallTransaction::new();
+    tx.tx_before = Some(Vec::new());
+
+    install_phase(&mut app, &mut tx, "base", &["base-dep".to_string()]).expect("base installs");
+    assert_eq!(tx.tx_added, vec!["base-dep".to_string()]);
+
+    install_phase(&mut app, &mut tx, "app", &["app-dep".to_string()])
+      .expect_err("the app install fails");
+
+    assert_eq!(
+      tx.tx_added,
+      vec!["base-dep".to_string()],
+      "a listing that stopped answering must not erase what was already confirmed"
+    );
+    assert!(tx.tx_changed.is_empty(), "and it must not invent version changes");
   }
 
   #[test]
