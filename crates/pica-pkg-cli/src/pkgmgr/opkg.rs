@@ -4,7 +4,7 @@ use crate::app::{
   CliError, CliResult, E_INDEX_UNAVAILABLE, E_IO, E_LOCK_BUSY, E_MISSING_COMMAND, E_NO_SPACE,
   E_OPKG_INSTALL, E_OPKG_REMOVE, E_RUNTIME,
 };
-use crate::lock::pid_is_running;
+use crate::lock::{Liveness, process_liveness};
 use crate::system::{run_command_capture_output, stderr_or_stdout};
 use std::fs;
 use std::io::ErrorKind;
@@ -127,7 +127,12 @@ impl OpkgIndex {
       if !path.exists() {
         continue;
       }
-      if let Some(pid) = read_opkg_lock_pid(&path).filter(|pid| pid_is_running(*pid)) {
+      // Anything but a pid this host can see is gone is treated as held: opkg's
+      // lock is removed only when the process behind it is known to be gone, and a
+      // host that cannot answer (no `/proc`) must not break a lock in use.
+      if let Some(pid) =
+        read_opkg_lock_pid(&path).filter(|pid| process_liveness(*pid) != Liveness::Gone)
+      {
         // Breaking this lock would leave the opkg that holds it writing into a
         // database another instance is rebuilding.
         return LockCleanup::Held(path, pid);
@@ -853,6 +858,12 @@ Installed-Size: 2
 
   #[test]
   fn a_stale_lock_is_cleared_and_the_refresh_retried_once() {
+    // Clearing opkg's lock rests on telling a dead pid from a live one, which only
+    // `/proc` answers. A host that cannot answer must leave the lock alone, so the
+    // test asserts whichever of the two the host it runs on can prove — and never
+    // assumes the machine has `/proc`.
+    let host_can_check = crate::lock::process_liveness(999_999) == crate::lock::Liveness::Gone;
+
     let root = tempfile::tempdir().expect("create temp dir");
     let lists = root.path().join("lists");
     let lock = root.path().join("opkg.lock");
@@ -873,16 +884,27 @@ Installed-Size: 2
       vec![lock.clone()],
     );
 
-    index::ensure_index(&index).expect("the stale lock was cleared and the refresh retried");
-    assert_eq!(lock.exists(), false, "the stale lock is gone");
-    assert!(lists.join("openwrt_core").is_file(), "the retry wrote the list file");
+    if host_can_check {
+      index::ensure_index(&index).expect("the stale lock was cleared and the refresh retried");
+      assert_eq!(lock.exists(), false, "the stale lock is gone");
+      assert!(lists.join("openwrt_core").is_file(), "the retry wrote the list file");
+    } else {
+      let err = index::ensure_index(&index).expect_err("a lock that cannot be checked is kept");
+      assert_eq!(err.code, crate::app::E_LOCK_BUSY);
+      assert!(err.message.contains("999999"), "{}", err.message);
+      assert!(lock.exists(), "the lock of an opkg that may still be running is untouched");
+      assert!(
+        !lists.join("openwrt_core").exists(),
+        "and the refresh was not retried behind its back"
+      );
+    }
   }
 
   #[test]
   fn a_lock_held_by_a_running_process_is_left_alone() {
     // Only a host with /proc can tell a live pid from a dead one, and only such
     // a host can be asked not to break a lock.
-    if !crate::lock::pid_is_running(std::process::id()) {
+    if crate::lock::process_liveness(std::process::id()) != crate::lock::Liveness::Running {
       return;
     }
 

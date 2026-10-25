@@ -207,6 +207,7 @@ pub(crate) enum Key {
   InstallRollbackLeftovers,
   InstallRollbackRecordFailed,
   InstallRollbackIncomplete,
+  InstallReportFailed,
   TransactionCompleted,
   // ---- remove ------------------------------------------------------------
   RemoveHeader,
@@ -227,6 +228,7 @@ pub(crate) enum Key {
   NotInstalled,
   LockBusy,
   LockCleanupFailed,
+  LockUnverified,
   LockFailed,
 }
 
@@ -335,6 +337,7 @@ fn english(key: Key) -> &'static str {
     Key::InstallRollbackLeftovers => "{0}: rollback left {1} path(s) behind: {2}",
     Key::InstallRollbackRecordFailed => "{0}: could not record the partial install: {1}",
     Key::InstallRollbackIncomplete => "{0}; rollback incomplete, see the warnings above",
+    Key::InstallReportFailed => "{0}: installed, but the install report could not be written: {1}",
     Key::TransactionCompleted => "Transaction completed",
 
     Key::RemoveHeader => "Removing {0}",
@@ -354,6 +357,9 @@ fn english(key: Key) -> &'static str {
 
     Key::NotInstalled => "not installed: {0}",
     Key::LockBusy => "cannot lock pica database: {0} exists (held by pid {1})",
+    Key::LockUnverified => {
+      "cannot lock pica database: {0} exists and this host cannot check whether {1} still holds it, so the lock was left in place; remove the directory if no other pica is running"
+    }
     Key::LockCleanupFailed => "cannot lock pica database: stale lock cleanup failed for {0}: {1}",
     Key::LockFailed => "cannot lock pica database: {0}",
   }
@@ -451,6 +457,7 @@ fn chinese(key: Key) -> &'static str {
     Key::InstallRollbackLeftovers => "{0}：回滚后仍残留 {1} 个路径：{2}",
     Key::InstallRollbackRecordFailed => "{0}：无法记录这次部分安装：{1}",
     Key::InstallRollbackIncomplete => "{0}；回滚未完成，请查看上面的警告",
+    Key::InstallReportFailed => "{0}：已安装，但安装报告写入失败：{1}",
     Key::TransactionCompleted => "事务完成",
 
     Key::RemoveHeader => "正在卸载 {0}",
@@ -470,6 +477,9 @@ fn chinese(key: Key) -> &'static str {
 
     Key::NotInstalled => "未安装：{0}",
     Key::LockBusy => "无法锁定 pica 数据库：{0} 已存在（持有者 pid {1}）",
+    Key::LockUnverified => {
+      "无法锁定 pica 数据库：{0} 已存在，本机无法确认 {1} 是否仍持有它，因此没有动这把锁；若确认没有其他 pica 在运行，删除该目录后重试"
+    }
     Key::LockCleanupFailed => "无法锁定 pica 数据库：清理陈旧锁 {0} 失败：{1}",
     Key::LockFailed => "无法锁定 pica 数据库：{0}",
   }
@@ -626,6 +636,7 @@ mod tests {
     Key::InstallRollbackLeftovers,
     Key::InstallRollbackRecordFailed,
     Key::InstallRollbackIncomplete,
+    Key::InstallReportFailed,
     Key::TransactionCompleted,
     Key::RemoveHeader,
     Key::RemoveHeaderVersioned,
@@ -643,6 +654,7 @@ mod tests {
     Key::NotInstalled,
     Key::LockBusy,
     Key::LockCleanupFailed,
+    Key::LockUnverified,
     Key::LockFailed,
   ];
 }

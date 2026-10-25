@@ -277,6 +277,7 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 - 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
 - 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
 - `-Qi` 只打印**有值**的字段：某字段在这条记录里为空（旧记录没有 `pkgver`、包本身没有 `license`）就整行省略，不打出“标签 + 空值”。空标签比省略更少信息，还会让人以为值曾经存在。`Name` 是唯一的例外——它是这条记录的标识，行行都有。字段取值的列宽固定为 16 字符，省略某行不会让下面的行错位。
+- `db.json` 是**已记录安装状态的唯一依据**：`-Qi`、`-R`、`-U` 只读它。同一状态目录下的 `install-report.json` 描述的是**最近一次尝试**（`precheck`、`dependency_diff` 等审计信息），其中的后端包可能已在同一次失败中被回滚。它只在数据库写成功之后才写，写失败只告警，所以报告可能比数据库旧；一次干净回滚的失败既不写库也不写报告，“没有报告”既不代表“没装”，也不代表“装成功过”。判断设备上装了什么、`-R` 能不能删，一律看 `db.json`。
 
 ## JSON 输出（显式开启）
 
@@ -526,7 +527,8 @@ luci = lua1
 - `luci_desc` 用于记录 LuCI 插件描述（与 `pkgdesc` 的通用程序描述分离）。
 - `pkgmgr = opkg|apk` 时：按 `app/base/kmod` 安装，按 `app` + `app_i18n`（`i18n=zh-cn`）卸载，`pkgs/` 中的原生包交给系统包管理器。
 - `pkgmgr = pica` 时：Pica 部署 `root/`、执行生命周期脚本，不解析依赖。产物里不该有 `pkgs/`——带了的归档在写入任何文件之前就被拒绝（`E_PACKAGE_INVALID`），因为 pica 不读容器格式，既装不了它，也无法为里面的文件记账。
-- `root/` 按路径镜像部署到真实根文件系统，安装的文件与目录会被记录，卸载时逐条回滚。
+- `root/` 按路径镜像部署到真实根文件系统，安装的文件与目录会被记录，卸载时逐条回滚。`root/` 不得写入 Pica 自身状态：`/etc/pica/`、`/var/lib/pica/`、`/usr/lib/pica/scripts/`、`/etc/pica/env.d/` 下的任何路径。这类归档在写入任何文件之前就被拒绝（`E_PACKAGE_INVALID`），判定按路径**最终落到哪里**——已有符号链接与产物自带的符号链接都算在内，不看拼写。这是防止载荷覆盖 Pica 账本的完整性护栏，不是安全边界：有 root 权限的生命周期脚本仍可直接写这些文件。
+- 部署前会被覆盖的文件（含 `scripts/.env` 落到的 `/etc/pica/env.d/<pkgname>.env`）先复制一份到 `/var/lib/pica/cache/backup/`，之后的步骤失败时旧内容按原样放回，副本本身不计入安装清单、不计入大小、`-R` 删不到它。这是**进程内**的事务还原，不是崩溃恢复 journal：安装进程被杀或设备掉电后，没有任何后续运行会读这些副本（要人工清理），也没有多文件的整体原子性。机制细节见 `developer.md`。
 - `script_install/script_update/script_remove` 是生命周期脚本（包内路径，一般在 `scripts/` 下），应按 POSIX `sh` 语法编写。
 - 生命周期脚本由系统 `sh` 执行（OpenWrt 默认 BusyBox `sh`），不依赖 `bash`。
 - 生命周期脚本保留策略（默认）：`script_remove` 保留；`script_install/script_update` 执行后不保留。

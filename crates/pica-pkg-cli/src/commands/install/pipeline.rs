@@ -13,17 +13,23 @@ use crate::format;
 use crate::i18n::{Key, Lang};
 use crate::installed::EntrySource;
 use crate::pkgmgr::PackageManagerKind;
-use crate::state::{db_installed_version, db_set_installed, report_set_install_result};
+use crate::state::{
+  db_installed_version, db_record_remnant, db_set_installed, report_set_install_result,
+};
 use crate::system::{TargetRoot, run_hook, run_tar_extract};
 use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::io::make_temp_dir;
-use pica_pkg_core::io::{PayloadInstall, install_payload, remove_payload};
+use pica_pkg_core::io::{
+  PayloadInstall, copy_symlink, deploy_file, install_payload_with, remove_payload,
+};
 use pica_pkg_core::manifest::Manifest;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_gt, ver_ge};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Pkgdir layout inside a built artifact. See docs/standard.md.
 const MANIFEST: &str = "manifest";
@@ -927,7 +933,7 @@ fn run_install(
   execute_scripts(app, ctx, tx)?;
 
   // 7. The artifact's own payload.
-  deploy_payload(ctx, tx)?;
+  deploy_payload(app, ctx, tx)?;
 
   Ok(())
 }
@@ -1452,25 +1458,44 @@ fn move_orphan_marker_aside(app: &mut App, marker_path: &Path, suffix: &str) -> 
 /// `root/` is mirrored onto the target rootfs (so `root/etc/init.d/demo` becomes
 /// `/etc/init.d/demo`), while kept lifecycle scripts and the env file are copied
 /// into Pica's own directories.
-fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliResult<()> {
+fn deploy_payload(
+  app: &App,
+  ctx: &InstallContext<'_>,
+  tx: &mut InstallTransaction,
+) -> CliResult<()> {
   let target = ctx.target;
   let mut payload = PayloadInstall::default();
 
   let root_dir = ctx.tmpdir.join(ROOT);
+  // Before the copies, not merely before the walk: a refusal that happened after
+  // the snapshot would leave every replaced file copied out and rewritten back on
+  // the way out, so "nothing on the device has changed" would be false for a file
+  // whose bytes and inode quietly did.
+  refuse_pica_state(&app.paths, target, &root_dir)?;
+  // The copies go first, and the store exists even for a payload that turns out
+  // to replace nothing: the env file below is a destination too.
+  tx.prepare_payload_backup(app, ctx.pkgname, target, &root_dir)?;
   if root_dir.is_dir() {
     // Enumerated *before* the walk: only a path that does not exist yet can be
     // one the walk creates, and only such a path may be removed again.
     let intended = intended_payload(target, &root_dir);
-    match install_payload(&root_dir, target.as_path()) {
-      Ok(installed) => {
+    // The walk records into `walked` as it goes, so a walk that stops on an error
+    // still says which destinations it got to — which is exactly what the rollback
+    // needs, and what a plain `Result` throws away.
+    let mut walked = PayloadInstall::default();
+    let walked_error = install_payload_with(&root_dir, target.as_path(), &mut walked).err();
+    tx.note_deployed(&walked);
+    match walked_error {
+      None => {
+        let installed = walked;
         // Recorded here, not at the end of this function: everything below can
         // fail, and a failure there must not lose the files that are already on
         // disk. Only the paths this walk created may be removed again — the
         // result also lists the files it replaced, and deleting one of those
-        // would take away a path that existed before the install, its previous
-        // content already gone. `intended` holds the paths that were missing
-        // before the walk, so the intersection is exactly what this install
-        // created.
+        // would take away a path that existed before the install. `intended`
+        // holds the paths that were missing before the walk, so the intersection
+        // is exactly what this install created; the ones it replaced go back
+        // from the backup instead.
         tx.record_created(PayloadInstall {
           files: installed
             .files
@@ -1486,15 +1511,16 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
         payload.dirs.extend(installed.dirs);
         payload.size += installed.size;
       }
-      Err(err) => {
+      Some(err) => {
         // `install_payload` validates as it copies, so a payload it rejects can
-        // still have created files before it got there — and it reports nothing
-        // at all when it fails. The intended paths are recorded instead, so the
-        // rollback knows what to look for and can delete whatever exists. They
-        // are all paths that did not exist before, so they are also what the
-        // rollback is allowed to remove.
-        tx.record_payload(intended.clone());
-        tx.record_created(intended);
+        // still have created files before it got there. The paths that are on disk now are recorded:
+        // every one of them was missing before the walk, so every one of them is
+        // this install's own to remove, and a path that turns out not to have
+        // been reached is left out rather than claimed. What the walk *did*
+        // replace is not in this list at all — the backup puts that back.
+        let landed = existing_only(intended);
+        tx.record_payload(landed.clone());
+        tx.record_created(landed);
         return Err(CliError::from(err));
       }
     }
@@ -1514,6 +1540,12 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
     tx.record_created(created_dirs);
 
     let existed = file.symlink_metadata().is_ok();
+    if existed {
+      // The env file is Pica's own metadata, but a package replacing it is the
+      // same destruction as replacing a payload file: the operator's copy goes
+      // into the same store and comes back from the same rollback.
+      tx.back_up_destination(&file)?;
+    }
     let written = copy_recording_new_target(tx, &file, existed, || fs::copy(&env_file, &file))
       .map_err(|err| CliError::new(E_IO, format!("copy env file failed: {err}")))?;
     payload.files.push(file.display().to_string());
@@ -1540,6 +1572,209 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
   Ok(())
 }
 
+/// Refuses a payload that would write Pica's own state.
+///
+/// `etc/pica/pica.json`, `var/lib/pica/db.json` and the rest are the files this
+/// install is about to read and rewrite. A package that ships one of them would
+/// otherwise be deployed like any other file: the database it replaced is the
+/// one the commit then loads, and a rollback would put the package's copy back
+/// instead of the record that was there.
+///
+/// The directories matter as much as the files. The lock lives in
+/// `<state>/db.lck.d/pid`, and a payload that writes a pid there makes the lock
+/// answer for a process that is not running, so the next `pica` reclaims it while
+/// this install is still going. `<scripts>/<pkgname>/` holds the hooks `-R` and
+/// `-U` run for a package, so a payload landing there replaces a hook nobody
+/// asked it to replace. Nothing legitimate installs any of these paths — a
+/// package's own hooks and env file reach the device through `scripts/`, never
+/// through `root/`.
+///
+/// Every path is checked where it *lands*, not where it is spelled. A payload
+/// naming `usr/lib/demo/db.json` writes the database when `usr/lib/demo` is a
+/// symlink to the state directory, and it lands on `install-report.json` when it
+/// plants `opt/alias -> ../var/lib/pica` first; comparing the spelled path would
+/// miss both. So the components above the entry are resolved through the symlinks
+/// that are already there, the entry's own link target is resolved too, and a path
+/// whose location cannot be established — an unreadable link, a loop, one that
+/// leads out of the target root — refuses the payload before anything is written
+/// rather than being guessed at. None of this depends on the order the walk takes
+/// the entries in: the checks are about the destination as a whole.
+///
+/// This is a collision guard, not a privilege boundary. A lifecycle hook is
+/// already arbitrary code running as root and can write wherever root can; what
+/// this stops is a package's *payload* quietly overwriting the files this
+/// transaction is reading, the lock it holds, or another package's hooks.
+fn refuse_pica_state(
+  paths: &crate::app::Paths,
+  target: &TargetRoot,
+  root_dir: &Path,
+) -> CliResult<()> {
+  let protected = [
+    ("config file", paths.conf_file.as_path()),
+    ("database", paths.db_file.as_path()),
+    ("index", paths.index_file.as_path()),
+    ("install report", paths.report_file.as_path()),
+    ("lock file", paths.lock_file.as_path()),
+  ];
+
+  let mut lock_dir = paths.lock_file.as_os_str().to_os_string();
+  lock_dir.push(".d");
+  let lock_dir = PathBuf::from(lock_dir);
+  let scripts_dir = target.resolve(SCRIPTS_DIR);
+  let env_dir = target.resolve(ENV_DIR);
+  // Compared by component, so `/var/lib/pica` does not claim `/var/lib/pica-old`.
+  // The narrowest directory comes first so the message names the thing that is
+  // actually at risk: the lock directory is inside the state directory, and the
+  // kept scripts are not described by "a directory Pica owns".
+  let protected_dirs = [
+    ("lock directory", lock_dir.as_path()),
+    ("kept scripts", scripts_dir.as_path()),
+    ("env fragments", env_dir.as_path()),
+    ("state directory", paths.state_dir.as_path()),
+    ("configuration directory", paths.etc_dir.as_path()),
+  ];
+
+  let mut nodes = Vec::new();
+  payload_nodes(root_dir, root_dir, &mut nodes);
+
+  for (relative, node) in &nodes {
+    // A directory entry is a no-op when a directory is already there, and makes an
+    // empty one otherwise: it overwrites nothing, and everything written *below* it
+    // comes through as a file or a link and is checked on its own. Checking it here
+    // would report the directory holding Pica's database instead of the database.
+    if matches!(node, PayloadNode::Dir) {
+      continue;
+    }
+
+    // Where the entry itself is written. `deploy_file` renames over the name and
+    // `copy_symlink` clears it first, so neither follows a symlink standing at the
+    // last component; the components above it are another matter, and they are the
+    // ones this resolves.
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    // `None` here means the parent chain leaves the target root. Pica's files are
+    // inside it, so there is nothing this entry could overwrite that the walk is
+    // about to depend on — and the walk refuses a payload that leads out of the
+    // root before it writes the link in any case.
+    let Some(landing_parent) = resolve_in_root(target, parent, relative)? else {
+      continue;
+    };
+    let mut landing = landing_parent.clone();
+    if let Some(name) = relative.file_name() {
+      landing.push(name);
+    }
+    refuse_protected(&protected, &protected_dirs, &landing)?;
+
+    // A symlink is a name the next install would write through, so it is refused
+    // when it *points* into Pica's state, not only when it sat there. Directories
+    // need no check of their own: one that lands on a directory is a no-op, and one
+    // that lands nowhere only makes an empty directory, while everything written
+    // *below* it is a file or a link and is checked as such — which is also what
+    // keeps the message naming the database rather than the directory holding it.
+    if let PayloadNode::Link(points_at) = node {
+      let resolved = pica_pkg_core::io::resolve_link(target.as_path(), &landing_parent, points_at)
+        .map_err(|err| {
+          CliError::new(
+            E_PACKAGE_INVALID,
+            format!("cannot tell where the symlink {} would lead: {}", relative.display(), err),
+          )
+        })?;
+      if let Some(resolved) = resolved {
+        refuse_protected(&protected, &protected_dirs, &resolved)?;
+      }
+    }
+  }
+
+  Ok(())
+}
+
+/// Where `relative` would land under `root_dir`, following the symlinks already
+/// standing in its way.
+///
+/// Refusing is the answer to every question this cannot answer: a link that cannot
+/// be read, one that leads out of the target root, and one that never settles. A
+/// guard that guessed here would be guarding the wrong path.
+fn resolve_in_root(
+  target: &TargetRoot,
+  relative: &Path,
+  spelled: &Path,
+) -> CliResult<Option<PathBuf>> {
+  pica_pkg_core::io::resolve_in_root(target.as_path(), relative).map_err(|err| {
+    CliError::new(
+      E_PACKAGE_INVALID,
+      format!("cannot tell where payload path {} would land: {}", spelled.display(), err),
+    )
+  })
+}
+
+fn refuse_protected(
+  files: &[(&str, &Path)],
+  dirs: &[(&str, &Path)],
+  landing: &Path,
+) -> CliResult<()> {
+  if let Some((label, _)) = files.iter().find(|(_, guard)| *guard == landing) {
+    return Err(CliError::new(
+      E_PACKAGE_INVALID,
+      format!("payload writes Pica's own {label}: {}", landing.display()),
+    ));
+  }
+  if let Some((label, _)) = dirs.iter().find(|(_, dir)| landing.starts_with(dir)) {
+    return Err(CliError::new(
+      E_PACKAGE_INVALID,
+      format!("payload writes Pica's own {label}: {}", landing.display()),
+    ));
+  }
+  Ok(())
+}
+
+/// One entry of a `root/` payload, as the walk sees it.
+enum PayloadNode {
+  /// A directory, merged into whatever is at the destination.
+  Dir,
+  /// A regular file, put in place by a rename over the destination's name.
+  File,
+  /// A symlink, created at the destination's name after clearing it. What it
+  /// points at is kept: that is the path a later write would take.
+  Link(PathBuf),
+}
+
+/// Every path the payload would write, whether or not something is there now.
+///
+/// [`intended_payload`] answers a different question — which paths the walk can
+/// create — so a payload that overwrites Pica's database is invisible to it for
+/// the very reason that matters: the database already exists.
+///
+/// The paths are relative to `base` on purpose: where they land is not a matter
+/// of string concatenation, because the target may have symlinks a component
+/// passes through. Resolving them is the caller's job, once, against a real
+/// filesystem.
+fn payload_nodes(base: &Path, dir: &Path, nodes: &mut Vec<(PathBuf, PayloadNode)>) {
+  let Ok(entries) = fs::read_dir(dir) else {
+    return;
+  };
+
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let Ok(relative) = path.strip_prefix(base) else {
+      continue;
+    };
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+      continue;
+    };
+
+    if metadata.is_dir() {
+      nodes.push((relative.to_path_buf(), PayloadNode::Dir));
+      payload_nodes(base, &path, nodes);
+    } else if metadata.is_symlink() {
+      let Ok(link) = fs::read_link(&path) else {
+        continue;
+      };
+      nodes.push((relative.to_path_buf(), PayloadNode::Link(link)));
+    } else if metadata.is_file() {
+      nodes.push((relative.to_path_buf(), PayloadNode::File));
+    }
+  }
+}
+
 /// Every path a `root/` payload could still create, mirroring the walker's
 /// mapping without copying anything.
 ///
@@ -1548,11 +1783,12 @@ fn deploy_payload(ctx: &InstallContext<'_>, tx: &mut InstallTransaction) -> CliR
 /// its failure can have half-created. A path that is already there is left out
 /// on purpose — the walk may never have reached it, and removing a file or a
 /// directory this install did not create is destruction the rollback has no
-/// right to perform.
+/// right to perform. Only the paths of this list that are actually on disk when
+/// the walk fails are recorded; see [`existing_only`].
 ///
-/// That leaves the reverse gap, a pre-existing file the walk overwrote before
-/// it failed and the rollback therefore keeps, which is the cheaper of the two
-/// mistakes: an untracked file is visible and removable by hand.
+/// The other half of a failed deploy — a pre-existing file the walk overwrote
+/// before it failed — is not this list's business at all. [`PayloadBackup`] took
+/// a copy of it before the walk started, and `rollback` puts that back.
 fn intended_payload(target: &TargetRoot, root_dir: &Path) -> PayloadInstall {
   let mut payload = PayloadInstall::default();
   collect_intended(target, root_dir, root_dir, &mut payload);
@@ -1565,8 +1801,8 @@ fn intended_payload(target: &TargetRoot, root_dir: &Path) -> PayloadInstall {
 /// A copy truncates and writes the target, so a failure partway leaves a file
 /// behind that no `Ok` value will ever describe. Only a destination that did
 /// not exist before the copy is this install's to remove; one that did is left
-/// alone, even though its previous content is already gone (pica keeps no
-/// backup).
+/// where it is, and its previous content comes back from the backup the
+/// transaction took before the copy started.
 ///
 /// The copy itself is a parameter so a test can fail it at the one point a real
 /// filesystem cannot be made to fail on demand.
@@ -1642,6 +1878,415 @@ fn push_missing_ancestors(target: &TargetRoot, path: &Path, payload: &mut Payloa
   }
 }
 
+/// Copies out everything this `root/` walk is about to replace, before it
+/// replaces any of it.
+///
+/// The traversal mirrors [`collect_intended`] — the same mapping the deploy
+/// makes — on purpose: a backup taken of the wrong path restores the wrong file.
+/// A destination that is not there yet is skipped, because this install owns that
+/// one and removing it is the whole undo.
+fn snapshot_payload(
+  target: &TargetRoot,
+  base: &Path,
+  dir: &Path,
+  backup: &mut PayloadBackup,
+) -> CliResult<()> {
+  let Ok(entries) = fs::read_dir(dir) else {
+    return Ok(());
+  };
+
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let Ok(relative) = path.strip_prefix(base) else {
+      continue;
+    };
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+      continue;
+    };
+
+    if metadata.is_dir() {
+      snapshot_payload(target, base, &path, backup)?;
+      continue;
+    }
+    // Only a file or a symlink puts something at its own destination; anything
+    // else in the payload the walker ignores, so nothing of the device's is at
+    // risk for it.
+    if !metadata.is_file() && !metadata.is_symlink() {
+      continue;
+    }
+
+    let to = target.as_path().join(relative);
+    let Ok(existing) = fs::symlink_metadata(&to) else {
+      continue;
+    };
+    backup.back_up(&to, &existing)?;
+    if let Some(entry) = backup.entries.last_mut() {
+      entry.walked = true;
+    }
+  }
+
+  Ok(())
+}
+
+/// The paths of a payload that are actually on disk.
+///
+/// `install_payload` reports nothing when it fails, so a deploy that died
+/// partway is described only by looking: of the paths this install could still
+/// create, the ones that are there are the ones it did create — and the only
+/// ones its rollback has a right to remove.
+fn existing_only(payload: PayloadInstall) -> PayloadInstall {
+  let present = |path: &String| Path::new(path).symlink_metadata().is_ok();
+  PayloadInstall {
+    files: payload.files.into_iter().filter(present).collect(),
+    dirs: payload.dirs.into_iter().filter(present).collect(),
+    size: 0,
+  }
+}
+
+/// Names the copies inside one transaction's backup directory. Process-wide so
+/// that two transactions — two packages in one run, or two `pica` processes on
+/// one device — cannot pick the same name for different files.
+static BACKUP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// What a transaction keeps of the files it is about to replace.
+///
+/// A payload file goes in by renaming a draft over the destination: atomic, and
+/// final — the previous content is unreachable the moment the rename happens.
+/// This store is the copy taken *before* the walk starts, so a deploy that fails
+/// partway puts the device back the way it found it instead of leaving this
+/// artifact's bytes in a file the transaction never finished.
+///
+/// Three things it deliberately is not:
+///
+/// - **Not a journal.** It lives in this process and names no state a later run
+///   can resume. A process killed mid-deploy leaves both the device's files and
+///   the copies exactly where they are, and nothing across runs reads them: the
+///   guarantee is *in-process* rollback, not crash recovery.
+/// - **Not the payload.** Nothing here is recorded as an installed file, so the
+///   database list, the size accounting and what `-R` may delete are unchanged.
+///   The copies live under Pica's own cache directory, not inside the target
+///   rootfs they came from.
+/// - **Not a general-purpose archiver.** Only a path the walk is about to
+///   destroy gets a copy, and only in the three forms the walk can destroy —
+///   see [`PayloadBackup::back_up`] for what is refused instead.
+struct PayloadBackup {
+  /// `<cache>/backup`, where this store's own directory is made.
+  parent: PathBuf,
+  /// Names which package the copies belong to.
+  prefix: String,
+  /// Made with the first file that needs storing, so an install that replaces
+  /// nothing — the common first install — creates no directory at all.
+  /// `tempfile` gives it a name no other transaction can pick, and Pica asks it
+  /// for mode `0700` wherever the platform has a mode to ask for: the copies are
+  /// the device's own files and one of them may be a configuration file only
+  /// root may read. The copies themselves are `0600` by the way they are made.
+  dir: Option<tempfile::TempDir>,
+  entries: Vec<BackupEntry>,
+}
+
+/// One destination kept as it was, and how to put it back.
+struct BackupEntry {
+  destination: PathBuf,
+  kind: BackupKind,
+  /// Whether the payload walk is what writes this destination. Only such a file
+  /// can be skipped on the way back: the walk replaces it in one rename, so a walk
+  /// that never reached it left it exactly as the copy found it.
+  walked: bool,
+}
+
+enum BackupKind {
+  /// A regular file. Its bytes are at `stored` and `permissions` is the mode it
+  /// had; a restore puts both back with one rename, the same way a deploy does.
+  File { stored: PathBuf, permissions: fs::Permissions },
+  /// A symlink, kept as a symlink rather than as what it points at.
+  Link { stored: PathBuf },
+  /// A directory that held nothing. The walk only replaces one after removing
+  /// it, so putting it back is removing what took its place and making the
+  /// directory again, with the mode it had — a directory Pica did not create is
+  /// not one Pica gets to re-permission, and `mkdir` would apply the umask.
+  EmptyDir { permissions: fs::Permissions },
+}
+
+impl PayloadBackup {
+  fn new(app: &App, pkgname: &str) -> Self {
+    Self {
+      parent: app.paths.cache_dir.join("backup"),
+      prefix: format!("{pkgname}-"),
+      dir: None,
+      entries: Vec::new(),
+    }
+  }
+
+  /// Keeps `destination` as it stands right now, before anything can replace it.
+  ///
+  /// A path that does not exist yet needs no copy: this install created it, so
+  /// removing it is the whole undo, and a copy of it would be a file the record
+  /// does not name. A directory the walk cannot empty needs no copy either — it
+  /// survives, which is what a non-empty one deserves.
+  ///
+  /// Anything that is neither a file, a symlink nor a directory is refused here
+  /// rather than replaced: a socket, a fifo or a device node cannot be recreated
+  /// from a copy of its bytes, and this is the last moment at which refusing
+  /// costs nothing — after the walk starts, the destination is already gone.
+  fn back_up(&mut self, destination: &Path, metadata: &fs::Metadata) -> CliResult<()> {
+    let kind = if metadata.is_symlink() {
+      BackupKind::Link { stored: self.copy_link(destination)? }
+    } else if metadata.is_file() {
+      BackupKind::File { stored: self.copy_file(destination)?, permissions: metadata.permissions() }
+    } else if metadata.is_dir() {
+      if dir_has_entries(destination)? {
+        return Ok(());
+      }
+      BackupKind::EmptyDir { permissions: metadata.permissions() }
+    } else {
+      return Err(CliError::new(
+        E_IO,
+        format!(
+          "{} is neither a file, a symlink nor a directory; this install stops before writing \
+           anything, because pica could not put that back",
+          destination.display()
+        ),
+      ));
+    };
+
+    self.entries.push(BackupEntry {
+      destination: destination.to_path_buf(),
+      kind,
+      // Only `snapshot_payload` sets this: everything else here is a file this
+      // install writes itself, and a copy of it may be the only version left even
+      // if the write failed.
+      walked: false,
+    });
+    Ok(())
+  }
+
+  /// Takes the copies out, deepest path first, and puts each one back.
+  ///
+  /// Reverse order is the same rule `remove_payload` follows for directories: a
+  /// path that has to be cleared before it can become a directory again is
+  /// handled before its parent is made. Restoring is done by the same primitives
+  /// as deploying — one file by rename, one link by recreating the link — so the
+  /// undo of a deploy is not a second, different deploy, and a restore that
+  /// already happened is a no-op rather than a hazard: every path left alone is
+  /// still the path the entry names.
+  ///
+  /// The copies are kept when one of them cannot go back: they are the only copy
+  /// of what the device had, so the paths that failed are returned for the caller
+  /// to name, and the directory stays where the message says it is.
+  #[cfg(test)]
+  fn restore(&mut self) -> Vec<String> {
+    self.restore_reaching(|_| true)
+  }
+
+  /// The same restore, but only for destinations the walk got as far as writing.
+  ///
+  /// A copy taken of a file the walk never reached is a copy of a file that is
+  /// still exactly as it was: putting it back is a rewrite with the same bytes —
+  /// a new inode, broken hard links, a fresh mtime, and a full read and write of a
+  /// file that may be large — with nothing to show for it. `deployed` is what the
+  /// walk itself reported writing, so a file it did not reach is simply dropped
+  /// from the record.
+  ///
+  /// Two kinds are restored whether or not the walk reported them. `deploy_file`
+  /// and `copy_symlink` clear the destination before they make the new thing, so a
+  /// deploy that fails after clearing leaves the name *missing*, and the entry is
+  /// the only way back. Neither is expensive to redo: a link is one syscall, and an
+  /// empty directory that is still a directory is the no-op case above.
+  fn restore_replacing(&mut self, deployed: &HashSet<PathBuf>) -> Vec<String> {
+    let reached = |entry: &BackupEntry| match &entry.kind {
+      // Only a destination the walk replaced atomically can be left alone. A file
+      // Pica wrote itself — an env file or a kept script — is copied into place,
+      // so a copy that failed may have left it truncated: it always goes back.
+      BackupKind::File { .. } => !entry.walked || deployed.contains(&entry.destination),
+      BackupKind::Link { .. } | BackupKind::EmptyDir { .. } => true,
+    };
+    self.restore_reaching(reached)
+  }
+
+  fn restore_reaching(&mut self, reached: impl Fn(&BackupEntry) -> bool) -> Vec<String> {
+    let mut failed = Vec::new();
+
+    for entry in self.entries.iter().rev() {
+      if !reached(entry) {
+        continue;
+      }
+      let result = match &entry.kind {
+        BackupKind::File { stored, permissions } => {
+          deploy_file(stored, &entry.destination, permissions).map_err(CliError::from)
+        }
+        BackupKind::Link { stored } => {
+          let _ = remove_any(&entry.destination);
+          copy_symlink(stored, &entry.destination).map_err(CliError::from)
+        }
+        BackupKind::EmptyDir { permissions } => {
+          // A directory that is still a directory is what this entry kept. The
+          // walk may have put files inside it, and those are the record's to
+          // remove; recreating it here would only fail on a directory that is
+          // not empty and report a path that never went missing.
+          let still_a_directory =
+            fs::symlink_metadata(&entry.destination).is_ok_and(|existing| existing.is_dir());
+          if still_a_directory {
+            Ok(())
+          } else {
+            remove_any(&entry.destination)
+              .and_then(|()| fs::create_dir_all(&entry.destination))
+              .and_then(|()| fs::set_permissions(&entry.destination, permissions.clone()))
+              .map_err(|err| {
+                CliError::new(
+                  E_IO,
+                  format!(
+                    "could not make {} a directory again: {err}",
+                    entry.destination.display()
+                  ),
+                )
+              })
+          }
+        }
+      };
+
+      if let Err(err) = result {
+        failed.push(format!("{} ({})", entry.destination.display(), err.message));
+      }
+    }
+
+    if failed.is_empty() {
+      self.entries.clear();
+      self.dir = None;
+    }
+    failed
+  }
+
+  /// Hands the directory over and stops `tempfile` from cleaning it up
+  /// (`TempDir::keep`), returning where it is.
+  ///
+  /// Whoever calls this decides what the copies are worth: a committed install
+  /// removes the directory it gets back — and says so when it cannot — while a
+  /// rollback that could not put everything back keeps it, because it is the only
+  /// copy of what the device had. A restore that finished cleared the directory
+  /// already, so this returns `None` there.
+  fn release(mut self) -> Option<PathBuf> {
+    self.dir.take().map(tempfile::TempDir::keep)
+  }
+
+  fn copy_file(&mut self, destination: &Path) -> CliResult<PathBuf> {
+    let dir = self.dir()?;
+    let seq = BACKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stored = dir.join(format!("file-{seq}"));
+
+    let mut draft = tempfile::NamedTempFile::new_in(&dir)
+      .map_err(|err| write_back_up_failure(destination, &stored, err))?;
+    let copied =
+      fs::File::open(destination).and_then(|mut from| std::io::copy(&mut from, &mut draft));
+    if let Err(err) = copied {
+      return Err(read_back_up_failure(destination, &err));
+    }
+    // The draft is `0600` and owner-only, which is the point: the mode here is a
+    // secret, not a permission bit, so the copy stays unreadable even when the
+    // file on the device was world-readable. The mode that goes *back* onto the
+    // device is the one kept in the entry.
+    draft.persist(&stored).map_err(|err| write_back_up_failure(destination, &stored, err.error))?;
+    Ok(stored)
+  }
+
+  fn copy_link(&mut self, destination: &Path) -> CliResult<PathBuf> {
+    let stored = self.next_path("link")?;
+    // The destination's *own* link is kept, not what it points at, and
+    // `fs::symlink` refuses a name that is already taken: a file planted at the
+    // name can only make this fail, never be written through.
+    copy_symlink(destination, &stored)
+      .map_err(|err| write_back_up_failure(destination, &stored, err))?;
+    Ok(stored)
+  }
+
+  /// A name in the backup directory for the next copy.
+  fn next_path(&mut self, label: &str) -> CliResult<PathBuf> {
+    let dir = self.dir()?;
+    let seq = BACKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+    Ok(dir.join(format!("{label}-{seq}")))
+  }
+
+  fn dir(&mut self) -> CliResult<PathBuf> {
+    if let Some(dir) = &self.dir {
+      return Ok(dir.path().to_path_buf());
+    }
+
+    fs::create_dir_all(&self.parent).map_err(|err| {
+      CliError::new(E_IO, format!("mkdir {} failed: {err}", self.parent.display()))
+    })?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&self.prefix);
+    // The copies are the device's own files, and one of them may be a
+    // configuration file holding a secret, so the store is asked for owner-only
+    // — a mode set *at creation*, so there is no moment in which it is not. A
+    // platform with no mode to set keeps its default, and what is inside is
+    // still `0600`.
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let made = builder.tempdir_in(&self.parent).map_err(|err| {
+      CliError::new(
+        E_IO,
+        format!(
+          "could not make a directory for the files this install replaces ({}): {err}",
+          self.parent.display()
+        ),
+      )
+    })?;
+    let path = made.path().to_path_buf();
+    self.dir = Some(made);
+    Ok(path)
+  }
+}
+
+/// Whether `dir` holds anything, including a broken symlink.
+fn dir_has_entries(dir: &Path) -> CliResult<bool> {
+  let mut entries = fs::read_dir(dir)
+    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?;
+  Ok(entries.next().is_some())
+}
+
+/// Takes `path` away whether it is a file, a link or a directory, and reports
+/// only what is still standing afterwards: a path that is already gone was not
+/// this install's to keep.
+fn remove_any(path: &Path) -> std::io::Result<()> {
+  if fs::symlink_metadata(path).is_err() {
+    return Ok(());
+  }
+
+  match fs::remove_file(path).or_else(|_| fs::remove_dir(path)) {
+    Ok(()) => Ok(()),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(err) => Err(err),
+  }
+}
+
+fn read_back_up_failure(destination: &Path, err: &std::io::Error) -> CliError {
+  CliError::new(
+    E_IO,
+    format!(
+      "could not read {} before replacing it ({err}); nothing has been written",
+      destination.display()
+    ),
+  )
+}
+
+fn write_back_up_failure(
+  destination: &Path,
+  stored: &Path,
+  err: impl std::fmt::Display,
+) -> CliError {
+  CliError::new(
+    E_IO,
+    format!(
+      "could not keep a copy of {} at {} ({err}); nothing has been written",
+      destination.display(),
+      stored.display()
+    ),
+  )
+}
+
 /// What one install has done so far, so that it can be undone.
 ///
 /// Every field is filled in *before* the step that could fail, so a step that
@@ -1677,6 +2322,14 @@ struct InstallTransaction {
   /// which transaction made it. Rollback puts it back; a finished install
   /// removes it.
   scripts_backup: Option<ScriptsBackup>,
+  /// What this transaction has copied out of the way, ready to go back. Made in
+  /// step 7 and emptied when the install commits.
+  payload_backup: Option<PayloadBackup>,
+  /// The destinations the payload walk actually wrote, in the order it wrote
+  /// them. A walk that fails halfway leaves what it reached here, which is how a
+  /// rollback tells a file it replaced from one it never got to: putting a copy
+  /// back over the latter would rewrite a file nothing touched.
+  deployed: HashSet<PathBuf>,
   /// Labels of the hooks that ran, in the order they ran.
   executed_hooks: Vec<String>,
 }
@@ -1691,12 +2344,56 @@ impl InstallTransaction {
       payload_records: Vec::new(),
       created_records: Vec::new(),
       scripts_backup: None,
+      payload_backup: None,
+      deployed: HashSet::new(),
       executed_hooks: Vec::new(),
     }
   }
 
   fn record_payload(&mut self, payload: PayloadInstall) {
     self.payload_records.push(payload);
+  }
+
+  /// Notes every destination a walk reached, finished or not.
+  fn note_deployed(&mut self, walked: &PayloadInstall) {
+    self.deployed.extend(walked.files.iter().map(PathBuf::from));
+  }
+
+  /// Takes the copies of everything step 7 is about to replace, before it
+  /// replaces any of it.
+  ///
+  /// The order is the whole point: a cache directory that cannot be written, a
+  /// file that cannot be read and a destination that cannot be put back (a
+  /// socket, a fifo, a device node) all fail *here*, while the device still has
+  /// every byte it had.
+  fn prepare_payload_backup(
+    &mut self,
+    app: &App,
+    pkgname: &str,
+    target: &TargetRoot,
+    root_dir: &Path,
+  ) -> CliResult<()> {
+    let mut backup = PayloadBackup::new(app, pkgname);
+    if root_dir.is_dir() {
+      snapshot_payload(target, root_dir, root_dir, &mut backup)?;
+    }
+    self.payload_backup = Some(backup);
+    Ok(())
+  }
+
+  /// Keeps one more path that step 7 is about to overwrite.
+  ///
+  /// The env file is Pica's own metadata, but it is a destination this install
+  /// replaces exactly like a payload file does, so it is backed up by the same
+  /// store and restored by the same rollback.
+  fn back_up_destination(&mut self, path: &Path) -> CliResult<()> {
+    let Some(backup) = self.payload_backup.as_mut() else {
+      return Ok(());
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+      return Ok(());
+    };
+    backup.back_up(path, &metadata)
   }
 
   /// Remembers the directory an upgrade moved aside, so rollback can put it
@@ -1728,12 +2425,17 @@ impl InstallTransaction {
     }
   }
 
-  /// Removes the backup of the previous kept scripts once the install is
-  /// complete. A failure is reported, not hidden: the directory stays at a path
-  /// the message names, and its marker stays with it so a later run can
-  /// classify it.
+  /// Removes what this transaction kept, once the install is complete. A failure
+  /// is reported, not hidden: the directory stays at a path the message names,
+  /// and the scripts' marker stays with its backup so a later run can classify
+  /// it.
   fn finish(&mut self, app: &mut App) {
-    self.finish_with(app, |dir| fs::remove_dir_all(dir), |file| fs::remove_file(file));
+    self.finish_with(
+      app,
+      |dir| fs::remove_dir_all(dir),
+      |file| fs::remove_file(file),
+      |dir| fs::remove_dir_all(dir),
+    );
   }
 
   fn finish_with(
@@ -1741,7 +2443,22 @@ impl InstallTransaction {
     app: &mut App,
     remove: impl FnOnce(&Path) -> std::io::Result<()>,
     remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+    remove_payload_backup: impl FnOnce(&Path) -> std::io::Result<()>,
   ) {
+    // First, because the scripts branch below returns early. The install is
+    // complete, so the copies of the files this transaction replaced are
+    // superseded — and Pica says so out loud when it cannot collect them,
+    // because they are the last copy of what was on the device before.
+    if let Some(backup) = self.payload_backup.take().and_then(PayloadBackup::release) {
+      if let Err(err) = remove_payload_backup(&backup) {
+        app.log_warn(format!(
+          "the install completed, but the copies taken of the files it replaced could not be \
+           removed from {} ({err})",
+          backup.display()
+        ));
+      }
+    }
+
     let Some(entry) = self.scripts_backup.take() else {
       return;
     };
@@ -1838,11 +2555,34 @@ impl InstallTransaction {
 
   /// Undoes everything recorded so far, and returns what could not be undone.
   ///
-  /// The order mirrors the install: deployed files come off first (deepest
+  /// The order mirrors the install backwards: the content this transaction
+  /// replaced goes back first, then the paths it created come off (deepest
   /// payload last), then the hooks are compensated, and finally the packages
   /// step 5 added are handed back to the backend that installed them.
   fn rollback(&mut self, app: &mut App, ctx: &InstallContext<'_>) -> Vec<String> {
     let mut leftovers = Vec::new();
+
+    // Content first. A path this install replaced is not its own to delete, so
+    // the only way back is the copy taken before the walk — and putting it back
+    // has to happen before anything is removed, because a removal can empty a
+    // directory this transaction never created.
+    if let Some(mut backup) = self.payload_backup.take() {
+      let unrestored = backup.restore_replacing(&self.deployed);
+      for path in &unrestored {
+        leftovers.push(format!("content:{path}"));
+      }
+      if let Some(dir) = backup.release() {
+        // A copy that could not go back is the only version of that file anyone
+        // has left, so the store stays where it is and the message says where.
+        let paths = unrestored.join(" ");
+        app.log_warn(format!(
+          "pica could not put {} back; the copies it kept are in {}, which is the only place \
+           those files still exist",
+          if paths.is_empty() { "the files it replaced".to_string() } else { paths },
+          dir.display()
+        ));
+      }
+    }
 
     for record in self.created_records.iter().rev() {
       // Its count is dropped because it does not answer the question below: a
@@ -1864,16 +2604,20 @@ impl InstallTransaction {
     // Only `created_records` is walked: a file the install *replaced* is not a
     // survivor of this rollback, and listing it here would make `-R` delete a
     // path the transaction did not create.
+    // Asked with `symlink_metadata` rather than `exists`: a created symlink whose
+    // target is gone is a survivor too, and `exists` follows the link when it is
+    // exactly what may not be followed.
+    let present = |path: &String| Path::new(path).symlink_metadata().is_ok();
     let mut remnant = PayloadInstall::default();
     for record in &self.created_records {
       for file in &record.files {
-        if Path::new(file).exists() {
+        if present(file) {
           leftovers.push(file.clone());
           remnant.files.push(file.clone());
         }
       }
       for dir in &record.dirs {
-        if Path::new(dir).exists() {
+        if present(dir) {
           leftovers.push(dir.clone());
           remnant.dirs.push(dir.clone());
         }
@@ -1977,16 +2721,6 @@ fn record_installation(
     report["optional"] = precheck.optional.report(if failed { "failed" } else { "installed" });
   }
 
-  report_set_install_result(
-    &app.paths,
-    ctx.pkgname,
-    ctx.selector,
-    &ctx.manifest.value,
-    &report,
-    &tx.tx_added,
-    &tx.app_added,
-  )?;
-
   let mut manifest_stored = ctx.manifest.value.clone();
   // `source` describes how *this* install obtained the package, not where the
   // artifact was built, so it is overwritten instead of defaulted: a URL
@@ -2008,14 +2742,47 @@ fn record_installation(
   }
 
   let payload = tx.merged_payload();
-  db_set_installed(
-    &app.paths.db_file,
+  if failed {
+    // The rollback has already put the previous version's files back when there
+    // was one, so the entry that describes it must survive: only the paths this
+    // install could not remove are added to it.
+    db_record_remnant(
+      &app.paths.db_file,
+      ctx.pkgname,
+      &manifest_stored,
+      &canonicalize_display(ctx.pkgfile),
+      &payload.files,
+      &payload.dirs,
+    )?;
+  } else {
+    db_set_installed(
+      &app.paths.db_file,
+      ctx.pkgname,
+      &manifest_stored,
+      &canonicalize_display(ctx.pkgfile),
+      &payload.files,
+      &payload.dirs,
+    )?;
+  }
+
+  // The database is what makes an install an install: `-Qi`, `-R` and `-U` read
+  // it, and none of them reads the report. Writing the report second means a
+  // report that cannot be written leaves a recorded install rather than a report
+  // describing one the database never took; and since the install is already
+  // recorded and its files are in place, that failure is a warning instead of a
+  // reason to undo them.
+  if let Err(err) = report_set_install_result(
+    &app.paths,
     ctx.pkgname,
-    &manifest_stored,
-    &canonicalize_display(ctx.pkgfile),
-    &payload.files,
-    &payload.dirs,
-  )?;
+    ctx.selector,
+    &ctx.manifest.value,
+    &report,
+    &tx.tx_added,
+    &tx.app_added,
+  ) {
+    let message = err.message.clone();
+    app.warn_args(Key::InstallReportFailed, &[ctx.pkgname, &message]);
+  }
 
   // What Pica itself wrote, and only when Pica is the one that wrote it: a
   // native backend prints its own summary, and counting Pica's containers for it
@@ -2025,7 +2792,12 @@ fn record_installation(
     app.log_info(summary);
   }
 
-  app.info(Key::TransactionCompleted);
+  // This function is also the writer of a failed attempt's remnant record, and
+  // that attempt has just been reported as a rollback. Saying "transaction
+  // completed" on the way out would contradict the error printed right after it.
+  if !failed {
+    app.info(Key::TransactionCompleted);
+  }
 
   Ok(())
 }
@@ -2036,7 +2808,7 @@ mod tests {
   use crate::app::{E_INDEX_UNAVAILABLE, FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
   use crate::pkgmgr::FeedCandidate;
   use pretty_assertions::assert_eq;
-  use std::os::unix::fs::symlink;
+  use std::os::unix::fs::{MetadataExt, symlink};
   use std::process::Command;
 
   const MANIFEST_DEMO: &str = "\
@@ -2549,9 +3321,588 @@ arch = all
     assert!(
       !fixture.path("aaa.conf").exists(),
       "the walker reports nothing when it fails, so the file it had already copied is only \
-       reachable through the paths this step intended to create"
+       reachable through the paths this step meant to create that are actually on disk"
     );
     assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_failed_upgrade_leaves_the_previous_record_and_the_previous_bytes() {
+    let mut fixture = PicaFixture::new();
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "one\n"), ("etc/keep.conf", "keeper\n")],
+        &[],
+        &[],
+      )
+      .expect("the first version installs");
+    let before = db_record(&fixture.app, "demo").expect("the first version is recorded");
+
+    // The upgrade gets as far as replacing `etc/demo.conf`, then the env copy
+    // dies on a directory sitting at its destination.
+    fs::create_dir_all(fixture.path("etc/pica/env.d/demo.env")).expect("block the env copy");
+    let err = fixture
+      .install_without_containers(
+        &format!("{}pkgmgr = pica\n", MANIFEST_DEMO.replace("pkgver = 1.0.0", "pkgver = 2.0.0")),
+        &[("etc/demo.conf", "two\n")],
+        &[],
+        &[("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\n")],
+      )
+      .expect_err("the upgrade fails");
+    assert!(err.message.contains("copy env file failed"), "{}", err.message);
+
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/demo.conf")).expect("read"),
+      "one\n",
+      "the file the upgrade replaced is back to the bytes the installed version had"
+    );
+    // The record is not rewritten at all: a rollback that undid everything leaves
+    // nothing for `-R` to act on, so the device is what the old record describes.
+    assert_eq!(db_record(&fixture.app, "demo").expect("still recorded"), before);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn an_empty_directory_the_payload_replaced_comes_back_with_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut fixture = PicaFixture::new();
+    fs::create_dir_all(fixture.path("etc/demo.conf"))
+      .expect("a directory where the payload wants a file");
+    fs::set_permissions(fixture.path("etc/demo.conf"), fs::Permissions::from_mode(0o700))
+      .expect("give the directory a mode of its own");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "a file where the directory was\n")],
+        &[("zzz-escape", "/etc/passwd")],
+        &[],
+      )
+      .expect_err("the walk fails after the file replaced the directory");
+
+    assert!(err.message.contains("escapes the target root"), "{}", err.message);
+    let path = fixture.path("etc/demo.conf");
+    assert!(path.is_dir(), "the directory is what was there before the install");
+    assert_eq!(
+      fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+      0o700,
+      "a directory Pica did not create keeps the mode it had, not the umask's"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_restore_leaves_a_directory_alone_when_the_walk_only_filled_it() {
+    // The entry kept an empty directory; the walk then put a file inside it. The
+    // record removes that file, so the directory is already what it was — and a
+    // restore that tried to recreate it would fail on a directory it cannot
+    // empty and report a path that never went missing.
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("temp dir");
+    let destination = work.path().join("etc/demo");
+    fs::create_dir_all(&destination).expect("mkdir");
+    fs::write(destination.join("added"), "written by the walk\n").expect("write");
+
+    let mut backup = PayloadBackup {
+      parent: work.path().join("backup"),
+      prefix: "demo-".to_string(),
+      dir: None,
+      entries: vec![BackupEntry {
+        destination: destination.clone(),
+        kind: BackupKind::EmptyDir { permissions: fs::Permissions::from_mode(0o700) },
+        walked: true,
+      }],
+    };
+
+    let failed = backup.restore();
+
+    assert!(failed.is_empty(), "nothing went missing: {failed:?}");
+    assert!(destination.is_dir());
+    assert!(
+      destination.join("added").is_file(),
+      "removing what the walk wrote is the record's job, not the restore's"
+    );
+  }
+
+  #[test]
+  fn a_payload_that_ships_pica_own_database_is_refused_before_anything_is_written() {
+    // A package that writes `/var/lib/pica/db.json` is writing the record this
+    // very install reads and rewrites. Nothing legitimate does it, so the
+    // payload is refused while the database is still the operator's.
+    let mut fixture = PicaFixture::new();
+    let state = fixture.target.as_path().join("var/lib/pica");
+    fs::create_dir_all(&state).expect("mkdir state");
+    let database = state.join("db.json");
+    fs::write(&database, "{\"schema\":1,\"installed\":{}}\n").expect("existing database");
+    let before = fs::read_to_string(&database).expect("read");
+    // A hard link tells "untouched" apart from "rewritten with the same bytes":
+    // putting a copy back is a rename of a fresh inode, which leaves `db.json`
+    // with one link while the sibling keeps the old one.
+    let sibling = state.join("db.json.link");
+    fs::hard_link(&database, &sibling).expect("hard link the database");
+    fixture.app.paths.db_file = database.clone();
+    fixture.app.paths.state_dir = state.clone();
+    fixture.app.paths.index_file = state.join("index.json");
+    fixture.app.paths.report_file = state.join("install-report.json");
+    fixture.app.paths.lock_file = state.join("db.lck");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("var/lib/pica/db.json", "{\"schema\":1,\"installed\":{}}\n")],
+        &[],
+        &[],
+      )
+      .expect_err("a payload may not write the database");
+
+    assert!(err.message.contains("database"), "{}", err.message);
+    assert_eq!(fs::read_to_string(&database).expect("read"), before, "the database is untouched");
+    assert_eq!(
+      fs::metadata(&database).expect("db").ino(),
+      fs::metadata(&sibling).expect("sibling").ino(),
+      "the refusal must come before the copy, or a rollback rewrites a file nothing touched"
+    );
+    assert!(
+      !fixture.app.paths.cache_dir.join("backup").exists(),
+      "a payload refused before the walk has nothing to back up"
+    );
+    assert!(
+      !fixture.target.as_path().join("etc").exists(),
+      "the payload must be refused before the walk starts"
+    );
+  }
+
+  #[test]
+  fn a_payload_that_ships_the_lock_directory_is_refused() {
+    // The lock is `<state>/db.lck.d/pid`. A payload that writes a pid there makes
+    // the lock name a process that is not running, so the next `pica` reclaims it
+    // while this install is still halfway through.
+    let mut fixture = PicaFixture::new();
+    let state = fixture.target.as_path().join("var/lib/pica");
+    fs::create_dir_all(&state).expect("mkdir state");
+    fixture.app.paths.db_file = state.join("db.json");
+    fixture.app.paths.state_dir = state.clone();
+    fixture.app.paths.index_file = state.join("index.json");
+    fixture.app.paths.report_file = state.join("install-report.json");
+    fixture.app.paths.lock_file = state.join("db.lck");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("var/lib/pica/db.lck.d/pid", "1\n"), ("etc/demo.conf", "payload\n")],
+        &[],
+        &[],
+      )
+      .expect_err("a payload may not write the lock directory");
+
+    assert!(err.message.contains("lock directory"), "{}", err.message);
+    assert!(!state.join("db.lck.d").exists(), "no lock directory was created");
+    assert!(
+      !fixture.path("etc/demo.conf").exists(),
+      "the refusal comes before any of the payload is deployed"
+    );
+  }
+
+  #[test]
+  fn a_payload_that_ships_another_packages_lifecycle_script_is_refused() {
+    // Kept scripts are executed as root by `-R` and `-U`, and they live in
+    // `/usr/lib/pica/scripts/<pkgname>/`. A payload that can write one can plant
+    // or replace a hook for a package it is not.
+    let mut fixture = PicaFixture::new();
+    let victim = fixture.target.as_path().join("usr/lib/pica/scripts/victim/install.sh");
+    write_file(&victim, "#!/bin/sh\necho the installed one\n");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("usr/lib/pica/scripts/victim/install.sh", "#!/bin/sh\nrm -rf /\n")],
+        &[],
+        &[],
+      )
+      .expect_err("a payload may not write another package's hook");
+
+    assert!(err.message.contains("kept scripts"), "{}", err.message);
+    assert_eq!(
+      fs::read_to_string(&victim).expect("read"),
+      "#!/bin/sh\necho the installed one\n",
+      "the hook `-U` will run is still the one that was there"
+    );
+  }
+
+  /// Points `App`'s state paths at `<target>/var/lib/pica` and leaves a database
+  /// there, the way an installed device has one.
+  fn state_with_a_database(fixture: &mut PicaFixture) -> (PathBuf, PathBuf) {
+    let state = fixture.target.as_path().join("var/lib/pica");
+    fs::create_dir_all(&state).expect("mkdir state");
+    let database = state.join("db.json");
+    fs::write(&database, "{\"schema\":1,\"installed\":{}}\n").expect("existing database");
+    fixture.app.paths.db_file = database.clone();
+    fixture.app.paths.state_dir = state.clone();
+    fixture.app.paths.index_file = state.join("index.json");
+    fixture.app.paths.report_file = state.join("install-report.json");
+    fixture.app.paths.lock_file = state.join("db.lck");
+    (state, database)
+  }
+
+  #[test]
+  fn a_payload_that_writes_through_a_symlink_into_pica_state_is_refused() {
+    // `usr/lib/demo` is a symlink to the state directory, so `usr/lib/demo/db.json`
+    // *is* the database. The name says `usr/lib`; the kernel says `/var/lib/pica`.
+    // Which one the guard believes is the whole question, and it believes the
+    // filesystem.
+    let mut fixture = PicaFixture::new();
+    let (state, database) = state_with_a_database(&mut fixture);
+    let sibling = state.join("db.json.link");
+    fs::hard_link(&database, &sibling).expect("hard link the database");
+    let alias = fixture.path("usr/lib/demo");
+    fs::create_dir_all(alias.parent().expect("parent")).expect("mkdir usr/lib");
+    symlink("../../var/lib/pica", &alias).expect("link the state directory");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[
+          ("usr/lib/demo/db.json", "{\"schema\":1,\"installed\":{}}\n"),
+          ("etc/demo.conf", "payload\n"),
+        ],
+        &[],
+        &[],
+      )
+      .expect_err("a payload may not write the database through a symlink");
+
+    assert!(err.message.contains("database"), "{}", err.message);
+    assert_eq!(
+      fs::read_to_string(&database).expect("read"),
+      "{\"schema\":1,\"installed\":{}}\n",
+      "the database still holds what the operator left"
+    );
+    assert_eq!(
+      fs::metadata(&database).expect("db").ino(),
+      fs::metadata(&sibling).expect("sibling").ino(),
+      "the refusal comes before the copy, so the database is not a fresh inode"
+    );
+    assert!(!fixture.path("etc/demo.conf").exists(), "nothing of the payload was deployed");
+  }
+
+  #[test]
+  fn a_payload_that_writes_through_a_dangling_symlink_into_pica_state_is_refused() {
+    // The link is there and the state directory is not. `create_dir_all` would
+    // follow the link and build the directory wherever it names, which is the
+    // order that matters: the symlink comes first, the write second, and the guard
+    // refuses on where the write would land rather than on what exists yet.
+    let mut fixture = PicaFixture::new();
+    let (state, _database) = state_with_a_database(&mut fixture);
+    fs::remove_dir_all(&state).expect("take the state directory away");
+    let alias = fixture.path("usr/lib/demo");
+    fs::create_dir_all(alias.parent().expect("parent")).expect("mkdir usr/lib");
+    symlink("../../var/lib/pica", &alias).expect("link the state directory");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[
+          ("usr/lib/demo/db.json", "{\"schema\":1,\"installed\":{}}\n"),
+          ("etc/demo.conf", "payload\n"),
+        ],
+        &[],
+        &[],
+      )
+      .expect_err("a payload may not create Pica's state through a symlink");
+
+    assert!(err.message.contains("database"), "{}", err.message);
+    // Pica makes its own state directory when it opens the store; what matters is
+    // that the *payload* stopped at the guard, before the walk wrote anything.
+    assert!(!fixture.path("etc/demo.conf").exists(), "nothing of the payload was deployed");
+  }
+
+  #[test]
+  fn a_payload_that_plants_a_symlink_into_pica_state_is_refused() {
+    // A link that only *points* at the state directory writes nothing today. It is
+    // what the next install of this package would write through, so it is refused
+    // now, while it is still a name and not a way in.
+    let mut fixture = PicaFixture::new();
+    let _ = state_with_a_database(&mut fixture);
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n")],
+        &[("opt/alias", "../var/lib/pica")],
+        &[],
+      )
+      .expect_err("a payload may not plant an alias for Pica's state");
+
+    assert!(err.message.contains("state directory"), "{}", err.message);
+    assert!(!fixture.path("opt/alias").exists(), "the alias was never created");
+    assert!(!fixture.path("etc/demo.conf").exists(), "nothing of the payload was deployed");
+  }
+
+  #[test]
+  fn a_payload_is_refused_whichever_order_the_walk_takes_its_entries_in() {
+    // `root/` is walked in name order, and a guard that decided entry by entry on
+    // the way past would answer differently depending on where the names sort. The
+    // check is about the destination, not about what was seen before it: `var`
+    // sorts after `etc` and before `zzz`, and both orders stop before the walk.
+    for harmless in ["etc/aaa.conf", "zzz/zzz.conf"] {
+      let mut fixture = PicaFixture::new();
+      let (_, database) = state_with_a_database(&mut fixture);
+
+      let err = fixture
+        .install_without_containers(
+          &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+          &[(harmless, "fine\n"), ("var/lib/pica/db.json", "{\"schema\":1,\"installed\":{}}\n")],
+          &[],
+          &[],
+        )
+        .expect_err("a payload may not write the database");
+
+      assert!(err.message.contains("database"), "{harmless}: {}", err.message);
+      assert!(!fixture.path(harmless).exists(), "{harmless}: refused before the walk starts");
+      assert_eq!(
+        fs::read_to_string(&database).expect("read"),
+        "{\"schema\":1,\"installed\":{}}\n",
+        "{harmless}: the database is untouched"
+      );
+    }
+  }
+
+  #[test]
+  fn a_payload_that_writes_through_a_symlink_elsewhere_is_allowed() {
+    // Not every symlink in the way is Pica's: `usr/lib/demo` pointing at a version
+    // directory is how a package with two versions installed stays addressable.
+    // The guard has to tell that apart from the state directory, or it breaks a
+    // layout it was never meant to police.
+    let mut fixture = PicaFixture::new();
+    let _ = state_with_a_database(&mut fixture);
+    let version = fixture.path("opt/demo-1.0");
+    fs::create_dir_all(&version).expect("mkdir version");
+    let alias = fixture.path("usr/lib/demo");
+    fs::create_dir_all(alias.parent().expect("parent")).expect("mkdir usr/lib");
+    symlink("../../opt/demo-1.0", &alias).expect("link the version directory");
+
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("usr/lib/demo/app.conf", "ok\n")],
+        &[],
+        &[],
+      )
+      .expect("a symlink that leads somewhere else is the package's business");
+
+    assert_eq!(
+      fs::read_to_string(version.join("app.conf")).expect("read"),
+      "ok\n",
+      "the file lands where the link points, as the walk meant it to"
+    );
+    assert!(
+      fs::symlink_metadata(&alias).expect("metadata").is_symlink(),
+      "the link itself stays a link"
+    );
+  }
+
+  #[test]
+  fn a_restore_leaves_a_file_the_walk_never_reached_alone() {
+    // Two files are copied out before the walk starts. It replaces the first and
+    // stops; the second is exactly what it was. Putting the copy back over the
+    // second would rewrite the same bytes into a fresh inode — a hard link to it
+    // would come apart, and a large file would be read and written for nothing —
+    // so the rollback restores only what the walk reported reaching.
+    let work = tempfile::tempdir().expect("temp dir");
+    let app = test_app(work.path());
+    let first = work.path().join("one.conf");
+    let second = work.path().join("two.conf");
+    write_file(&first, "old-one\n");
+    write_file(&second, "old-two\n");
+    let sibling = work.path().join("two.conf.link");
+    fs::hard_link(&second, &sibling).expect("hard link the second file");
+
+    let mut backup = PayloadBackup::new(&app, "demo");
+    for destination in [&first, &second] {
+      let metadata = fs::symlink_metadata(destination).expect("metadata");
+      backup.back_up(destination, &metadata).expect("back up");
+      // What `snapshot_payload` marks on the entries it takes: these are files the
+      // walk may replace, unlike the ones Pica writes itself.
+      if let Some(entry) = backup.entries.last_mut() {
+        entry.walked = true;
+      }
+    }
+
+    // What a deploy that reached only the first file leaves behind: the rename is
+    // the same one `deploy_file` makes, so the first path is a new inode.
+    let staged = work.path().join("one.conf.tmp");
+    write_file(&staged, "new-one\n");
+    fs::rename(&staged, &first).expect("replace the first file");
+
+    let deployed: HashSet<PathBuf> = [first.clone()].into_iter().collect();
+    let failed = backup.restore_replacing(&deployed);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(
+      fs::read_to_string(&first).expect("read"),
+      "old-one\n",
+      "the reached file went back"
+    );
+    assert_eq!(
+      fs::metadata(&second).expect("second").ino(),
+      fs::metadata(&sibling).expect("sibling").ino(),
+      "the file the walk never reached was not rewritten"
+    );
+    assert_eq!(fs::read_to_string(&second).expect("read"), "old-two\n");
+  }
+
+  #[test]
+  fn a_restore_that_failed_partway_puts_the_rest_back_when_it_is_run_again() {
+    // A rollback can fail on one path and succeed on the rest. Running it again
+    // after the fault is repaired has to finish the job, and has to leave the
+    // paths it already restored with the bytes, the mode and the shape they had —
+    // not with what the failed install put there.
+    let work = tempfile::tempdir().expect("temp dir");
+    let app = test_app(work.path());
+    let first_dir = work.path().join("first");
+    let second_dir = work.path().join("second");
+    fs::create_dir_all(&first_dir).expect("mkdir first");
+    fs::create_dir_all(&second_dir).expect("mkdir second");
+    let first = first_dir.join("one.conf");
+    let second = second_dir.join("two.conf");
+    write_file(&first, "old-one\n");
+    write_file(&second, "old-two\n");
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      fs::set_permissions(&second, fs::Permissions::from_mode(0o640)).expect("mode");
+    }
+
+    let mut backup = PayloadBackup::new(&app, "demo");
+    for destination in [&first, &second] {
+      let metadata = fs::symlink_metadata(destination).expect("metadata");
+      backup.back_up(destination, &metadata).expect("back up");
+    }
+
+    // What the deploy would have done to both files.
+    write_file(&first, "new-one\n");
+    write_file(&second, "new-two\n");
+
+    // The fault: the directory `second` lives in is gone, so that copy cannot go
+    // back. The other one still can, and does.
+    fs::remove_dir_all(&second_dir).expect("take the parent away");
+    let failed = backup.restore();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].contains("two.conf"), "{failed:?}");
+    assert_eq!(fs::read_to_string(&first).expect("read"), "old-one\n", "the first one went back");
+    assert!(!second.exists(), "the second one could not");
+
+    // The operator repairs the fault and the same rollback runs again. Nothing is
+    // deleted, and the file the first run already restored is not replaced with
+    // the failed install's bytes.
+    fs::create_dir_all(&second_dir).expect("put the parent back");
+    let failed = backup.restore();
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(fs::read_to_string(&first).expect("read"), "old-one\n");
+    assert_eq!(fs::read_to_string(&second).expect("read"), "old-two\n");
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      assert_eq!(
+        fs::metadata(&second).expect("metadata").permissions().mode() & 0o777,
+        0o640,
+        "the mode the file had comes back with its bytes"
+      );
+    }
+  }
+
+  #[test]
+  fn a_database_that_cannot_be_updated_undoes_the_files_it_just_deployed() {
+    // The database is the commit point. An install whose record cannot be
+    // written is not an install: the files go back to what the old record
+    // describes, instead of staying on the device with nothing naming them.
+    let mut fixture = PicaFixture::new();
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "one\n")],
+        &[],
+        &[],
+      )
+      .expect("the first version installs");
+    let before = db_record(&fixture.app, "demo").expect("recorded");
+
+    // The atomic write needs `db.json.tmp-<pid>`: a directory standing on that
+    // name is a write that cannot happen.
+    let blocked = fixture.app.paths.db_file.with_file_name(format!(
+      "{}.tmp-{}",
+      fixture.app.paths.db_file.file_name().expect("name").to_string_lossy(),
+      std::process::id()
+    ));
+    fs::create_dir_all(&blocked).expect("block the database's temporary name");
+    assert!(
+      pica_pkg_core::io::write_atomic(&fixture.app.paths.db_file, b"{}").is_err(),
+      "the block has to be what stops the write"
+    );
+
+    fixture
+      .install_without_containers(
+        &format!("{}pkgmgr = pica\n", MANIFEST_DEMO.replace("pkgver = 1.0.0", "pkgver = 2.0.0")),
+        &[("etc/demo.conf", "two\n")],
+        &[],
+        &[],
+      )
+      .expect_err("an install that cannot be recorded fails");
+
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/demo.conf")).expect("read"),
+      "one\n",
+      "the file the failed install replaced is back to what is installed"
+    );
+    assert_eq!(
+      db_record(&fixture.app, "demo").expect("still recorded"),
+      before,
+      "the record still describes the version that is on the device"
+    );
+  }
+
+  #[test]
+  fn an_install_report_that_cannot_be_written_does_not_undo_the_install() {
+    // The database is the record; the report explains it. A report that cannot
+    // be written leaves a recorded install and a warning, not a rollback of
+    // files that are in place. The report is blocked by occupying the temporary
+    // name its atomic write uses — the file itself has to stay readable so the
+    // startup initialisation, which writes it when it is missing, gets past.
+    let mut fixture = PicaFixture::new();
+    fs::create_dir_all(&fixture.app.paths.state_dir).expect("state dir");
+    fs::write(&fixture.app.paths.report_file, "{\"schema\": 1, \"reports\": {}}")
+      .expect("an existing report");
+    let blocked = fixture.app.paths.report_file.with_file_name(format!(
+      "{}.tmp-{}",
+      fixture.app.paths.report_file.file_name().expect("name").to_string_lossy(),
+      std::process::id()
+    ));
+    fs::create_dir_all(&blocked).expect("block the report's temporary name");
+
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "overlay\n")],
+        &[],
+        &[],
+      )
+      .expect("the install itself is committed");
+
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/demo.conf")).expect("read"),
+      "overlay\n",
+      "the file must survive a report that could not be written"
+    );
+    let record = db_record(&fixture.app, "demo").expect("the database owns the file");
+    assert!(
+      record["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .any(|file| file.as_str().is_some_and(|path| path.ends_with("/etc/demo.conf"))),
+      "the record must name what was installed: {record}"
+    );
   }
 
   /// Installs a `pica` artifact with one `root/` file and, when asked, an env
@@ -2621,10 +3972,11 @@ arch = all
   }
 
   #[test]
-  fn a_rollback_keeps_a_file_that_was_already_on_the_device() {
+  fn a_rollback_restores_the_content_of_a_file_it_replaced() {
     let mut fixture = PicaFixture::new();
     // The artifact ships this path, so the walk replaces it — but it existed
     // before the install started, which makes it not the rollback's to remove.
+    // Its content, on the other hand, is the rollback's to put back.
     let existing = fixture.path("etc/demo.conf");
     fs::create_dir_all(existing.parent().expect("parent")).expect("mkdir");
     fs::write(&existing, "original\n").expect("write the pre-existing file");
@@ -2638,9 +3990,11 @@ arch = all
       existing.exists(),
       "a path that was there before the install must survive the rollback"
     );
-    // Known limitation, pinned here so a future change is a deliberate one:
-    // pica keeps no copy of what it replaced, so the content is the artifact's.
-    assert_eq!(fs::read_to_string(&existing).expect("read"), "payload\n");
+    assert_eq!(
+      fs::read_to_string(&existing).expect("read"),
+      "original\n",
+      "the copy taken before the walk replaced it"
+    );
   }
 
   #[test]
@@ -2720,7 +4074,7 @@ arch = all
   }
 
   #[test]
-  fn a_failed_env_copy_over_an_existing_file_is_left_in_place_and_not_restored() {
+  fn a_failed_env_copy_over_an_existing_file_records_nothing_and_keeps_the_path() {
     let dir = tempfile::tempdir().expect("temp dir");
     let target = dir.path().join("demo.env");
     fs::write(&target, b"original\n").expect("write the original env file");
@@ -2738,8 +4092,10 @@ arch = all
       "a path that existed before the copy is not this install's to remove"
     );
 
-    // What the rollback actually does with this path: nothing. The record is
-    // empty, so the file the failed copy already truncated stays truncated.
+    // What the record alone does with this path: nothing. The bytes stay as the
+    // failed copy left them, which is why the *transaction* keeps a copy of the
+    // env file before copying it — see
+    // `a_failed_env_copy_restores_the_file_that_was_already_there`.
     let mut recorded = PayloadInstall::default();
     for record in &tx.created_records {
       recorded.files.extend(record.files.iter().cloned());
@@ -2751,17 +4107,17 @@ arch = all
     assert_eq!(
       fs::read_to_string(&target).expect("read the env file"),
       "partial",
-      "the original bytes are not restored: pica keeps no backup"
+      "the record on its own restores no content"
     );
   }
 
   #[test]
-  fn a_mid_payload_failure_keeps_a_file_that_was_already_there() {
+  fn a_mid_payload_failure_restores_a_file_that_was_already_there() {
     let mut fixture = PicaFixture::new();
     // The walk goes in name order: `aaa.conf` lands, `etc/demo.conf` — already
-    // on the device — is replaced, and then the escaping symlink fails it.
-    // `intended` never contained the pre-existing path, so the rollback leaves
-    // it alone even though its previous content is gone.
+    // on the device — is replaced, and then the escaping symlink fails it. The
+    // path this install created is removed, and the one it replaced goes back to
+    // the copy taken before the walk started.
     let existing = fixture.path("etc/demo.conf");
     fs::create_dir_all(existing.parent().expect("parent")).expect("mkdir");
     fs::write(&existing, "original\n").expect("write the pre-existing file");
@@ -2780,9 +4136,560 @@ arch = all
       existing.exists(),
       "a path that was there before the install is not the rollback's to remove"
     );
+    assert_eq!(
+      fs::read_to_string(&existing).expect("read"),
+      "original\n",
+      "and its content is not the artifact's either"
+    );
     assert!(
       !fixture.path("aaa.conf").exists(),
       "the file this walk created before failing is removed"
+    );
+  }
+
+  /// A step-7 deploy and its undo, without the steps around them.
+  ///
+  /// Everything above reaches `deploy_payload` through a real artifact, which is
+  /// what an install actually does. These two functions are where the guarantee
+  /// about a file an install *replaced* lives, and driving them directly is what
+  /// lets a test change the filesystem between the deploy and its undo — the
+  /// moment the copies are the only version of a file that is left.
+  struct Deployed {
+    fixture: PicaFixture,
+    target: TargetRoot,
+    staging: PathBuf,
+    manifest: Manifest,
+    scripts: ScriptConfig,
+    tx: InstallTransaction,
+  }
+
+  impl Deployed {
+    /// Stages the unpacked tree step 7 reads: `root_files` under `root/`,
+    /// `extra_files` at their own paths (so a test can ship `scripts/.env`), and
+    /// deploys them.
+    fn new(
+      fixture: PicaFixture,
+      root_files: &[(&str, &str)],
+      extra_files: &[(&str, &str)],
+    ) -> CliResult<Self> {
+      let target = fixture.target.clone();
+      let staging = fixture.work_path.join("deployed-staging");
+      let _ = fs::remove_dir_all(&staging);
+      let text = format!("{MANIFEST_DEMO}pkgmgr = pica\n");
+      write_file(&staging.join(MANIFEST), &text);
+      for (relative, contents) in root_files {
+        write_file(&staging.join(ROOT).join(relative), contents);
+      }
+      for (relative, contents) in extra_files {
+        write_file(&staging.join(relative), contents);
+      }
+
+      let mut out = Self {
+        fixture,
+        target,
+        staging,
+        manifest: Manifest::from_text(&text).expect("a well-formed manifest"),
+        scripts: ScriptConfig {
+          install: String::new(),
+          update: String::new(),
+          remove: String::new(),
+          keep_all: false,
+          keep_install: false,
+          keep_update: false,
+          keep_remove: false,
+        },
+        tx: InstallTransaction::new(),
+      };
+      out.deploy()?;
+      Ok(out)
+    }
+
+    /// Runs step 7: the copies are taken, then the payload replaces what was
+    /// there. A deploy that is *expected* to fail returns the error instead of
+    /// the transaction, because then the rollback has nothing of this install's
+    /// to undo.
+    fn deploy(&mut self) -> CliResult<()> {
+      let ctx = InstallContext {
+        target: &self.target,
+        tmpdir: &self.staging,
+        pkgfile: &self.staging,
+        pkgname: "demo",
+        selector: "demo",
+        pkgmgr: "pica",
+        manifest: &self.manifest,
+        scripts: &self.scripts,
+        is_upgrade: false,
+        source: EntrySource::Repo,
+      };
+      deploy_payload(&self.fixture.app, &ctx, &mut self.tx)
+    }
+
+    fn path(&self, relative: &str) -> PathBuf {
+      self.fixture.path(relative)
+    }
+
+    /// Removes the directory `relative` lives in and plants a regular file at
+    /// its name. That makes a restore fail for a reason the filesystem
+    /// guarantees rather than one a test fakes: the copy is still there, the
+    /// destination's directory is not.
+    fn make_the_restore_fail(&mut self, relative: &str) {
+      let parent = self.path(relative).parent().expect("a path with a parent").to_path_buf();
+      fs::remove_dir_all(&parent).expect("remove the directory");
+      fs::write(&parent, "not a directory\n").expect("plant a file in its place");
+    }
+
+    /// Runs the rollback and reports what it could not undo.
+    fn rollback(&mut self) -> Vec<String> {
+      let ctx = InstallContext {
+        target: &self.target,
+        tmpdir: &self.staging,
+        pkgfile: &self.staging,
+        pkgname: "demo",
+        selector: "demo",
+        pkgmgr: "pica",
+        manifest: &self.manifest,
+        scripts: &self.scripts,
+        is_upgrade: false,
+        source: EntrySource::Repo,
+      };
+      self.tx.rollback(&mut self.fixture.app, &ctx)
+    }
+  }
+
+  /// The store directories under `<cache>/backup` that a transaction kept.
+  fn backup_stores(fixture: &PicaFixture) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(fixture.app.paths.cache_dir.join("backup")) else {
+      return Vec::new();
+    };
+    let mut stores: Vec<PathBuf> =
+      entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+    stores.sort();
+    stores
+  }
+
+  #[test]
+  fn a_rollback_after_a_full_deploy_restores_every_file_it_replaced() {
+    let fixture = PicaFixture::new();
+    for (relative, contents) in
+      [("etc/demo.conf", "operator one\n"), ("etc/app/settings.json", "operator two\n")]
+    {
+      write_file(&fixture.path(relative), contents);
+    }
+
+    let mut deployed = Deployed::new(
+      fixture,
+      &[("etc/demo.conf", "payload one\n"), ("etc/app/settings.json", "payload two\n")],
+      &[],
+    )
+    .expect("a payload of plain files deploys");
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/demo.conf")).expect("read"),
+      "payload one\n",
+      "the deploy really did replace what was there"
+    );
+
+    let leftovers = deployed.rollback();
+    assert!(leftovers.is_empty(), "the rollback should undo everything: {leftovers:?}");
+    assert_eq!(fs::read_to_string(deployed.path("etc/demo.conf")).expect("read"), "operator one\n");
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/app/settings.json")).expect("read"),
+      "operator two\n",
+      "every file the walk replaced comes back, not only the first"
+    );
+  }
+
+  #[test]
+  fn a_rollback_restores_the_env_file_the_install_overwrote() {
+    let fixture = PicaFixture::new();
+    write_file(
+      &fixture.path("etc/pica/env.d/demo.env"),
+      "PICA_KEEP_SCRIPT_INSTALL=true\noperator\n",
+    );
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+
+    let mut deployed = Deployed::new(
+      fixture,
+      &[("etc/demo.conf", "payload\n")],
+      &[("scripts/.env", "PICA_KEEP_SCRIPT_INSTALL=true\nnew\n")],
+    )
+    .expect("the payload and the env file both land");
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/pica/env.d/demo.env")).expect("read"),
+      "PICA_KEEP_SCRIPT_INSTALL=true\nnew\n",
+      "the artifact's env file replaced the operator's"
+    );
+
+    let leftovers = deployed.rollback();
+    assert!(leftovers.is_empty(), "the rollback should undo everything: {leftovers:?}");
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/pica/env.d/demo.env")).expect("read"),
+      "PICA_KEEP_SCRIPT_INSTALL=true\noperator\n",
+      "a file Pica owns is still the operator's file, and it goes back like any other"
+    );
+    assert_eq!(fs::read_to_string(deployed.path("etc/demo.conf")).expect("read"), "operator\n");
+  }
+
+  #[test]
+  fn a_symlink_the_payload_replaced_comes_back_as_a_symlink() {
+    let fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/keep.conf"), "operator\n");
+    symlink("keep.conf", fixture.path("etc/demo.conf")).expect("create the pre-existing link");
+
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+    assert!(
+      !deployed.path("etc/demo.conf").is_symlink(),
+      "the rename replaced the link with the artifact's file"
+    );
+
+    let leftovers = deployed.rollback();
+    assert!(leftovers.is_empty(), "the rollback should undo everything: {leftovers:?}");
+    assert_eq!(
+      fs::read_link(deployed.path("etc/demo.conf")).expect("read the link"),
+      Path::new("keep.conf"),
+      "what comes back is the link itself, not a copy of what it pointed at"
+    );
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/keep.conf")).expect("read"),
+      "operator\n",
+      "and nothing was ever written through it"
+    );
+  }
+
+  #[test]
+  fn an_empty_directory_the_payload_replaced_comes_back_as_a_directory() {
+    let fixture = PicaFixture::new();
+    fs::create_dir_all(fixture.path("etc")).expect("create the parent");
+    fs::create_dir(fixture.path("etc/demo.conf")).expect("create the empty directory");
+
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+    assert!(deployed.path("etc/demo.conf").is_file(), "a file took the empty directory's place");
+
+    let leftovers = deployed.rollback();
+    assert!(leftovers.is_empty(), "the rollback should undo everything: {leftovers:?}");
+    assert!(
+      deployed.path("etc/demo.conf").is_dir(),
+      "the path is a directory again, which is what it was"
+    );
+  }
+
+  #[test]
+  fn a_hard_linked_destination_keeps_its_other_name_and_its_content() {
+    let fixture = PicaFixture::new();
+    let original = fixture.path("etc/demo.conf");
+    write_file(&original, "operator\n");
+    let alias = fixture.path("etc/alias.conf");
+    fs::hard_link(&original, &alias).expect("create the second name");
+
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+    assert_eq!(
+      fs::read_to_string(&alias).expect("read"),
+      "operator\n",
+      "the rename put a new inode at the destination, so the other name never changed"
+    );
+
+    let leftovers = deployed.rollback();
+    assert!(leftovers.is_empty(), "the rollback should undo everything: {leftovers:?}");
+    assert_eq!(fs::read_to_string(deployed.path("etc/demo.conf")).expect("read"), "operator\n");
+    assert_eq!(
+      fs::read_to_string(&alias).expect("read"),
+      "operator\n",
+      "both names hold the bytes the device had; that they are now two inodes is what \
+       restoring one file by rename means"
+    );
+  }
+
+  #[test]
+  fn a_restore_that_cannot_put_a_file_back_keeps_the_copies_and_names_the_path() {
+    let fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+    let stores = backup_stores(&deployed.fixture);
+    assert_eq!(stores.len(), 1, "the deploy kept exactly one store: {stores:?}");
+
+    deployed.make_the_restore_fail("etc/demo.conf");
+    let leftovers = deployed.rollback();
+
+    assert_eq!(leftovers.len(), 1, "the file that could not go back is reported: {leftovers:?}");
+    assert!(leftovers[0].starts_with("content:"), "it is named as content: {leftovers:?}");
+    assert!(leftovers[0].contains("etc/demo.conf"), "with its path: {leftovers:?}");
+    assert_eq!(
+      backup_stores(&deployed.fixture),
+      stores,
+      "the copies stay where the message says they are — they are the only version of that \
+       file left on the device"
+    );
+  }
+
+  #[test]
+  fn a_completed_restore_leaves_nothing_to_do_a_second_time() {
+    let fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+
+    assert!(deployed.rollback().is_empty(), "the first rollback undid everything");
+    let second = deployed.rollback();
+    assert!(
+      second.is_empty(),
+      "a rollback of an install already rolled back reports nothing: {second:?}"
+    );
+    assert_eq!(
+      fs::read_to_string(deployed.path("etc/demo.conf")).expect("read"),
+      "operator\n",
+      "and does not disturb what is already back"
+    );
+    assert!(backup_stores(&deployed.fixture).is_empty(), "the store went with the first rollback");
+  }
+
+  #[test]
+  fn a_successful_install_removes_the_copies_it_took() {
+    let mut fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n")],
+        &[],
+        &[],
+      )
+      .expect("the install completes");
+
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/demo.conf")).expect("read"),
+      "payload\n",
+      "the install is the one that wins"
+    );
+    assert!(backup_stores(&fixture).is_empty(), "a committed install collects its own copies");
+  }
+
+  #[test]
+  fn a_recorded_install_names_the_file_it_replaced_and_says_nothing_about_the_copies() {
+    let mut fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n")],
+        &[],
+        &[],
+      )
+      .expect("the install completes");
+
+    // The record is the same one it always was: the file this install wrote,
+    // whether or not that file was already there. Keeping a copy of the previous
+    // content adds no path to it, which is why the copy is not installed, not
+    // counted, and not something `-R` can delete.
+    let record = db_record(&fixture.app, "demo").expect("the install is recorded");
+    let text = record.to_string();
+    assert!(text.contains("etc/demo.conf"), "the replaced path is owned: {text}");
+    assert!(!text.contains("cache/backup"), "the copy is not: {text}");
+
+    crate::commands::remove::pkg(&mut fixture.app, "demo").expect("uninstall");
+    assert!(
+      !fixture.path("etc/demo.conf").exists(),
+      "and the uninstall that follows the existing ownership policy still removes it"
+    );
+  }
+
+  #[test]
+  fn an_install_that_replaces_nothing_never_makes_a_backup_directory() {
+    let mut fixture = PicaFixture::new();
+
+    fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n")],
+        &[],
+        &[],
+      )
+      .expect("a first install completes");
+
+    assert!(
+      !fixture.app.paths.cache_dir.join("backup").exists(),
+      "an install that destroys nothing copies nothing, so it creates no directory either"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn the_copies_are_only_readable_by_the_user_who_installed_them() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = PicaFixture::new();
+    let original = fixture.path("etc/demo.conf");
+    write_file(&original, "operator\n");
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o644))
+      .expect("make the device file world-readable");
+
+    let mut deployed =
+      Deployed::new(fixture, &[("etc/demo.conf", "payload\n")], &[]).expect("the file lands");
+    // A restore that fails keeps the store, which is the only moment the copies
+    // are on disk while a test can still look at them.
+    deployed.make_the_restore_fail("etc/demo.conf");
+    assert_eq!(deployed.rollback().len(), 1, "kept so the copies are still there");
+
+    let store = backup_stores(&deployed.fixture).into_iter().next().expect("one store");
+    let mode = fs::metadata(&store).expect("stat the store").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the store itself is the installer's alone");
+    let copies: Vec<PathBuf> =
+      fs::read_dir(&store).expect("read the store").flatten().map(|entry| entry.path()).collect();
+    assert!(!copies.is_empty(), "the copy of the replaced file is in the store");
+    for copy in copies {
+      assert_eq!(
+        fs::symlink_metadata(&copy).expect("stat the copy").permissions().mode() & 0o777,
+        0o600,
+        "{} was world-readable on the device; the copy of it is not",
+        copy.display()
+      );
+    }
+  }
+
+  #[test]
+  fn a_backup_that_cannot_be_written_stops_the_install_before_anything_is_written() {
+    let mut fixture = PicaFixture::new();
+    write_file(&fixture.path("etc/demo.conf"), "operator\n");
+    write_file(&fixture.path("aaa.conf"), "operator too\n");
+    // The cache directory's backup root is a regular file, so making a store in
+    // it fails with `ENOTDIR` for any user, root included.
+    let blocker = fixture.app.paths.cache_dir.join("backup");
+    write_file(&blocker, "not a directory\n");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n"), ("aaa.conf", "payload too\n")],
+        &[],
+        &[],
+      )
+      .expect_err("the copies cannot be kept");
+
+    assert!(
+      err.message.contains("backup"),
+      "the message names the store it could not make: {}",
+      err.message
+    );
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/demo.conf")).expect("read"),
+      "operator\n",
+      "the file the walk would have replaced is untouched"
+    );
+    assert_eq!(
+      fs::read_to_string(fixture.path("aaa.conf")).expect("read"),
+      "operator too\n",
+      "and so is the one it would have replaced"
+    );
+    assert!(db_record(&fixture.app, "demo").is_none(), "and nothing was recorded");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_socket_at_a_payload_destination_stops_the_install_before_anything_is_written() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let mut fixture = PicaFixture::new();
+    let blocker = fixture.path("etc/demo.conf");
+    write_file(&fixture.path("etc/other.conf"), "operator\n");
+    std::os::unix::net::UnixListener::bind(&blocker).expect("bind a socket at the destination");
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\n"),
+        &[("etc/demo.conf", "payload\n"), ("aaa.conf", "payload too\n")],
+        &[],
+        &[],
+      )
+      .expect_err("a socket cannot be put back from a copy");
+
+    assert!(err.message.contains("neither a file, a symlink nor a directory"), "{}", err.message);
+    assert!(
+      fs::symlink_metadata(&blocker).expect("stat").file_type().is_socket(),
+      "the socket is exactly what it was"
+    );
+    assert!(
+      !fixture.path("aaa.conf").exists(),
+      "not even the file the walk would have reached first was written"
+    );
+    assert_eq!(
+      fs::read_to_string(fixture.path("etc/other.conf")).expect("read"),
+      "operator\n",
+      "the device kept every byte it had"
+    );
+    assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_finish_that_cannot_remove_the_copies_leaves_them_and_says_so() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut app = test_app(dir.path());
+    let original = dir.path().join("device.conf");
+    fs::write(&original, "operator\n").expect("write the device file");
+
+    let mut backup = PayloadBackup::new(&app, "demo");
+    let metadata = fs::symlink_metadata(&original).expect("stat the device file");
+    backup.back_up(&original, &metadata).expect("keep a copy");
+    let store = backup.dir.as_ref().expect("the copy made a store").path().to_path_buf();
+
+    let mut tx = InstallTransaction::new();
+    tx.payload_backup = Some(backup);
+    tx.finish_with(
+      &mut app,
+      |_| Ok(()),
+      |_| Ok(()),
+      |_| Err(std::io::Error::other("simulated copy removal failure")),
+    );
+
+    assert!(store.is_dir(), "the install completed, but the copies were not deleted with it");
+    assert_eq!(
+      fs::read_dir(&store).expect("read the store").flatten().count(),
+      1,
+      "and the copy it made of the file it replaced is still inside"
+    );
+  }
+
+  #[test]
+  fn a_failed_env_copy_restores_the_file_that_was_already_there() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app = test_app(dir.path());
+    let target = dir.path().join("demo.env");
+    fs::write(&target, "original\n").expect("write the env file the operator left");
+
+    // The same store step 7 hands the env file to. It is taken directly here
+    // because the copy failure this test needs — a write that dies after
+    // truncating — is not something a filesystem can be made to do on demand.
+    let mut backup = PayloadBackup::new(&app, "demo");
+    backup
+      .back_up(&target, &fs::symlink_metadata(&target).expect("stat the env file"))
+      .expect("keep the copy");
+    let mut tx = InstallTransaction::new();
+    tx.payload_backup = Some(backup);
+
+    copy_recording_new_target(&mut tx, &target, true, || {
+      fs::write(&target, "partial").expect("truncate and rewrite the env file");
+      Err(std::io::Error::other("simulated write failure"))
+    })
+    .expect_err("the copy fails");
+    assert_eq!(
+      fs::read_to_string(&target).expect("read"),
+      "partial",
+      "the record on its own leaves the half-written file in place"
+    );
+
+    let failed = tx.payload_backup.as_mut().expect("the transaction holds the store").restore();
+    assert!(failed.is_empty(), "the env file goes back: {failed:?}");
+    assert_eq!(
+      fs::read_to_string(&target).expect("read"),
+      "original\n",
+      "the copy taken before the copy is what puts it back"
+    );
+    assert!(
+      tx.created_records.is_empty(),
+      "and the env file, which existed already, is still not this install's to remove"
     );
   }
 
@@ -3273,6 +5180,7 @@ arch = all
       &mut app,
       |_| Err(std::io::Error::other("simulated removal failure")),
       |_| Ok(()),
+      |dir| fs::remove_dir_all(dir),
     );
 
     assert!(backup.is_dir(), "the backup is still there");
@@ -3301,6 +5209,7 @@ arch = all
       &mut app,
       |dir| fs::remove_dir_all(dir),
       |_| Err(std::io::Error::other("simulated marker removal failure")),
+      |dir| fs::remove_dir_all(dir),
     );
 
     assert!(!backup.exists(), "the backup is gone");
