@@ -192,7 +192,7 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   );
   field("Installed From", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
   field("License", &manifest_get_first(manifest, "license"));
-  field("Visibility", &manifest_get_first(manifest, "visibility"));
+  field("Source Avail", &manifest_get_first(manifest, "source_availability"));
   field("Requires", &declared_constraints(manifest, installed::entry_backend(entry).kind.as_str()));
   if let Some(depends) = backend_dependencies(app, entry) {
     field("Depends", &depends);

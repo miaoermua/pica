@@ -117,6 +117,13 @@ mod tests {
   }
 
   #[test]
+  fn keeps_source_availability_for_the_installed_manifest() {
+    let out = rewrite("pkgname = hello\nsource_availability = partial\n", "pica");
+    assert!(out.contains("source_availability = partial"), "{out}");
+    assert!(!out.contains("visibility"), "the retired key must not be written: {out}");
+  }
+
+  #[test]
   fn writes_the_pica_backend_into_the_artifact() {
     let out = rewrite("pkgname = hello\ntargets = pica\n", "pica");
     assert!(out.contains("pkgmgr = pica"));

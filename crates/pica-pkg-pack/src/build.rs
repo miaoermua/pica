@@ -9,7 +9,7 @@ use pica_pkg_core::error::{PicaError, PicaResult};
 use pica_pkg_core::io::{
   copy_dir_recursive, ensure_dir, make_temp_dir, resolve_script_dir_from_exe, write_atomic,
 };
-use pica_pkg_core::manifest::Manifest;
+use pica_pkg_core::manifest::{Manifest, SOURCE_AVAILABILITY_VALUES, is_valid_source_availability};
 use pica_pkg_core::repo::{
   BACKEND_INDEX_SCHEMA, BackendIndex, ENTRY_SCHEMA, EntryDescriptor, EntryManager, Package,
   package_filename, parse_backend_index, parse_entry_descriptor,
@@ -61,6 +61,8 @@ pub(crate) fn main_build(
       "source manifest must not declare `pkgmgr`; use `targets` (the packer writes `pkgmgr` into each artifact)",
     ));
   }
+
+  check_source_availability(&manifest)?;
 
   let pkgname = manifest.require_non_empty("pkgname")?;
   let _appname = manifest.require_non_empty("appname")?;
@@ -161,6 +163,21 @@ pub(crate) fn main_build(
     }
   }
 
+  Ok(())
+}
+
+/// Refuses a `source_availability` the device's precheck and the index reject.
+///
+/// The field is descriptive, but an unknown value would still make the
+/// artifact uninstallable, so the packer stops before writing anything.
+fn check_source_availability(manifest: &Manifest) -> PicaResult<()> {
+  let value = manifest.get_first("source_availability");
+  if !is_valid_source_availability(&value) {
+    return Err(PicaError::msg(format!(
+      "invalid source_availability value: {value} (supported: {})",
+      SOURCE_AVAILABILITY_VALUES.join(", ")
+    )));
+  }
   Ok(())
 }
 
@@ -598,7 +615,7 @@ fn write_repo_index(
     luci_desc: text("luci_desc"),
     pkgdesc: text("pkgdesc"),
     license: text("license"),
-    visibility: text("visibility"),
+    source_availability: text("source_availability"),
     pica: text("pica").or_else(|| (!req.pica.is_empty()).then(|| req.pica.to_string())),
     download_url: None,
     size: Some(install_size),
@@ -819,7 +836,7 @@ mod tests {
       pkgdir.join("manifest"),
       "pkgname = luci-app-demo\nappname = demo\npkgver = 1.0.0\npkgrel = 1\nos = openwrt\n\
        branch = stable\nprotocol = luci\nurl = https://example.invalid/demo\npkgdesc = demo\n\
-       visibility = open\napp = demo\napp = luci-app-demo\nbase = luci-base\nbase = rpcd\n\
+       source_availability = partial\napp = demo\napp = luci-app-demo\nbase = luci-base\nbase = rpcd\n\
        builddate = 1\nsize = 4096\n",
     )
     .expect("write manifest");
@@ -858,6 +875,8 @@ mod tests {
     assert_eq!(pkg.protocol.as_deref(), Some("luci"));
     assert_eq!(pkg.url.as_deref(), Some("https://example.invalid/demo"));
     assert_eq!(pkg.os.as_deref(), Some("openwrt"));
+    assert_eq!(pkg.source_availability.as_deref(), Some("partial"));
+    assert!(!text.contains("\"visibility\""), "the index must carry the new key only: {text}");
     assert_eq!(pkg.size, Some(4096));
     assert_eq!(pkg.csize, Some(2048));
     assert_eq!(
@@ -888,6 +907,63 @@ mod tests {
     )
     .expect("the source root must carry an entry descriptor");
     assert_eq!(entry.managers["apk"].path, "output/index.json");
+  }
+
+  #[test]
+  fn rewriting_an_index_drops_the_retired_field() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let pkgdir = tmp.path().join("pkgdir");
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&pkgdir).expect("mkdir pkgdir");
+    fs::create_dir_all(&output).expect("mkdir output");
+    // An index built before the rename: `visibility` is still in the entry and
+    // in the manifest the entry embeds.
+    let old = serde_json::json!({
+      "schema": 1,
+      "mgr": "apk",
+      "packages": [{
+        "pkgname": "old",
+        "pkgver": "1.0.0",
+        "pkgrel": "1",
+        "pkgmgr": "apk",
+        "platform": "all",
+        "arch": "all",
+        "filename": "old-1.0.0-1-all-apk.pkg.tar.gz",
+        "sha256": "a".repeat(64),
+        "visibility": "mix",
+        "manifest": {"visibility": "mix"}
+      }]
+    });
+    fs::write(output.join("index.json"), old.to_string()).expect("write the pre-rename index");
+    fs::write(pkgdir.join("manifest"), format!("{BASE_MANIFEST}source_availability = open\n"))
+      .expect("write manifest");
+
+    let manifest =
+      pica_pkg_core::manifest::Manifest::from_file(pkgdir.join("manifest")).expect("parse");
+    let req = BuildRequest {
+      pkgdir: &pkgdir,
+      output_dir: &output,
+      pkgname: "hello",
+      pkgver: "1.0.0",
+      pkgrel: "1",
+      build_platform: "all",
+      build_arch: "all",
+      pica: "",
+      has_matrix: false,
+      backend: BuildBackend::Apk,
+    };
+    write_repo_index(&req, &manifest, "hello-1.0.0-1-all-apk.pkg.tar.gz", &"b".repeat(64), 1, 1)
+      .expect("rewrite index");
+
+    let text = fs::read_to_string(output.join("index.json")).expect("read index");
+    assert!(!text.contains("\"visibility\""), "the retired key must not survive: {text}");
+    assert!(!text.contains("\"mix\""), "the retired value must not survive: {text}");
+    let parsed = parse_backend_index(&text, "apk").expect("valid index");
+    let old = parsed.packages.iter().find(|pkg| pkg.pkgname == "old").expect("old entry stays");
+    assert_eq!(
+      old.source_availability, None,
+      "the retired value must not be reinterpreted as the new field"
+    );
   }
 
   #[test]
@@ -960,6 +1036,20 @@ mod tests {
 
     let err = main_build(&root, Some(root.join("out")), None).expect_err("pkgmgr must be rejected");
     assert!(err.to_string().contains("must not declare `pkgmgr`"));
+  }
+
+  #[test]
+  fn build_rejects_an_unknown_source_availability() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("scripts")).expect("mkdir scripts");
+    fs::write(root.join("scripts/install"), "#!/bin/sh\nexit 0\n").expect("write script");
+    write_pkgdir(&root, &format!("{BASE_MANIFEST}source_availability = source-available\n"));
+
+    let err = main_build(&root, Some(root.join("out")), None).expect_err("undeclared value");
+    assert!(err.to_string().contains("invalid source_availability"), "{err}");
+    assert!(err.to_string().contains("open, partial, closed"), "{err}");
+    assert!(!root.join("out").exists(), "validation runs before any output is made");
   }
 
   #[test]

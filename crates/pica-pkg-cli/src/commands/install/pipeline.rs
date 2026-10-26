@@ -66,7 +66,7 @@ pub(super) struct PackageFields {
   pub(super) uname: String,
   pub(super) luci: String,
   pub(super) pkgmgr: String,
-  pub(super) visibility: String,
+  pub(super) source_availability: String,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -374,7 +374,7 @@ fn pkgfile_into(
     uname: manifest.get_first("uname"),
     luci: manifest.get_first("luci"),
     pkgmgr,
-    visibility: manifest.get_first("visibility"),
+    source_availability: manifest.get_first("source_availability"),
   };
 
   let env_file = tmpdir.join(SCRIPTS).join(".env");
@@ -2735,7 +2735,7 @@ fn record_installation(
     let origin = manifest_stored.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
     manifest_stored["url"] = json!(origin);
   }
-  for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "visibility"] {
+  for key in ["branch", "protocol", "url", "luci_url", "luci_desc", "source_availability"] {
     if manifest_stored.get(key).is_none() {
       manifest_stored[key] = json!("");
     }
@@ -3236,6 +3236,70 @@ arch = all
     assert_eq!(err.code, E_PACKAGE_INVALID);
     assert!(!fixture.path("etc/demo.conf").exists(), "validation runs before anything is written");
     assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn every_declared_source_availability_is_installed_and_recorded() {
+    for value in ["open", "partial", "closed"] {
+      let mut fixture = PicaFixture::new();
+      fixture
+        .install_without_containers(
+          &format!("{MANIFEST_DEMO}pkgmgr = pica\nsource_availability = {value}\n"),
+          &[("etc/demo.conf", "overlay\n")],
+          &[],
+          &[],
+        )
+        .unwrap_or_else(|err| panic!("{value} must install: {}", err.message));
+
+      let record = db_record(&fixture.app, "demo").expect("the install is recorded");
+      assert_eq!(
+        record["manifest"]["source_availability"].as_str(),
+        Some(value),
+        "the recorded manifest keeps the value the artifact declared"
+      );
+    }
+  }
+
+  #[test]
+  fn an_unknown_source_availability_is_refused_before_anything_is_written() {
+    let mut fixture = PicaFixture::new();
+
+    let err = fixture
+      .install_without_containers(
+        &format!("{MANIFEST_DEMO}pkgmgr = pica\nsource_availability = public\n"),
+        &[("etc/demo.conf", "overlay\n")],
+        &[],
+        &[],
+      )
+      .expect_err("`public` is not one of the declared values");
+
+    assert_eq!(err.code, E_CONFIG_INVALID);
+    assert!(err.message.contains("invalid source_availability"), "{}", err.message);
+    assert!(err.message.contains("open, partial, closed"), "{}", err.message);
+    assert!(!fixture.path("etc/demo.conf").exists(), "the precheck runs before any deployment");
+    assert!(db_record(&fixture.app, "demo").is_none());
+  }
+
+  #[test]
+  fn a_package_that_declares_no_source_availability_is_still_installed() {
+    for declaration in ["", "source_availability =\n"] {
+      let mut fixture = PicaFixture::new();
+      fixture
+        .install_without_containers(
+          &format!("{MANIFEST_DEMO}pkgmgr = pica\n{declaration}"),
+          &[("etc/demo.conf", "overlay\n")],
+          &[],
+          &[],
+        )
+        .unwrap_or_else(|err| panic!("{declaration:?} must be accepted: {}", err.message));
+
+      let record = db_record(&fixture.app, "demo").expect("the install is recorded");
+      assert_eq!(
+        record["manifest"]["source_availability"].as_str(),
+        Some(""),
+        "an undeclared value is stored as empty, the same way the other optional fields are"
+      );
+    }
   }
 
   #[test]

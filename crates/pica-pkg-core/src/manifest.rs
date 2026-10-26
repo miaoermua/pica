@@ -8,6 +8,22 @@ use std::path::Path;
 /// Separator for backend-scoped overrides, e.g. `app@apk = demo-v3`.
 pub const BACKEND_SCOPE: char = '@';
 
+/// The values `source_availability` may take.
+///
+/// The field itself is optional: an empty value means "not declared", which is
+/// why it is accepted by [`is_valid_source_availability`] rather than listed
+/// here. `partial` replaced `mix` in a one-time rename; `mix` is not accepted.
+pub const SOURCE_AVAILABILITY_VALUES: [&str; 3] = ["open", "partial", "closed"];
+
+/// Whether a declared `source_availability` is one the protocol defines.
+///
+/// An empty value is "not declared" and is valid; a non-empty value must match
+/// one of [`SOURCE_AVAILABILITY_VALUES`] exactly.
+#[must_use]
+pub fn is_valid_source_availability(value: &str) -> bool {
+  value.is_empty() || SOURCE_AVAILABILITY_VALUES.contains(&value)
+}
+
 /// Build targets declared in a source manifest (`targets = opkg`).
 ///
 /// Accepts both the repeatable form and a comma-separated list so that the
@@ -275,7 +291,7 @@ fn value_to_text(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::Manifest;
+  use super::{Manifest, is_valid_source_availability};
 
   #[test]
   fn parse_manifest_repeatable() {
@@ -363,5 +379,26 @@ mod tests {
     assert_eq!(mixed.targets(), vec!["opkg", "apk", "pica"]);
 
     assert!(Manifest::from_text("pkgname = x").expect("parse").targets().is_empty());
+  }
+
+  #[test]
+  fn source_availability_accepts_the_declared_values_and_nothing_else() {
+    for value in ["open", "partial", "closed", ""] {
+      assert!(is_valid_source_availability(value), "{value:?} must be accepted");
+    }
+    for value in ["mix", "public", "Open", " open", "closed "] {
+      assert!(!is_valid_source_availability(value), "{value:?} must be refused");
+    }
+  }
+
+  #[test]
+  fn a_manifest_reads_source_availability_under_its_own_key() {
+    let manifest =
+      Manifest::from_text("pkgname = demo\nsource_availability = partial\n").expect("parse");
+    assert_eq!(manifest.get_first("source_availability"), "partial");
+    assert!(
+      !manifest.has("visibility"),
+      "the retired key must not be read as an alias for the new one"
+    );
   }
 }
