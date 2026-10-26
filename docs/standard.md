@@ -398,7 +398,7 @@ pica = 0.2.8
 pkgdesc = Example lifecycle package
 packager = pica-pack
 license = GPL-3.0-only
-visibility = open
+source_availability = open
 url = https://github.com/miaoermua/pica
 luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hello
 branch = stable
@@ -456,7 +456,7 @@ size = <bytes>
 
 # license metadata
 license = GPL-3.0-only
-visibility = open
+source_availability = open
 ```
 
 约定：
@@ -726,20 +726,25 @@ luci = js2
 - 包含 `type = luci`：必须同时声明 `luci = lua1|js2`
 - `pica -U` 会尝试检测本机 LuCI 实现并匹配；无法检测或不匹配则安装失败
 
-## 许可证（license / visibility）
+## 许可证与源码公开程度（license / source_availability）
 
-manifest 中允许定义许可证信息：
+manifest 中允许分别定义许可证与源码的公开可获取程度：
 
 ```
 license = GPL-3.0-only
-visibility = open
+source_availability = open
 ```
 
 约定：
 
-- `license`：建议用 SPDX 标识（例如 `GPL-3.0-only`、`MIT`、`Apache-2.0`）
-- `visibility`：软件可见性标签，取值只能是 `open|mix|closed`
-- 当前版本只做“定义与展示”，不做任何许可证强制校验
+- `license`：软件许可证，建议用 SPDX 标识（例如 `GPL-3.0-only`、`MIT`、`Apache-2.0`）。
+- `source_availability`：源码的公开可获取程度，取值只能是 `open|partial|closed`：
+  - `open`：完整源码公开可获取。
+  - `partial`：部分源码公开可获取，或软件由公开源码部分与未公开部分共同组成。
+  - `closed`：源码未公开可获取。
+- `source_availability` 可省略；省略或留空表示未声明，不做默认推断。写了非空值时必须是上述三种之一，否则打包与安装前校验都会拒绝。
+- 两者描述不同事实：不得根据 `source_availability` 推断许可证类型或许可证合规性；`closed` 不等同于专有软件。
+- 当前版本只校验字段取值并展示，不校验许可证内容，也不推断许可证合规性。
 
 ## LICENSE 文件（包内可选）
 
@@ -782,7 +787,7 @@ pkgrel = 1
 pkgdesc = Example LuCI application
 packager = example
 license = GPL-3.0-only
-visibility = open
+source_availability = open
 
 # 要构建的后端（可重复，默认 opkg）
 targets = opkg

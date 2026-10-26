@@ -170,7 +170,7 @@ const FULL_ROW: &str = r#"{
         "builddate": "2026-10-01",
         "size": "2048",
         "license": "MIT",
-        "visibility": "public"
+        "source_availability": "partial"
       },
       "pkgfile": "/tmp/full-app.pkg.tar.gz",
       "files": [],
@@ -533,12 +533,13 @@ fn qi_prints_the_fields_a_row_does_carry() {
       "Installed At",
       "Installed From",
       "License",
-      "Visibility"
+      "Source Avail"
     ],
     "{stdout}"
   );
   assert_eq!(field(&stdout, "Version"), "1.2.3-4");
   assert_eq!(field(&stdout, "License"), "MIT");
+  assert_eq!(field(&stdout, "Source Avail"), "partial");
   assert_eq!(field(&stdout, "Size"), "2048 (2.00 KiB)");
 }
 

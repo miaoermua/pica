@@ -8,7 +8,7 @@ use crate::platform::{
 };
 use crate::system::run_command_text;
 use pica_pkg_core::constraint::{self, Constraint};
-use pica_pkg_core::manifest::Manifest;
+use pica_pkg_core::manifest::{Manifest, SOURCE_AVAILABILITY_VALUES, is_valid_source_availability};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -404,14 +404,14 @@ pub(super) fn validate_package(
     ));
   }
 
-  if !pkg.visibility.is_empty()
-    && pkg.visibility != "open"
-    && pkg.visibility != "mix"
-    && pkg.visibility != "closed"
-  {
+  if !is_valid_source_availability(&pkg.source_availability) {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("invalid visibility value: {} (supported: open, mix, closed)", pkg.visibility),
+      format!(
+        "invalid source_availability value: {} (supported: {})",
+        pkg.source_availability,
+        SOURCE_AVAILABILITY_VALUES.join(", ")
+      ),
     ));
   }
 
@@ -437,11 +437,12 @@ pub(super) fn validate_package(
     }
   }
 
-  // What this artifact declares about itself — version, os, arch, visibility,
-  // type — is in the manifest and in `-Qi`; the transaction header already said
-  // which package and which version is being installed. Printing the fields one
-  // per line here only buried the phase that followed, and every check above
-  // already refused a mismatch with an error naming both sides.
+  // What this artifact declares about itself — version, os, arch,
+  // source_availability, type — is in the manifest and in `-Qi`; the transaction
+  // header already said which package and which version is being installed.
+  // Printing the fields one per line here only buried the phase that followed,
+  // and every check above already refused a mismatch with an error naming both
+  // sides.
 
   Ok(())
 }

@@ -1,4 +1,5 @@
 use crate::error::{PicaError, PicaResult};
+use crate::manifest::{SOURCE_AVAILABILITY_VALUES, is_valid_source_availability};
 use crate::version::pkgver_cmp_key;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -38,8 +39,10 @@ pub struct Package {
   pub pkgdesc: Option<String>,
   #[serde(default)]
   pub license: Option<String>,
+  /// How much of the package's source is publicly available. Optional: an
+  /// absent or empty value means the entry does not declare it.
   #[serde(default)]
-  pub visibility: Option<String>,
+  pub source_availability: Option<String>,
   #[serde(default)]
   pub pica: Option<String>,
   #[serde(default)]
@@ -151,7 +154,7 @@ pub fn parse_entry_descriptor(content: &str) -> PicaResult<EntryDescriptor> {
 /// smuggle an `opkg` entry into its `apk` index, and a client never has to
 /// re-derive a backend from a filename.
 pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<BackendIndex> {
-  let parsed: BackendIndex = serde_json::from_str(content)?;
+  let mut parsed: BackendIndex = serde_json::from_str(content)?;
   if parsed.schema != BACKEND_INDEX_SCHEMA {
     return Err(PicaError::msg(format!(
       "backend index schema must be {BACKEND_INDEX_SCHEMA}, got {}",
@@ -171,6 +174,18 @@ pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<Back
         "package {}: pkgmgr {} does not match the index's {}",
         pkg.pkgname, pkg.pkgmgr, parsed.mgr
       )));
+    }
+  }
+
+  // `visibility` is the retired spelling of `source_availability`. It is not
+  // unknown data to forward: an index re-serialized from this parse (the
+  // client's cache, a packer's output) must not keep the old name alive. Drop
+  // it from the entry and the manifest it embeds; the entry then simply
+  // declares no availability.
+  for package in &mut parsed.packages {
+    package.extra.remove("visibility");
+    if let Some(manifest) = package.manifest.as_mut().and_then(|value| value.as_object_mut()) {
+      manifest.remove("visibility");
     }
   }
 
@@ -259,6 +274,17 @@ pub fn validate_packages(packages: &[Package]) -> PicaResult<()> {
         pkg.pkgmgr,
         SUPPORTED_PKGMGRS.join(", ")
       )));
+    }
+
+    if let Some(value) = &pkg.source_availability {
+      if !is_valid_source_availability(value) {
+        return Err(PicaError::msg(format!(
+          "package {}: invalid source_availability value: {} (supported: {})",
+          pkg.pkgname,
+          value,
+          SOURCE_AVAILABILITY_VALUES.join(", ")
+        )));
+      }
     }
 
     validate_filename(pkg)?;
@@ -538,6 +564,81 @@ mod tests {
       reserialized["packages"][0]["future_field"],
       json!({"nested": [1, 2, 3]}),
       "sync must not strip fields the struct does not model"
+    );
+  }
+
+  #[test]
+  fn source_availability_round_trips_under_its_own_key() {
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    pkg["source_availability"] = json!("partial");
+    let parsed = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("valid index");
+    assert_eq!(parsed.packages[0].source_availability.as_deref(), Some("partial"));
+
+    let reserialized = serde_json::to_value(&parsed).expect("serialize");
+    assert_eq!(reserialized["packages"][0]["source_availability"], json!("partial"));
+    assert!(
+      reserialized["packages"][0].get("visibility").is_none(),
+      "the retired key must not be written back"
+    );
+  }
+
+  #[test]
+  fn every_declared_source_availability_is_accepted() {
+    for value in ["open", "partial", "closed"] {
+      let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+      pkg["source_availability"] = json!(value);
+      let parsed =
+        parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("declared value");
+      assert_eq!(parsed.packages[0].source_availability.as_deref(), Some(value));
+    }
+  }
+
+  #[test]
+  fn an_index_refuses_an_unknown_source_availability() {
+    for value in ["mix", "proprietary", "OPEN"] {
+      let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+      pkg["source_availability"] = json!(value);
+      let err = parse_backend_index(&backend_index("opkg", &[pkg]), "opkg")
+        .expect_err("an undeclared value must not reach an install");
+      assert!(err.to_string().contains("source_availability"), "{value}: {err}");
+      assert!(err.to_string().contains("open, partial, closed"), "{value}: {err}");
+    }
+  }
+
+  #[test]
+  fn an_index_may_omit_or_leave_source_availability_empty() {
+    let pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    let parsed =
+      parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("omitted is valid");
+    assert_eq!(parsed.packages[0].source_availability, None);
+
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    pkg["source_availability"] = json!("");
+    let parsed =
+      parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("empty is unset");
+    assert_eq!(parsed.packages[0].source_availability.as_deref(), Some(""));
+  }
+
+  #[test]
+  fn the_retired_field_does_not_survive_an_index_round_trip() {
+    let mut pkg = entry("hello-1.0.0-1-all-opkg.pkg.tar.gz", "opkg");
+    pkg["visibility"] = json!("mix");
+    pkg["manifest"] = json!({"visibility": "mix"});
+    let parsed =
+      parse_backend_index(&backend_index("opkg", &[pkg]), "opkg").expect("an old index is read");
+    assert_eq!(
+      parsed.packages[0].source_availability, None,
+      "an old value must not be reinterpreted as the new field"
+    );
+
+    let reserialized = serde_json::to_value(&parsed).expect("serialize");
+    assert!(
+      reserialized["packages"][0].get("visibility").is_none(),
+      "the retired key must not be written back"
+    );
+    assert!(
+      reserialized["packages"][0]["manifest"].get("visibility").is_none(),
+      "the retired key must not survive inside the embedded manifest"
     );
   }
 
