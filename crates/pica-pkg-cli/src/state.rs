@@ -96,6 +96,76 @@ pub fn db_set_installed(
   write_json_atomic_pretty(db_file, &db)
 }
 
+/// Adds the paths a failed install left behind without replacing what the
+/// database already says about the package.
+///
+/// A first install that fails leaves files no entry names, so they are written
+/// as a new one: without it `-R` would have nothing to act on and the files
+/// would be unreachable. An upgrade that fails is not that case. Its rollback
+/// put the previous version's files back, and the entry for the package still
+/// describes that version; writing the new manifest over it would claim a
+/// version that is not on the device and drop the paths that *are*. The remnant
+/// is merged into the entry that is already there, keeping its manifest,
+/// `pkgfile` and `installed_at`.
+///
+/// Returns whether the package already had an entry.
+pub fn db_record_remnant(
+  db_file: &Path,
+  pkgname: &str,
+  manifest: &Value,
+  pkgfile: &str,
+  files: &[String],
+  dirs: &[String],
+) -> CliResult<bool> {
+  let mut db = read_json_file(db_file)?;
+  ensure_json_object_field(&mut db, "installed")?;
+
+  let installed = db
+    .get_mut("installed")
+    .and_then(Value::as_object_mut)
+    .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
+
+  if let Some(Value::Object(entry)) = installed.get_mut(pkgname) {
+    merge_owned_paths(entry, "files", files);
+    merge_owned_paths(entry, "dirs", dirs);
+    write_json_atomic_pretty(db_file, &db)?;
+    return Ok(true);
+  }
+
+  installed.insert(
+    pkgname.to_string(),
+    json!({
+        "manifest": manifest,
+        "pkgfile": pkgfile,
+        "files": files,
+        "dirs": dirs,
+        "installed_at": now_unix_secs(),
+    }),
+  );
+
+  write_json_atomic_pretty(db_file, &db)?;
+  Ok(false)
+}
+
+/// Appends the paths that are not already named, in the order given.
+fn merge_owned_paths(entry: &mut Map<String, Value>, key: &str, add: &[String]) {
+  if add.is_empty() {
+    return;
+  }
+
+  let list = entry.entry(key.to_string()).or_insert_with(|| json!([]));
+  let Some(items) = list.as_array_mut() else {
+    *list = json!(add);
+    return;
+  };
+
+  for path in add {
+    if !items.iter().any(|item| item.as_str() == Some(path.as_str())) {
+      items.push(json!(path));
+    }
+  }
+}
+
 pub fn db_del_installed(db_file: &Path, pkgname: &str) -> CliResult<()> {
   let mut db = read_json_file(db_file)?;
   ensure_json_object_field(&mut db, "installed")?;
@@ -363,7 +433,8 @@ pub(crate) fn cleanup_pkg_cache(app: &mut App) {
 #[cfg(test)]
 mod tests {
   use super::{
-    db_find_installed_pkgname_by_selector, ensure_json_object_field, write_json_atomic_pretty,
+    db_find_installed_pkgname_by_selector, db_record_remnant, db_set_installed,
+    ensure_json_object_field, read_json_file, write_json_atomic_pretty,
   };
   use crate::app::E_RUNTIME;
   use pica_pkg_core::selector::Selector;
@@ -379,6 +450,78 @@ mod tests {
     let mut invalid = json!({"installed": []});
     let err = ensure_json_object_field(&mut invalid, "installed").expect_err("must fail");
     assert_eq!(err.code, E_RUNTIME);
+  }
+
+  #[test]
+  fn a_remnant_is_added_to_the_entry_of_the_version_that_is_still_installed() {
+    // A failed upgrade restores the old files but cannot always remove the new
+    // ones. The entry still describes what is on the device, so it keeps its
+    // manifest and gains only the paths `-R` would otherwise never see.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db_file = dir.path().join("db.json");
+    write_json_atomic_pretty(&db_file, &json!({"schema": 1, "installed": {}})).expect("empty db");
+    db_set_installed(
+      &db_file,
+      "demo",
+      &json!({"pkgname": "demo", "pkgver": "1.0"}),
+      "demo-1.0.ipk",
+      &["usr/bin/demo".to_string()],
+      &[],
+    )
+    .expect("record the first version");
+    let installed_at = read_json_file(&db_file)
+      .expect("read db")
+      .pointer("/installed/demo/installed_at")
+      .cloned()
+      .expect("installed_at");
+
+    let existed = db_record_remnant(
+      &db_file,
+      "demo",
+      &json!({"pkgname": "demo", "pkgver": "2.0"}),
+      "demo-2.0.ipk",
+      &["usr/bin/demo".to_string(), "etc/demo.conf".to_string()],
+      &["etc".to_string()],
+    )
+    .expect("record the remnant");
+
+    assert!(existed, "the package had an entry");
+    let db = read_json_file(&db_file).expect("read db");
+    let entry = db.pointer("/installed/demo").expect("entry");
+    assert_eq!(entry["manifest"]["pkgver"], json!("1.0"), "the old version is what is on disk");
+    assert_eq!(entry["pkgfile"], json!("demo-1.0.ipk"));
+    assert_eq!(entry["installed_at"], installed_at, "the install itself is not new");
+    assert_eq!(
+      entry["files"],
+      json!(["usr/bin/demo", "etc/demo.conf"]),
+      "the surviving path is added once"
+    );
+    assert_eq!(entry["dirs"], json!(["etc"]));
+  }
+
+  #[test]
+  fn a_first_install_that_fails_is_recorded_so_its_files_can_be_removed() {
+    // Nothing on the device names these files: without an entry `-R` has
+    // nothing to read and the leftovers stay forever.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db_file = dir.path().join("db.json");
+    write_json_atomic_pretty(&db_file, &json!({"schema": 1, "installed": {}})).expect("empty db");
+
+    let existed = db_record_remnant(
+      &db_file,
+      "demo",
+      &json!({"pkgname": "demo", "pkgver": "2.0"}),
+      "demo-2.0.ipk",
+      &["etc/demo.conf".to_string()],
+      &[],
+    )
+    .expect("record the remnant");
+
+    assert!(!existed, "there was no entry to merge into");
+    let db = read_json_file(&db_file).expect("read db");
+    let entry = db.pointer("/installed/demo").expect("entry");
+    assert_eq!(entry["manifest"]["pkgver"], json!("2.0"));
+    assert_eq!(entry["files"], json!(["etc/demo.conf"]));
   }
 
   #[test]

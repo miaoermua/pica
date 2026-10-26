@@ -44,6 +44,9 @@ case "$1" in
   --version) printf 'apk-tools @VERSION@\n' ;;
   --print-arch) printf 'x86_64\n' ;;
   search) printf '%s-1.0.0\n' "$3" ;;
+  # `is_installed` is this sub-command's exit status. Nothing is installed in
+  # this stub, and saying otherwise would make every dependency look present.
+  info) exit 1 ;;
 esac
 exit 0
 "#;
@@ -77,18 +80,6 @@ case "$1" in
   --print-arch) printf 'x86_64\n' ;;
   search) printf '%s-1.0.0\n' "$3" ;;
   list) printf '%s-@INSTALLED@\n' "$4" ;;
-esac
-exit 0
-"#;
-
-/// The opkg counterpart: both `is_installed` and `installed_version` read
-/// `opkg status <name>`, so the line has to look like a real status block.
-const OPKG_STUB_WITH_INSTALLED: &str = r#"#!/bin/sh
-printf 'opkg %s\n' "$*" >> "$PICA_STUB_LOG"
-case "$1" in
-  status) printf 'Package: %s\nStatus: install user installed\nVersion: @INSTALLED@\n' "$2" ;;
-  info) printf 'Package: %s\nVersion: @INSTALLED@\n' "$2" ;;
-  print-architecture) printf 'all 100\n' ;;
 esac
 exit 0
 "#;
@@ -975,14 +966,12 @@ fn apk_stub_installed(version: &str) -> String {
   APK_STUB_WITH_INSTALLED.replace("@INSTALLED@", version)
 }
 
-fn opkg_stub_installed(version: &str) -> String {
-  OPKG_STUB_WITH_INSTALLED.replace("@INSTALLED@", version)
-}
-
 #[test]
-fn a_satisfied_bound_installs_the_name_and_nothing_else() {
-  // 1.1 installed, `>=1.0` and `>1.0` both hold. The request handed to apk is
-  // the name: this is the regression that keeps the bound on pica's side.
+fn an_installed_dependency_that_satisfies_its_bound_is_not_sent_again() {
+  // 1.1 installed, `>=1.0` and `>1.0` both hold. pica has no upgrade policy on
+  // this path, so it does not ask the backend for a name it already has — that
+  // is what keeps installing an app from upgrading a dependency in passing. The
+  // bound itself never reaches the backend either: it is pica's to check.
   let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, &apk_stub_installed("1.1"));
   let artifact = sandbox.container_artifact(
     "bound-apk",
@@ -995,10 +984,7 @@ fn a_satisfied_bound_installs_the_name_and_nothing_else() {
   sandbox.run(&["-U", artifact, "--feed-policy", "feed-first"]).success();
 
   let calls = sandbox.calls();
-  let adds = apk_add_targets(&calls);
-  assert_eq!(adds.len(), 2, "one request per phase: {calls}");
-  assert_eq!(adds[0], vec!["base-dep".to_string()], "the name, not the bound: {calls}");
-  assert_eq!(adds[1], vec!["app-dep".to_string()], "the name, not the bound: {calls}");
+  assert_eq!(apk_add_targets(&calls).len(), 0, "nothing is asked for again: {calls}");
   assert!(!calls.contains('>'), "no bound may reach the backend: {calls}");
   assert!(!calls.contains('<'), "no bound may reach the backend: {calls}");
 }
@@ -1023,9 +1009,10 @@ fn an_installed_version_that_misses_the_bound_stops_the_install() {
 
 #[test]
 fn opkg_is_asked_for_the_name_too() {
-  // The same bound under the other backend, read from `opkg status`. `opkg
-  // install base-dep>=1.0` would be a package called `base-dep>=1.0`.
-  let sandbox = Sandbox::with_stubs(EMPTY_DB, &opkg_stub_installed("1.1"), APK_STUB);
+  // The bound is pica's and never reaches the command line: `opkg install
+  // base-dep>=1.0` would be a package called `base-dep>=1.0`. The dependency is
+  // not installed here, so it is still sent — by name.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB);
   let artifact =
     sandbox.container_artifact("bound-opkg", "opkg", "base = base-dep>=1.0\n", &["demo.ipk"]);
   let artifact = artifact.to_str().expect("artifact path is utf-8");
@@ -1776,4 +1763,203 @@ fn a_failed_native_feed_install_prints_no_completion_and_keeps_the_error() {
   assert!(!stdout.contains(":: Transaction completed"), "{stdout}");
   assert.stderr(contains("install failed").and(contains("simulated failure")));
   assert!(sandbox.calls().contains("apk add"), "{}", sandbox.calls());
+}
+
+// -- Dependency transaction and Pica-package boundaries ----------------------
+
+/// An opkg that remembers what it installed, so a rollback can be observed.
+///
+/// `@FAIL@` names the package whose install is applied *and then* fails: a
+/// backend that dies partway through a request has still changed the system,
+/// which is exactly what the transaction has to notice.
+const OPKG_STUB_STATEFUL: &str = r#"#!/bin/sh
+printf 'opkg %s\n' "$*" >> "$PICA_STUB_LOG"
+STATE="$PICA_STUB_LOG.state"
+touch "$STATE"
+case "$1" in
+  info) printf 'Package: %s\nVersion: 1.0.0\n' "$2" ;;
+  list-installed)
+    while IFS= read -r name; do
+      [ -n "$name" ] && printf '%s - 1.0.0\n' "$name"
+    done < "$STATE" ;;
+  status)
+    if grep -qx "$2" "$STATE"; then
+      printf 'Package: %s\nStatus: install user installed\nVersion: 1.0.0\n' "$2"
+    else
+      printf 'Package: %s\nVersion: 1.0.0\n' "$2"
+    fi ;;
+  install)
+    shift
+    for name in "$@"; do
+      grep -qx "$name" "$STATE" || printf '%s\n' "$name" >> "$STATE"
+      if [ "$name" = "@FAIL@" ]; then
+        printf 'ERROR: simulated failure\n' >&2
+        exit 1
+      fi
+    done ;;
+  remove)
+    grep -vx "$2" "$STATE" > "$STATE.next" || true
+    mv "$STATE.next" "$STATE" ;;
+  print-architecture) printf 'all 100\n' ;;
+esac
+exit 0
+"#;
+
+/// An apk that knows nothing: neither installed nor in a feed.
+const APK_STUB_ALL_ABSENT: &str = r#"#!/bin/sh
+printf 'apk %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  --version) printf 'apk-tools 3.0.0\n' ;;
+  --print-arch) printf 'x86_64\n' ;;
+  info) exit 1 ;;
+  search) exit 1 ;;
+esac
+exit 0
+"#;
+
+/// Installed, but the backend will not say which version.
+const OPKG_STUB_INSTALLED_NO_VERSION: &str = r#"#!/bin/sh
+printf 'opkg %s\n' "$*" >> "$PICA_STUB_LOG"
+case "$1" in
+  status) printf 'Package: %s\nStatus: install user installed\n' "$2" ;;
+  info) printf 'Package: %s\nVersion: 1.0.0\n' "$2" ;;
+  print-architecture) printf 'all 100\n' ;;
+esac
+exit 0
+"#;
+
+impl Sandbox {
+  /// Marks `names` as installed in the stateful stub's ledger.
+  fn seed_backend_state(&self, names: &[&str]) {
+    let mut text = String::new();
+    for name in names {
+      text.push_str(name);
+      text.push('\n');
+    }
+    fs::write(self.state_dir().join("calls.log.state"), text).expect("seed the stub state");
+  }
+}
+
+/// One synced source publishing a single `pkgmgr = pica` entry.
+fn pica_index_with(pkgname: &str) -> String {
+  serde_json::json!({
+      "schema": 1,
+      "repos": {
+          "sandbox": {
+              "name": "sandbox",
+              "url": "",
+              "backends": ["pica"],
+              "platform": "all",
+              "indexes": {
+                  "pica": {
+                      "url": "",
+                      "schema": 1,
+                      "mgr": "pica",
+                      "packages": [{
+                          "pkgname": pkgname,
+                          "appname": pkgname,
+                          "pkgver": "1.0.0",
+                          "pkgrel": "1",
+                          "pkgmgr": "pica",
+                          "platform": "all",
+                          "arch": "all",
+                          "os": "all",
+                          "filename": format!("{pkgname}-1.0.0-1-all-pica.pkg.tar.gz"),
+                          "sha256": "",
+                          "download_url": null
+                      }]
+                  }
+              }
+          }
+      }
+  })
+  .to_string()
+}
+
+#[test]
+fn a_failed_app_phase_rolls_back_what_the_base_phase_installed() {
+  // The base phase succeeds; the app phase applies its own install and then
+  // fails. Both were added by this transaction, so both are removed — including
+  // the one whose request reported failure. The package that was there before
+  // the transaction started is not touched.
+  let stub = OPKG_STUB_STATEFUL.replace("@FAIL@", "app-dep");
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, &stub, APK_STUB);
+  sandbox.seed_backend_state(&["pre-dep"]);
+
+  let artifact = sandbox.container_artifact(
+    "phase-opkg",
+    "opkg",
+    "base = base-dep\napp = app-dep\n",
+    &["demo.ipk"],
+  );
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox.run(&["--pkgmgr", "opkg", "-U", artifact, "--feed-policy", "feed-first"]).failure();
+
+  let calls = sandbox.calls();
+  assert!(calls.contains("opkg install base-dep"), "{calls}");
+  assert!(calls.contains("opkg install app-dep"), "{calls}");
+  assert!(calls.contains("opkg remove base-dep"), "the finished base phase is undone: {calls}");
+  assert!(
+    calls.contains("opkg remove app-dep"),
+    "a request that failed after applying itself is undone too: {calls}"
+  );
+  assert!(
+    !calls.contains("opkg remove pre-dep"),
+    "nothing the transaction did not install is touched: {calls}"
+  );
+}
+
+#[test]
+fn a_missing_dependency_that_is_a_pica_package_says_so() {
+  // `pica-dep` is published, but a dependency name is resolved against the
+  // system backend, not against the Pica source. "missing" alone sends the
+  // reader looking for a package they can see listed.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_ALL_ABSENT);
+  sandbox.write_index(&pica_index_with("pica-dep"));
+  let artifact =
+    sandbox.container_artifact("hint-apk", "apk", "app = pica-dep\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact, "--feed-policy", "feed-first"])
+    .failure()
+    .stderr(contains("dependency precheck failed, missing: app:pica-dep"))
+    .stderr(contains("pica does not resolve Pica packages as dependencies"));
+}
+
+#[test]
+fn an_unreadable_index_does_not_claim_a_missing_name_is_unpublished() {
+  // No synced index at all. "I could not read the sources" must not become "the
+  // sources do not have it", so only the plain message is printed.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB, APK_STUB_ALL_ABSENT);
+  let artifact =
+    sandbox.container_artifact("hint-apk", "apk", "app = pica-dep\n", &["demo-app.apk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["-U", artifact, "--feed-policy", "feed-first"])
+    .failure()
+    .stderr(contains("missing: app:pica-dep"))
+    .stderr(contains("Pica sources").not());
+}
+
+#[test]
+fn a_bound_on_a_dependency_whose_version_cannot_be_read_is_not_called_satisfied() {
+  // Installed, bounded, and the backend will not say which version. The bound is
+  // unchecked; recording `bound_satisfied: true` would assert something nobody
+  // verified, so the report says nothing and the run says why.
+  let sandbox = Sandbox::with_stubs(EMPTY_DB, OPKG_STUB_INSTALLED_NO_VERSION, APK_STUB);
+  let artifact =
+    sandbox.container_artifact("unknown-opkg", "opkg", "base = base-dep>=2.0\n", &["demo.ipk"]);
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  sandbox
+    .run(&["--pkgmgr", "opkg", "-U", artifact, "--feed-policy", "feed-first"])
+    .success()
+    .stderr(contains("installed version of base-dep is unknown"));
+
+  let report = fs::read_to_string(sandbox.state_dir().join("install-report.json"))
+    .expect("read the install report");
+  assert!(!report.contains("bound_satisfied"), "{report}");
 }

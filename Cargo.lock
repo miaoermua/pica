@@ -306,7 +306,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "pica-pkg-cli"
-version = "0.4.0"
+version = "0.4.3"
 dependencies = [
  "assert_cmd",
  "insta",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "pica-pkg-core"
-version = "0.4.0"
+version = "0.4.3"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "pica-pkg-pack"
-version = "0.4.0"
+version = "0.4.3"
 dependencies = [
  "pica-pkg-core",
  "pretty_assertions",

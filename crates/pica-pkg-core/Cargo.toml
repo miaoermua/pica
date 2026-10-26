@@ -1,6 +1,6 @@
 [package]
 name = "pica-pkg-core"
-version = "0.4.0"
+version = "0.4.3"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -12,7 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

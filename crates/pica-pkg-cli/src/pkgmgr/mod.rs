@@ -135,7 +135,12 @@ pub trait PackageManager {
   fn architectures(&self) -> Vec<String>;
 
   /// Installed packages with their raw backend version strings.
-  fn installed(&self) -> Vec<(String, String)>;
+  ///
+  /// `Err` means the list could not be read. Callers must not read that as an
+  /// empty system: the install's rollback record is built by diffing this list,
+  /// and "nothing installed" is exactly what would make a transaction forget
+  /// the packages it added.
+  fn installed(&self) -> CliResult<Vec<(String, String)>>;
 
   /// Dependency names declared by `name`, without version constraints.
   fn depends(&self, name: &str) -> Vec<String>;
@@ -143,11 +148,11 @@ pub trait PackageManager {
   /// Name of the installed package owning `path`, when the backend can tell.
   fn owns_file(&self, path: &str) -> Option<String>;
 
-  fn snapshot_installed(&self) -> Vec<String> {
-    let mut packages: Vec<String> = self.installed().into_iter().map(|(name, _)| name).collect();
+  fn snapshot_installed(&self) -> CliResult<Vec<String>> {
+    let mut packages: Vec<String> = self.installed()?.into_iter().map(|(name, _)| name).collect();
     packages.sort();
     packages.dedup();
-    packages
+    Ok(packages)
   }
 }
 

@@ -140,17 +140,28 @@ fn dep_entries(
     // Only an installed dependency has a version on disk to compare against; for
     // the rest the bound travels to the post-install recheck instead. `None`
     // therefore means "not asked", which is why the key is omitted rather than
-    // written as `false`.
+    // written as `false`; `Some(None)` means it was asked and the backend would
+    // not say which version is installed.
     let bound = (status == "installed" && dep.has_bound())
-      .then(|| crate::constraints::unmet(app, requester, group, std::slice::from_ref(dep)));
-    if let Some(violations) = &bound {
-      if let Some(message) = violations.first() {
-        if dep.optional {
-          app.log_warn(format!("{}: {message}", crate::constraints::BOUND_UNMET));
-        } else {
-          return Err(CliError::new(E_VERSION_INCOMPATIBLE, message.clone()));
+      .then(|| crate::constraints::verdict(app, requester, group, dep));
+    match &bound {
+      Some(Some(violations)) => {
+        if let Some(message) = violations.first() {
+          if dep.optional {
+            app.log_warn(format!("{}: {message}", crate::constraints::BOUND_UNMET));
+          } else {
+            return Err(CliError::new(E_VERSION_INCOMPATIBLE, message.clone()));
+          }
         }
       }
+      // Installed, bounded, and no version to compare: unchecked, not satisfied.
+      // Recording `true` here would assert something nobody verified.
+      Some(None) => app.log_warn(format!(
+        "installed version of {} is unknown, so the declared {} was not checked",
+        dep.name,
+        dep.requirement()
+      )),
+      None => {}
     }
 
     let mut entry = json!({"name": dep.name, "status": status});
@@ -165,7 +176,7 @@ fn dep_entries(
     }
     // The verdict, when one was reached. Its absence is not "satisfied": it says
     // the question could not be put to a version this install knows about.
-    if let Some(violations) = bound {
+    if let Some(Some(violations)) = &bound {
       entry["bound_satisfied"] = json!(violations.is_empty());
     }
     entries.push(entry);

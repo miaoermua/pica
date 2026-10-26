@@ -54,7 +54,7 @@ crates/pica-pkg-pack/src/     build.rs、matrix.rs、backend.rs、payload.rs、a
 - `manifest` 字段名、`<key>@<backend>` 覆盖规则、`app_i18n` 的 `{lang}` 模板
 - 命名规则：`appname` 是选择键（纯上游应用名，不含 `@`），`pkgname` 是源内身份（`-bin` / `@<谁>` 只进 `pkgname`）
 
-行为级修复同样要 bump 版本：三个 crate 的 `version` 同步改（当前 `0.4.0`）。
+行为级修复同样要 bump 版本：三个 crate 的 `version` 同步改（当前 `0.4.3`）。
 
 ## 约定
 
