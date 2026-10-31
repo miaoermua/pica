@@ -147,9 +147,9 @@ jobs:
               -o "$archive" "${{ matrix.toolchain_url }}"
             echo "${{ matrix.toolchain_sha256 }}  ${archive}" | sha256sum -c -
 
-            # The archive holds <release>/<toolchain>/…; two levels down is the
-            # sysroot, so stripping them leaves bin/ and lib/ where the linker
-            # and libc.a are expected instead of a name that has to be guessed.
+            # The archive holds <release>/toolchain-<triple>/…; strip both so
+            # that bin/, lib/ (crt*.o, libc.a) and the gcc internal lib/ land
+            # where the driver looks for them.
             rm -rf "$TOOLCHAIN"
             mkdir -p "$TOOLCHAIN"
             tar --zstd -xf "$archive" -C "$TOOLCHAIN" --strip-components=2
@@ -159,19 +159,63 @@ jobs:
           test -x "$TOOLCHAIN/bin/$LINKER"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
+          # rustc passes -lunwind for every musl target, expecting the
+          # libunwind.a that rust-std ships in lib/self-contained for the tier-1
+          # ones. A tier-3 target has no rust-std at all, and OpenWrt's toolchain
+          # carries no libunwind either: the unwinder gcc itself uses is
+          # libgcc_eh.a, which exports the same _Unwind_* ABI that Rust's
+          # unwinder needs. Dropped next to libc.a so the driver's own -L finds
+          # it before -lunwind is reached.
+          gcc_lib=$(dirname "$(find "$TOOLCHAIN/lib/gcc" -name libgcc_eh.a -print -quit)")
+          cp -f "$gcc_lib/libgcc_eh.a" "$TOOLCHAIN/lib/libunwind.a"
+
+      # Costs a second, and turns a mis-set sysroot into an error here instead
+      # of "cannot find crt1.o" ten minutes into building std.
+      - name: Verify the cross toolchain
+        if: matrix.toolchain_url != ''
+        env:
+          TOOLCHAIN: ${{ runner.temp }}/toolchain
+          LINKER: ${{ matrix.linker }}
+        run: |
+          set -eu
+          cc="$TOOLCHAIN/bin/$LINKER"
+          echo "sysroot: $("$cc" -print-sysroot)"
+          for f in crt1.o crti.o crtbegin.o crtend.o crtn.o libc.a libunwind.a; do
+            path=$("$cc" -print-file-name="$f")
+            echo "$f -> $path"
+            case "$path" in
+              /*) test -f "$path" || { echo "::error::$f missing at $path"; exit 1; } ;;
+              *) echo "::error::$f not found by the driver"; exit 1 ;;
+            esac
+          done
+
       - name: Build pica binaries
         env:
-          # rustc's default linker for this target is `cc`, the host compiler,
-          # which cannot link a mipsel object.
-          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
-          # This target defaults to dynamic linking, unlike the two musl
-          # targets above, so the artifact would depend on the device's musl
-          # and libgcc_s. Static, like every other artifact Pica publishes.
-          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+          TOOLCHAIN: ${{ runner.temp }}/toolchain
+          # rustc's default linker for these targets is `cc`, the host compiler,
+          # which cannot link a foreign-architecture object.
+          LINKER: ${{ matrix.linker }}
         run: |
           set -eu
           args=(--release --target "${{ matrix.target }}"
                 -p pica-pkg-cli -p pica-pkg-pack ${{ matrix.build_std }})
+
+          if [ -n "$LINKER" ]; then
+            triple=$(printf '%s' "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+            # Absolute, not the bare name: mipsel-openwrt-linux-musl-gcc is a
+            # shell wrapper that derives the sysroot from its own location with
+            # `readlink -f "$0"` (see ../lib/../bin/*-wrapper.sh). Called by bare
+            # name through PATH, $0 is not a path, so readlink resolves it
+            # against the cwd and the sysroot becomes the directory above the
+            # checkout; gcc then translates its startfile prefix against it and
+            # every crt object comes up missing while -lc still resolves.
+            export "CARGO_TARGET_${triple}_LINKER=$TOOLCHAIN/bin/$LINKER"
+            # This target defaults to dynamic linking, unlike the two musl
+            # targets above, so the artifact would depend on the device's musl
+            # and libgcc_s. Static, like every other artifact Pica publishes.
+            export "CARGO_TARGET_${triple}_RUSTFLAGS=-C target-feature=+crt-static"
+          fi
+
           if [ -n "${{ matrix.toolchain_url }}" ]; then
             cargo "+${{ matrix.toolchain }}" build "${args[@]}"
           else
