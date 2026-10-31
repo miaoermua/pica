@@ -7,12 +7,15 @@ use pica_pkg_core::io::{copy_symlink, deploy_file};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Names the copies inside one transaction's backup directory. Process-wide so
 /// that two transactions — two packages in one run, or two `pica` processes on
 /// one device — cannot pick the same name for different files.
-pub(super) static BACKUP_SEQ: AtomicU64 = AtomicU64::new(0);
+///
+/// `usize` rather than `u64`: 32-bit MIPS has no 64-bit atomics, and a store
+/// never holds anywhere near `u32::MAX` copies.
+pub(super) static BACKUP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// What a transaction keeps of the files it is about to replace.
 ///

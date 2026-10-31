@@ -385,6 +385,8 @@ pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源�
 
 `platform` 仍然保留，但它只用于应用商店/仓库展示与筛选，不作为安装的硬性门槛。
 
+没有包管理器能报告架构列表时（`pica` 后端且本机无 opkg/apk），`arch` 退回与 `uname -m` 比较。MIPS 内核的 `uname -m` 对大小端都只报 `mips`（或 `mips64`），而软件包把小端写作 `mipsel_*`；此时按 `pica` 二进制自身的字节序补全，小端设备按 `mipsel` / `mips64el` 比较。`uname` 字段本身仍与 `uname -m` 原样严格匹配，不做这种补全。
+
 在需要展示时（日志、查询）应同时展示 `os + platform + arch + uname`（若 `uname` 未提供则可省略）。
 
 ## manifest（Arch-like 文本）

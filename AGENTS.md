@@ -21,7 +21,7 @@ cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|p
 cargo run -p pica-pkg-cli -- -Q
 ```
 
-- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和 `cross build`（`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`）。
+- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和 `cross build`（`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` / `mipsel-unknown-linux-musl`；mipsel 是 tier 3，用 nightly + `-Zbuild-std=std,panic_abort`，因此代码里不能用 `AtomicU64` 这类 32 位 MIPS 没有的类型）。
 - `Makefile` 与 `installer.sh` 当前是空文件，没有可用目标。
 - workspace 级 lints：`unsafe_code = "forbid"`，clippy `all` + `pedantic` 均为 `warn`；三个 crate 都 `[lints] workspace = true`，pedantic 告警要处理而不是加 `#[allow]` 绕过。
 

@@ -67,18 +67,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            toolchain: stable
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            toolchain: stable
+          # Little-endian MIPS32r2, soft-float: ramips (mt7621/mt7628) and the
+          # other mipsel_24kc routers. A tier-3 target since Rust 1.72, so it
+          # has no prebuilt std: nightly builds one from rust-src.
+          - target: mipsel-unknown-linux-musl
+            arch: mipsel
+            toolchain: nightly
+            build_std: "-Zbuild-std=std,panic_abort"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.target }}
+          toolchain: ${{ matrix.toolchain }}
+          # A tier-3 target cannot be added; its std comes from rust-src.
+          targets: ${{ matrix.build_std == '' && matrix.target || '' }}
+          components: ${{ matrix.build_std != '' && 'rust-src' || '' }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -88,20 +102,17 @@ jobs:
 
       - name: Build pica binaries
         run: |
-          cross build --release \
+          cross +${{ matrix.toolchain }} build --release \
             --target "${{ matrix.target }}" \
             -p pica-pkg-cli \
-            -p pica-pkg-pack
+            -p pica-pkg-pack \
+            ${{ matrix.build_std }}
 
       - name: Prepare artifacts
         id: prepare_artifacts
         run: |
           mkdir -p dist
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            arch=amd64
-          else
-            arch=arm64
-          fi
+          arch="${{ matrix.arch }}"
 
           cp "target/${{ matrix.target }}/release/pica" "dist/pica.${arch}"
           cp "target/${{ matrix.target }}/release/pica-pack" "dist/pica-pack.${arch}"

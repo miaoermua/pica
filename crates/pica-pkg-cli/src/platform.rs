@@ -143,6 +143,7 @@ pub(crate) fn check_arch(pkg_arch: &str, host: &HostArches) -> ArchVerdict {
       }
     }
     HostArches::Kernel { uname, .. } => {
+      let uname = &with_byte_order(uname, cfg!(target_endian = "little"));
       if same_arch(pkg_arch, uname) {
         ArchVerdict::Kernel
       } else if arch_related(pkg_arch, uname) {
@@ -152,6 +153,19 @@ pub(crate) fn check_arch(pkg_arch: &str, host: &HostArches) -> ArchVerdict {
       }
     }
     HostArches::Unknown => ArchVerdict::Unverified,
+  }
+}
+
+/// The kernel's name with the byte order it leaves out.
+///
+/// `uname -m` says `mips` (or `mips64`) for both byte orders, while every
+/// package name spells the little-endian one `mipsel`. This binary is running,
+/// so the host has the byte order it was built for.
+fn with_byte_order(uname: &str, little_endian: bool) -> String {
+  let uname = uname.trim();
+  match uname {
+    "mips" | "mips64" if little_endian => format!("{uname}el"),
+    _ => uname.to_string(),
   }
 }
 
@@ -230,6 +244,19 @@ mod tests {
 
   fn kernel(uname: &str) -> HostArches {
     HostArches::Kernel { uname: uname.to_string() }
+  }
+
+  #[test]
+  fn a_little_endian_mips_kernel_is_matched_as_mipsel() {
+    use super::with_byte_order;
+    assert_eq!(with_byte_order("mips", true), "mipsel");
+    assert_eq!(with_byte_order("mips64", true), "mips64el");
+    assert_eq!(with_byte_order("mips", false), "mips");
+    assert_eq!(with_byte_order("x86_64", true), "x86_64");
+    // With the byte order supplied, a mipsel package is a sub-architecture of
+    // the kernel's family, and a big-endian one is not.
+    assert!(super::arch_related("mipsel_24kc", &with_byte_order("mips", true)));
+    assert!(!super::arch_related("mips_24kc", &with_byte_order("mips", true)));
   }
 
   #[test]
