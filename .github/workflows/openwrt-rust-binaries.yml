@@ -58,7 +58,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --locked -- --nocapture
+        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
 
   build:
     name: build (${{ matrix.target }})

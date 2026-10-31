@@ -107,9 +107,16 @@ mod tests {
 
   #[test]
   fn every_code_is_documented() {
+    // A table cell, whatever width the Markdown formatter pads it to.
     let standard = include_str!("../../../docs/standard.md");
+    let cells: Vec<&str> = standard
+      .lines()
+      .filter(|line| line.trim_start().starts_with('|'))
+      .flat_map(|line| line.split('|').map(str::trim))
+      .collect();
     for code in ErrorCode::ALL {
-      assert!(standard.contains(&format!("| `{code}` |")), "{code} is missing from standard.md");
+      let cell = format!("`{code}`");
+      assert!(cells.contains(&cell.as_str()), "{code} is missing from standard.md");
     }
   }
 

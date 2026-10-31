@@ -236,9 +236,12 @@ fn a_restore_that_failed_partway_puts_the_rest_back_when_it_is_run_again() {
   write_file(&first, "new-one\n");
   write_file(&second, "new-two\n");
 
-  // The fault: the directory `second` lives in is gone, so that copy cannot go
-  // back. The other one still can, and does.
+  // The fault: a regular file stands where the directory `second` lives in
+  // was, so that copy cannot go back. A missing directory would not do: the
+  // restore makes the parent again, because an upgrade clears the kept
+  // scripts' directory as a whole. The other copy still goes back.
   fs::remove_dir_all(&second_dir).expect("take the parent away");
+  fs::write(&second_dir, "not a directory\n").expect("plant a file in its place");
   let failed = backup.restore();
   assert_eq!(failed.len(), 1, "{failed:?}");
   assert!(failed[0].contains("two.conf"), "{failed:?}");
@@ -248,6 +251,7 @@ fn a_restore_that_failed_partway_puts_the_rest_back_when_it_is_run_again() {
   // The operator repairs the fault and the same rollback runs again. Nothing is
   // deleted, and the file the first run already restored is not replaced with
   // the failed install's bytes.
+  fs::remove_file(&second_dir).expect("take the file away");
   fs::create_dir_all(&second_dir).expect("put the parent back");
   let failed = backup.restore();
   assert!(failed.is_empty(), "{failed:?}");
