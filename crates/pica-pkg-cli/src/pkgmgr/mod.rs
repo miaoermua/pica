@@ -1,4 +1,6 @@
 use crate::app::CliResult;
+use crate::i18n::Key;
+use crate::i18n::tr;
 
 pub mod apk;
 pub(crate) mod apk_repositories;
@@ -169,9 +171,9 @@ pub(crate) fn describe_targets(targets: &[String]) -> String {
       let shown: Vec<&str> = many.iter().take(SHOWN).map(String::as_str).collect();
       let rest = many.len() - shown.len();
       if rest == 0 {
-        format!("{} packages ({})", many.len(), shown.join(", "))
+        tr(Key::PackagesList, &[&many.len(), &shown.join(", ")])
       } else {
-        format!("{} packages ({}, and {rest} more)", many.len(), shown.join(", "))
+        tr(Key::PackagesAndMore, &[&many.len(), &shown.join(", "), &rest])
       }
     }
   }

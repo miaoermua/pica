@@ -60,7 +60,7 @@ crates/pica-pkg-pack/src/     build.rs、matrix.rs、backend.rs、payload.rs、a
 
 - **依赖最小化**（OpenWrt 体积敏感）：core/cli 只依赖 `serde`、`serde_json`、`sha2`、`tempfile`、`thiserror`；参数解析手写；不要引入 `clap`/`reqwest`/`tokio` 之类重依赖。系统能力交给系统工具：`opkg`/`apk`、`tar`、下载器 `curl` → `wget` → `uclient-fetch`。
 - **不做的事**（`crates/README.md` Non-goals）：不写回 `opkg`/`apk` 的已安装数据库、不做依赖求解、不解析容器格式（唯一例外是 `pica-pack` 为统计 `size` 读 `.ipk`/legacy `.apk`）。
-- **所有用户可见文本走 `src/i18n.rs`**：新增文案要在 `Key` 加变体、在 `english()` / `chinese()` 两张穷尽 `match` 各补一行、并加进 `ALL_KEYS`（有测试校验两表 `{n}` 占位符个数一致）。业务代码里不写语言判断、不写裸英文句子。包名、命令、配置键、协议字段、路径、`E_*` 错误码以及 `--help`/`--version`/`-Qi` 的字段名不翻译；第三方工具的原始错误文本作为参数塞进占位符，不能丢。
+- **所有用户可见文本走 `src/i18n.rs`**：新增文案要在 `Key` 加变体、在 `english()` / `chinese()` 两张穷尽 `match` 各补一行、并加进 `ALL_KEYS`（有测试校验两表 `{n}` 占位符个数一致）。业务代码里不写语言判断、不写裸英文句子（没有 `App` 时用 `i18n::tr`；测试 `no_sentence_is_written_outside_this_table` 会拦住裸句子）。包名、命令、配置键、协议字段、路径、`E_*` 错误码、JSON 输出以及 `--version`/`-Qi` 的字段名不翻译；第三方工具的原始错误文本作为参数塞进占位符，不能丢。
 - **输出诚实**：只打印真实发生的阶段和可信的数字。`size`/`csize` 缺失或为 `0` 就不报那一行（`0` 表示源没测量，不是不占空间）；统计不出来的容器（apk-tools 3.x 的 ADB）告警为未计量，不能记 0；实际写入量由安装结束时的 `Installed <n> files, <bytes>` 给出，两者不互相替代。
 - **错误显式**：用 `E_*` 错误码（`E_MANIFEST_INVALID`、`E_INDEX_UNAVAILABLE`、`E_INTEGRITY_INVALID` 等），不要用隐式兜底掩盖问题。读不到依赖索引是 `E_INDEX_UNAVAILABLE`，绝不能当成"源里没有这个包"。
 - **路径安全**：`root/` 内必须是相对路径、不含 `..`、不以 `/` 开头；符号链接原样保留且目标不得逃逸 `root/`。判定都在 `pica_pkg_core::io`：构建期用 `symlink_escapes_root`，安装期用 `install_payload` / `resolve_under`（错误文本 `escapes the target root`），两侧语义不能分叉。

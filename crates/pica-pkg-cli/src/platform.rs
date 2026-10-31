@@ -1,4 +1,6 @@
 use crate::app::App;
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::pkgmgr::{PackageManager, PackageManagerKind, detect_kind, package_manager_for};
 use crate::system::run_command_text;
 use std::fs;
@@ -56,14 +58,10 @@ impl HostArches {
   pub(crate) fn describe(&self) -> String {
     match self {
       Self::Backend { answered_by, arches } => {
-        format!("{} reports {}", answered_by.as_str(), arches.join(" "))
+        tr(Key::ArchReportedBy, &[&answered_by.as_str(), &arches.join(" ")])
       }
-      Self::Kernel { uname } => {
-        format!("no package manager reported an arch list; uname -m reports {uname}")
-      }
-      Self::Unknown => {
-        "no package manager reported an arch list and uname -m could not be read".to_string()
-      }
+      Self::Kernel { uname } => tr(Key::ArchFromUname, &[&uname]),
+      Self::Unknown => tr(Key::ArchUnknown, &[]),
     }
   }
 }

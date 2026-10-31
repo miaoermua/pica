@@ -1,9 +1,14 @@
-use crate::app::{App, CliError, CliResult, E_DB_INVALID, E_RUNTIME, Paths, ensure_dirs};
+use crate::app::{
+  App, CliError, CliResult, E_CONFIG_INVALID, E_DB_INVALID, E_INDEX_INVALID, E_RUNTIME, Paths,
+  ensure_dirs,
+};
 use crate::i18n::Key;
+use crate::i18n::tr;
 use pica_pkg_core::io::now_unix_secs;
 use pica_pkg_core::manifest::get_first as manifest_get_first;
-use pica_pkg_core::selector::Selector;
-use pica_pkg_core::version::pkgver_cmp_key;
+use pica_pkg_core::model::config::Config;
+use pica_pkg_core::model::db::{Db, DbEntry};
+use pica_pkg_core::model::local_index::LocalIndex;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io;
@@ -61,174 +66,68 @@ pub fn report_set_install_result(
   write_json_atomic_pretty(&paths.report_file, &report)
 }
 
-/// Records an installation.
+/// Reads the installed-package database.
 ///
-/// `files` and `dirs` are the payload this install created; removal replays them
-/// in reverse. Installs delegated to a native package manager pass `packages` in
-/// `files` instead, because that backend, not Pica, owns the real file list.
-pub fn db_set_installed(
-  db_file: &Path,
-  pkgname: &str,
-  manifest: &Value,
-  pkgfile: &str,
-  files: &[String],
-  dirs: &[String],
-) -> CliResult<()> {
-  let mut db = read_json_file(db_file)?;
-  ensure_json_object_field(&mut db, "installed")?;
-
-  let installed = db
-    .get_mut("installed")
-    .and_then(Value::as_object_mut)
-    .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
-
-  installed.insert(
-    pkgname.to_string(),
-    json!({
-        "manifest": manifest,
-        "pkgfile": pkgfile,
-        "files": files,
-        "dirs": dirs,
-        "installed_at": now_unix_secs(),
-    }),
-  );
-
-  write_json_atomic_pretty(db_file, &db)
+/// # Errors
+/// Returns `E_DB_INVALID` when the file exists but is not a database.
+pub fn read_db(paths: &Paths) -> CliResult<Db> {
+  let value = read_json_file(&paths.db_file)?;
+  serde_json::from_value(value).map_err(|err| {
+    CliError::new(E_DB_INVALID, tr(Key::NotPicaDatabase, &[&paths.db_file.display(), &err]))
+  })
 }
 
-/// Adds the paths a failed install left behind without replacing what the
-/// database already says about the package.
+/// Writes the installed-package database in one atomic replace.
 ///
-/// A first install that fails leaves files no entry names, so they are written
-/// as a new one: without it `-R` would have nothing to act on and the files
-/// would be unreachable. An upgrade that fails is not that case. Its rollback
-/// put the previous version's files back, and the entry for the package still
-/// describes that version; writing the new manifest over it would claim a
-/// version that is not on the device and drop the paths that *are*. The remnant
-/// is merged into the entry that is already there, keeping its manifest,
-/// `pkgfile` and `installed_at`.
+/// # Errors
+/// Returns an error when the file cannot be written.
+pub fn write_db(paths: &Paths, db: &Db) -> CliResult<()> {
+  let value = serde_json::to_value(db)
+    .map_err(|err| CliError::new(E_DB_INVALID, tr(Key::DatabaseEncodeFailed, &[&err])))?;
+  write_json_atomic_pretty(&paths.db_file, &value)
+}
+
+/// Reads the sync cache.
 ///
-/// Returns whether the package already had an entry.
-pub fn db_record_remnant(
-  db_file: &Path,
-  pkgname: &str,
-  manifest: &Value,
-  pkgfile: &str,
-  files: &[String],
-  dirs: &[String],
-) -> CliResult<bool> {
-  let mut db = read_json_file(db_file)?;
-  ensure_json_object_field(&mut db, "installed")?;
-
-  let installed = db
-    .get_mut("installed")
-    .and_then(Value::as_object_mut)
-    .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
-
-  if let Some(Value::Object(entry)) = installed.get_mut(pkgname) {
-    merge_owned_paths(entry, "files", files);
-    merge_owned_paths(entry, "dirs", dirs);
-    write_json_atomic_pretty(db_file, &db)?;
-    return Ok(true);
-  }
-
-  installed.insert(
-    pkgname.to_string(),
-    json!({
-        "manifest": manifest,
-        "pkgfile": pkgfile,
-        "files": files,
-        "dirs": dirs,
-        "installed_at": now_unix_secs(),
-    }),
-  );
-
-  write_json_atomic_pretty(db_file, &db)?;
-  Ok(false)
+/// # Errors
+/// Returns `E_INDEX_INVALID` when the cache exists but was not written by a
+/// sync, which says to run `pica -S`.
+pub fn read_local_index(paths: &Paths) -> CliResult<LocalIndex> {
+  let value = read_json_file(&paths.index_file)?;
+  serde_json::from_value(value)
+    .map_err(|err| CliError::new(E_INDEX_INVALID, tr(Key::IndexMissing, &[&err])))
 }
 
-/// Appends the paths that are not already named, in the order given.
-fn merge_owned_paths(entry: &mut Map<String, Value>, key: &str, add: &[String]) {
-  if add.is_empty() {
-    return;
-  }
-
-  let list = entry.entry(key.to_string()).or_insert_with(|| json!([]));
-  let Some(items) = list.as_array_mut() else {
-    *list = json!(add);
-    return;
-  };
-
-  for path in add {
-    if !items.iter().any(|item| item.as_str() == Some(path.as_str())) {
-      items.push(json!(path));
-    }
-  }
-}
-
-pub fn db_del_installed(db_file: &Path, pkgname: &str) -> CliResult<()> {
-  let mut db = read_json_file(db_file)?;
-  ensure_json_object_field(&mut db, "installed")?;
-
-  let installed = db
-    .get_mut("installed")
-    .and_then(Value::as_object_mut)
-    .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
-  installed.remove(pkgname);
-
-  write_json_atomic_pretty(db_file, &db)
-}
-
-/// The version the database records for `pkgname`, if it records the package.
+/// Reads the configuration. A file that does not parse as one is an error the
+/// caller decides how to treat.
 ///
-/// It is the same string the index and the transaction header print, built from
-/// the stored `pkgver`/`pkgrel` by the same function the install used, so an
-/// upgrade can be recognised without parsing anything twice.
-pub fn db_installed_version(db_file: &Path, pkgname: &str) -> CliResult<Option<String>> {
-  let db = read_json_file(db_file)?;
-  let Some(entry) = db.get("installed").and_then(Value::as_object).and_then(|i| i.get(pkgname))
-  else {
-    return Ok(None);
-  };
-
-  let manifest = entry.get("manifest").unwrap_or(&Value::Null);
-  let pkgver = manifest_get_first(manifest, "pkgver");
-  if pkgver.is_empty() {
-    // Recorded without a version: say so rather than inventing one.
-    return Ok(Some(String::new()));
-  }
-  let pkgrel = manifest_get_first(manifest, "pkgrel");
-
-  Ok(Some(pkgver_cmp_key(&pkgver, &pkgrel)))
+/// # Errors
+/// Returns `E_CONFIG_INVALID` when the file is not a configuration object.
+pub fn read_config(paths: &Paths) -> CliResult<Config> {
+  let value = read_json_file(&paths.conf_file)?;
+  serde_json::from_value(value)
+    .map_err(|err| CliError::new(E_CONFIG_INVALID, format!("{}: {err}", paths.conf_file.display())))
 }
 
-pub fn db_find_installed_pkgname_by_selector(
-  db_file: &Path,
-  selector: &Selector,
-) -> CliResult<Option<String>> {
-  let db = read_json_file(db_file)?;
-  let Some(installed) = db.get("installed").and_then(Value::as_object) else {
-    return Ok(None);
-  };
+/// The language-pack code `luci-i18n-*` packages are named with: the configured
+/// `i18n`, or the default when the configuration says nothing or cannot be read.
+pub fn luci_i18n(paths: &Paths) -> String {
+  read_config(paths)
+    .ok()
+    .and_then(|conf| conf.i18n)
+    .unwrap_or_else(|| pica_pkg_core::layout::DEFAULT_LUCI_I18N.to_string())
+}
 
-  for (pkgname, entry) in installed {
-    let manifest = entry.get("manifest").unwrap_or(&Value::Null);
-
-    let key_matches = pkgname == &selector.appname
-      || manifest_get_first(manifest, "appname") == selector.appname
-      || manifest_get_first(manifest, "pkgname") == selector.appname;
-    if !key_matches {
-      continue;
-    }
-
-    if !selector.branch.is_empty() && manifest_get_first(manifest, "branch") != selector.branch {
-      continue;
-    }
-
-    return Ok(Some(pkgname.clone()));
+/// A new database record for what an install wrote.
+pub fn new_entry(manifest: &Value, pkgfile: &str, files: &[String], dirs: &[String]) -> DbEntry {
+  DbEntry {
+    manifest: manifest.clone(),
+    pkgfile: pkgfile.to_string(),
+    files: files.to_vec(),
+    dirs: dirs.to_vec(),
+    installed_at: now_unix_secs(),
+    extra: Map::new(),
   }
-
-  Ok(None)
 }
 
 pub fn read_json_file(path: &Path) -> CliResult<Value> {
@@ -367,7 +266,7 @@ fn replace_file(path: &Path, content: &[u8]) -> CliResult<()> {
 
 pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   let Some(obj) = value.as_object_mut() else {
-    return Err(CliError::new(E_RUNTIME, "json root is not object"));
+    return Err(CliError::new(E_RUNTIME, tr(Key::JsonRootNotObject, &[])));
   };
 
   if !obj.contains_key(key) {
@@ -375,26 +274,10 @@ pub fn ensure_json_object_field(value: &mut Value, key: &str) -> CliResult<()> {
   }
 
   if !obj.get(key).is_some_and(Value::is_object) {
-    return Err(CliError::new(E_RUNTIME, format!("json field '{key}' is not object")));
+    return Err(CliError::new(E_RUNTIME, tr(Key::JsonFieldNotObject, &[&key])));
   }
 
   Ok(())
-}
-
-/// Every package list one synced repo entry holds: one list per backend index.
-#[must_use]
-pub(crate) fn repo_package_sets(repo: &Value) -> Vec<&[Value]> {
-  let mut sets = Vec::new();
-
-  if let Some(indexes) = repo.get("indexes").and_then(Value::as_object) {
-    for index in indexes.values() {
-      if let Some(packages) = index.get("packages").and_then(Value::as_array) {
-        sets.push(packages.as_slice());
-      }
-    }
-  }
-
-  sets
 }
 
 /// Drops the cached packages left by this run.
@@ -412,10 +295,7 @@ pub(crate) fn cleanup_pkg_cache(app: &mut App) {
   let entries = match fs::read_dir(&cache_pkgs_dir) {
     Ok(entries) => entries,
     Err(err) => {
-      app.log_warn(format!(
-        "cleanup cache skipped: cannot read {}: {err}",
-        cache_pkgs_dir.display()
-      ));
+      app.log_warn(tr(Key::CacheCleanupSkipped, &[&cache_pkgs_dir.display(), &err]));
       return;
     }
   };
@@ -425,133 +305,67 @@ pub(crate) fn cleanup_pkg_cache(app: &mut App) {
     let result = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
 
     if let Err(err) = result {
-      app.log_warn(format!("cleanup cache failed: {}: {err}", path.display()));
+      app.log_warn(tr(Key::CacheCleanupFailed, &[&path.display(), &err]));
     }
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{
-    db_find_installed_pkgname_by_selector, db_record_remnant, db_set_installed,
-    ensure_json_object_field, read_json_file, write_json_atomic_pretty,
-  };
-  use crate::app::E_RUNTIME;
-  use pica_pkg_core::selector::Selector;
+  use super::{ensure_json_object_field, new_entry, read_db, write_db};
+  use crate::app::{E_DB_INVALID, E_RUNTIME, Paths};
   use pretty_assertions::assert_eq;
-  use serde_json::{Value, json};
+  use serde_json::json;
+  use std::path::Path;
+
+  fn paths(root: &Path) -> Paths {
+    Paths {
+      etc_dir: root.to_path_buf(),
+      conf_file: root.join("pica.json"),
+      state_dir: root.to_path_buf(),
+      db_file: root.join("db.json"),
+      index_file: root.join("index.json"),
+      cache_dir: root.join("cache"),
+      repos_cache_dir: root.join("cache/repos"),
+      report_file: root.join("install-report.json"),
+      lock_file: root.join("db.lck"),
+    }
+  }
 
   #[test]
   fn ensure_json_object_field_creates_and_validates() {
     let mut value = json!({"schema": 1});
-    ensure_json_object_field(&mut value, "installed").expect("must create object field");
-    assert!(value.get("installed").is_some_and(Value::is_object));
+    ensure_json_object_field(&mut value, "installed").expect("field should be created");
+    assert!(value["installed"].is_object());
 
     let mut invalid = json!({"installed": []});
-    let err = ensure_json_object_field(&mut invalid, "installed").expect_err("must fail");
+    let err = ensure_json_object_field(&mut invalid, "installed").expect_err("must reject array");
     assert_eq!(err.code, E_RUNTIME);
   }
 
   #[test]
-  fn a_remnant_is_added_to_the_entry_of_the_version_that_is_still_installed() {
-    // A failed upgrade restores the old files but cannot always remove the new
-    // ones. The entry still describes what is on the device, so it keeps its
-    // manifest and gains only the paths `-R` would otherwise never see.
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let db_file = dir.path().join("db.json");
-    write_json_atomic_pretty(&db_file, &json!({"schema": 1, "installed": {}})).expect("empty db");
-    db_set_installed(
-      &db_file,
-      "demo",
-      &json!({"pkgname": "demo", "pkgver": "1.0"}),
-      "demo-1.0.ipk",
-      &["usr/bin/demo".to_string()],
-      &[],
-    )
-    .expect("record the first version");
-    let installed_at = read_json_file(&db_file)
-      .expect("read db")
-      .pointer("/installed/demo/installed_at")
-      .cloned()
-      .expect("installed_at");
+  fn a_database_round_trips_through_the_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paths = paths(dir.path());
+    std::fs::write(&paths.db_file, r#"{"schema":1,"installed":{},"kept":"yes"}"#).expect("seed");
 
-    let existed = db_record_remnant(
-      &db_file,
-      "demo",
-      &json!({"pkgname": "demo", "pkgver": "2.0"}),
-      "demo-2.0.ipk",
-      &["usr/bin/demo".to_string(), "etc/demo.conf".to_string()],
-      &["etc".to_string()],
-    )
-    .expect("record the remnant");
-
-    assert!(existed, "the package had an entry");
-    let db = read_json_file(&db_file).expect("read db");
-    let entry = db.pointer("/installed/demo").expect("entry");
-    assert_eq!(entry["manifest"]["pkgver"], json!("1.0"), "the old version is what is on disk");
-    assert_eq!(entry["pkgfile"], json!("demo-1.0.ipk"));
-    assert_eq!(entry["installed_at"], installed_at, "the install itself is not new");
-    assert_eq!(
-      entry["files"],
-      json!(["usr/bin/demo", "etc/demo.conf"]),
-      "the surviving path is added once"
+    let mut db = read_db(&paths).expect("read");
+    db.installed.insert(
+      "demo".to_string(),
+      new_entry(&json!({"pkgname": "demo"}), "/tmp/demo.pkg.tar.gz", &["/etc/demo".into()], &[]),
     );
-    assert_eq!(entry["dirs"], json!(["etc"]));
+    write_db(&paths, &db).expect("write");
+
+    let again = read_db(&paths).expect("read back");
+    assert_eq!(again.installed["demo"].files, ["/etc/demo"]);
+    assert_eq!(again.extra["kept"], json!("yes"), "unknown fields survive");
   }
 
   #[test]
-  fn a_first_install_that_fails_is_recorded_so_its_files_can_be_removed() {
-    // Nothing on the device names these files: without an entry `-R` has
-    // nothing to read and the leftovers stay forever.
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let db_file = dir.path().join("db.json");
-    write_json_atomic_pretty(&db_file, &json!({"schema": 1, "installed": {}})).expect("empty db");
-
-    let existed = db_record_remnant(
-      &db_file,
-      "demo",
-      &json!({"pkgname": "demo", "pkgver": "2.0"}),
-      "demo-2.0.ipk",
-      &["etc/demo.conf".to_string()],
-      &[],
-    )
-    .expect("record the remnant");
-
-    assert!(!existed, "there was no entry to merge into");
-    let db = read_json_file(&db_file).expect("read db");
-    let entry = db.pointer("/installed/demo").expect("entry");
-    assert_eq!(entry["manifest"]["pkgver"], json!("2.0"));
-    assert_eq!(entry["files"], json!(["etc/demo.conf"]));
-  }
-
-  #[test]
-  fn db_find_installed_pkgname_by_selector_matches_branch() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let db_file = dir.path().join("selector-db.json");
-    let db = json!({
-        "schema": 1,
-        "installed": {
-            "hello": {
-                "manifest": {
-                    "pkgname": "hello",
-                    "appname": "hello-app",
-                    "branch": "stable",
-                    "pkgver": "1.2.3",
-                    "pkgrel": "4"
-                }
-            }
-        }
-    });
-    write_json_atomic_pretty(&db_file, &db).expect("write db");
-
-    let selector = Selector::parse("hello-app(stable)").expect("parse selector");
-    let found = db_find_installed_pkgname_by_selector(&db_file, &selector)
-      .expect("query selector")
-      .expect("must match");
-    assert_eq!(found, "hello");
-
-    let selector_miss = Selector::parse("hello-app(dev)").expect("parse selector");
-    let miss = db_find_installed_pkgname_by_selector(&db_file, &selector_miss).expect("query miss");
-    assert!(miss.is_none());
+  fn a_database_that_is_not_one_is_reported_as_such() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let paths = paths(dir.path());
+    std::fs::write(&paths.db_file, r#"{"installed":[]}"#).expect("seed");
+    assert_eq!(read_db(&paths).expect_err("not a database").code, E_DB_INVALID);
   }
 }

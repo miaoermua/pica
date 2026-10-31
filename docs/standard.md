@@ -283,6 +283,7 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 - 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
 - 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
 - `-Qi` 只打印**有值**的字段：某字段在这条记录里为空（旧记录没有 `pkgver`、包本身没有 `license`）就整行省略，不打出“标签 + 空值”。空标签比省略更少信息，还会让人以为值曾经存在。`Name` 是唯一的例外——它是这条记录的标识，行行都有。字段取值的列宽固定为 16 字符，省略某行不会让下面的行错位。
+- **升级清理旧版独有文件**：升级（同 `pkgname` 再次安装）在新记录写入 `db.json` 之后，删除旧记录里有、新版本没有部署的路径。仍被其他 Pica 包记录的路径、被系统后端（`opkg`/`apk`）认领的路径不删。删除失败只告警，不回滚已经完成的升级。旧版本记录的目录若已为空也会删除。
 - `db.json` 是**已记录安装状态的唯一依据**：`-Qi`、`-R`、`-U` 只读它。同一状态目录下的 `install-report.json` 描述的是**最近一次尝试**（`precheck`、`dependency_diff` 等审计信息），其中的后端包可能已在同一次失败中被回滚。它只在数据库写成功之后才写，写失败只告警，所以报告可能比数据库旧；一次干净回滚的失败既不写库也不写报告，“没有报告”既不代表“没装”，也不代表“装成功过”。判断设备上装了什么、`-R` 能不能删，一律看 `db.json`。
 
 ## JSON 输出（显式开启）
@@ -291,8 +292,41 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 
 可选参数：
 
-- `--json`：启用 JSON 输出（成功/失败）
+- `--json`：启用 JSON 输出（成功/失败）。`-Q`、`-Qi`、`-Ql`、`-Qs`、`-Qo`、`-Qu`、`-Si`、`-Ss`、`-Sl` 成功时输出一行描述查询结果的 JSON 对象，取代默认的 `{"ok": true, ...}`。
 - `--json-errors`：仅失败时输出 JSON
+
+### 错误码
+
+`--json-errors` 输出的 `code` 只会是下列值，不随界面语言变化：
+
+| `code`                   |
+| ------------------------ |
+| `E_RUNTIME`              |
+| `E_ARG_INVALID`          |
+| `E_IO`                   |
+| `E_JSON_INVALID`         |
+| `E_DB_INVALID`           |
+| `E_INDEX_INVALID`        |
+| `E_INDEX_UNAVAILABLE`    |
+| `E_CONFIG_INVALID`       |
+| `E_POLICY_INVALID`       |
+| `E_REPO_INVALID`         |
+| `E_MISSING_COMMAND`      |
+| `E_LOCK_BUSY`            |
+| `E_OPKG_INSTALL`         |
+| `E_OPKG_REMOVE`          |
+| `E_NO_SPACE`             |
+| `E_MANIFEST_INVALID`     |
+| `E_PACKAGE_INVALID`      |
+| `E_PLATFORM_UNSUPPORTED` |
+| `E_VERSION_INCOMPATIBLE` |
+| `E_INTEGRITY_INVALID`    |
+| `E_NOT_INTERACTIVE`      |
+| `E_PKGMGR_INSTALL`       |
+| `E_PKGMGR_REMOVE`        |
+| `E_CANCELLED`            |
+
+后端安装、卸载失败时，`apk` 报 `E_PKGMGR_INSTALL` / `E_PKGMGR_REMOVE`；`opkg` 保留旧名 `E_OPKG_INSTALL` / `E_OPKG_REMOVE`。用户在确认提示中回答"否"时报 `E_CANCELLED`，此时系统未做任何更改。
 
 ## 非交互与来源策略
 
@@ -306,6 +340,13 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
   - `feed-only`
   - `packaged-only`
 - `--with-optional` / `--no-optional`：全装 / 全不装可选依赖（`?`），默认在终端上询问、非终端一个不装（见「可选依赖（`?`）」）。两者互斥。
+
+## 执行计划、确认与 `--dry-run`
+
+- 安装（`-S`、`-Sp`、`-U`）在依赖预检之后、第一次改动系统之前停一下：此时屏幕上已有事务标题、索引给出的大小、每个依赖的来源和载荷的文件数与字节数。`-So` 展示要交给后端的包名，`-R` 展示要删除的文件数和要交给后端卸载的包名，`-Su` 展示全部待升级的包及版本变化。
+- **确认**：stdin 是终端时询问 `Proceed? [Y/n]`；回答否则以 `E_CANCELLED` 退出，系统未做任何更改。`--noconfirm`（别名 `--yes`）、`--non-interactive`、stdin 不是终端时不询问，行为与引入确认之前一致。
+- **`--dry-run`**：展示计划后结束，退出码 0，不写 `db.json`、不写安装报告、不铺放文件、不调用后端的安装或卸载。解包、校验、依赖预检照常执行（预检可能刷新后端索引）。`setup` 与不带目标的 `-S`（同步）不接受 `--dry-run`，返回 `E_ARG_INVALID`。
+- **多个目标**：`-S`、`-Sp`、`-U`、`-R` 接受多个目标。先列出目标并确认一次，再逐个执行，每个目标是独立的事务；某个失败不影响后续目标，结束时汇总成功与失败数。有失败时以第一个失败的错误码退出。`-Si`、`-Qi`、`-Ql`、`-Qo`、`-So` 只接受一个参数，多余参数报 `E_ARG_INVALID`。
 
 ## 依赖索引：答不出来就不答
 
@@ -540,11 +581,7 @@ luci = lua1
 - 如果包内无任何生命周期脚本，视为无生命周期包：安装/升级/卸载均不会触发脚本执行。
 - 载荷至少提供其一，否则构建与安装都会以“空包”拒绝：对每个后端而言，`scripts/` 与 `root/` 都算；`pkgs/<backend>/` 只对 `opkg`/`apk` 算。所以一个只放 `pkgs/opkg/` 的 `pkgdir` 能产出 opkg 包，但同一份 `targets` 里的 `pica` 产物会因为没有任何文件而被拒绝。
 - 可在 `scripts/.env` 中声明保留策略：`PICA_KEEP_SCRIPT_INSTALL/PICA_KEEP_SCRIPT_UPDATE/PICA_KEEP_SCRIPT_REMOVE/PICA_KEEP_SCRIPT_ALL`（布尔值）。
-- 升级时旧的一组保留脚本不是直接删除，而是先重命名到 `/usr/lib/pica/scripts/<pkgname>.rollback`，并在旁边写一份 `<pkgname>.rollback.json`：`schema` / `txid` / `pkgname` / `pkgver` / `pkgrel` / `state`。`state=pending` 在复制新脚本**之前**写入；`state=committed` 只在 `record_installation` 返回成功后写入，因此它同时证明数据库记录已落盘——这是 marker 与数据库之间唯一的对应关系，版本号相同并不能证明任何事。
-- 备份生命周期：安装成功 → 标 `committed` → 删除备份与 marker；安装失败（含之后 `root/` 部署失败）→ 本次写入的脚本被清掉、备份改回原名恢复、marker 一并删除。
-- 下一次安装如果发现遗留的 `.rollback`：`committed` 的**删除**（旧脚本已被取代）；`pending`、marker 缺失、marker 损坏或 schema 不认识的一律**移到了 `<pkgname>.rollback.<txid>` 并原样保留**，只告警并给出新路径——它可能是这些脚本的唯一副本，不能猜它已完成。marker **文件只要存在就随备份一起迁移**，解析失败也照样搬走、内容不动，不会被新备份覆盖；`committed` 的备份目录已删但 marker 删不掉时，本次升级**不做新备份**。只有 marker、没有对应备份目录时（两次改名之间中断，或 marker 删除失败），marker 会被改名为 `.orphan.<txid>` 保留；这个目标名同样先独占占位，占不到就保持原样、本次不备份。移走时目录目标名也用独占创建占位：那里已经有文件、空目录或非空目录时一律不改动它，按移走失败处理（本次升级不做备份，新脚本不随回滚删除）；marker 的目标名占不到时把备份目录移回原名，避免出现“目录走了、marker 留在原处”的错位。
-- 恢复失败时备份留在原处，路径写进错误信息，且不写进失败记录，`-R` 不会删它。marker 写不进去时，旧目录会被改回原名并继续安装（本次没有脚本回滚）；改回也失败则安装中止并报出备份路径。
-- 这套 marker 只解决"遗留备份如何安全分类与让路"，**不是完整的崩溃恢复**：进程在任意时刻被终止时，仍可能出现记录与磁盘不一致、需要人工处理的状态。
+- 升级时旧的一组保留脚本按整组替换：旧脚本先复制进本次事务的备份（与 `root/` 被覆盖文件用同一个备份目录 `/var/lib/pica/cache/backup/`），再清空目录写入新脚本；新版本不再保留的脚本因此不会残留。安装失败（含之后 `root/` 部署失败）时旧脚本随事务回滚放回，安装成功后备份随事务一起删除。
 - 每次命令事务结束都会打印 `正在清理 pica 缓存`，并清理 `/var/lib/pica/cache/pkgs/` 目录内容。
 
 - `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。

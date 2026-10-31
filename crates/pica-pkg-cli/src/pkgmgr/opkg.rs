@@ -4,6 +4,8 @@ use crate::app::{
   CliError, CliResult, E_INDEX_UNAVAILABLE, E_IO, E_LOCK_BUSY, E_MISSING_COMMAND, E_NO_SPACE,
   E_OPKG_INSTALL, E_OPKG_REMOVE, E_RUNTIME,
 };
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::lock::{Liveness, process_liveness};
 use crate::system::{run_command_capture_output, stderr_or_stdout};
 use std::fs;
@@ -85,16 +87,13 @@ impl OpkgIndex {
         // feeds that are there still answer.
         Err(err) if err.kind() == ErrorKind::NotFound => continue,
         Err(err) => {
-          return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
+          return Err(CliError::new(E_IO, tr(Key::ReadFailed, &[&path.display(), &err])));
         }
       };
       let Ok(text) = std::str::from_utf8(&bytes) else {
         // Decoding garbage would invent entries, and saying "no candidates" from
         // a file nobody could read is the one answer this may not give.
-        return Err(CliError::new(
-          E_INDEX_UNAVAILABLE,
-          format!("{} is not a text index, so its entries cannot be read", path.display()),
-        ));
+        return Err(CliError::new(E_INDEX_UNAVAILABLE, tr(Key::NotTextIndex, &[&path.display()])));
       };
       candidates.extend(parse_opkg_lists(text, name));
     }
@@ -176,7 +175,7 @@ impl IndexSource for OpkgIndex {
         .iter()
         .map(|feed| (feed, dir.join(feed.as_str())))
         .filter(|(_, path)| !path.is_file())
-        .map(|(feed, path)| format!("no index for feed {feed} ({})", path.display()))
+        .map(|(feed, path)| tr(Key::NoFeedIndex, &[&feed, &path.display()]))
         .collect(),
     )
   }
@@ -198,7 +197,7 @@ impl IndexSource for OpkgIndex {
       LockCleanup::Held(path, pid) => {
         return Err(CliError::new(
           E_LOCK_BUSY,
-          format!("{program} update is blocked: {} is held by pid {pid}", path.display()),
+          tr(Key::UpdateBlocked, &[&program, &path.display(), &pid]),
         ));
       }
       LockCleanup::None => return Err(CliError::new(E_RUNTIME, first.failure(&program))),
@@ -249,7 +248,7 @@ fn read_opkg_conf(paths: &[PathBuf]) -> CliResult<OpkgConf> {
       }
       Err(err) if err.kind() == ErrorKind::NotFound => {}
       Err(err) => {
-        return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
+        return Err(CliError::new(E_IO, tr(Key::ReadFailed, &[&path.display(), &err])));
       }
     }
   }
@@ -364,9 +363,9 @@ impl PackageManager for OpkgBackend {
   fn package_exists(&self, name: &str) -> CliResult<bool> {
     let output = Command::new("opkg").arg("info").arg(name).output().map_err(|err| {
       let (code, message) = if err.kind() == ErrorKind::NotFound {
-        (E_MISSING_COMMAND, "missing required command: opkg".to_string())
+        (E_MISSING_COMMAND, tr(Key::MissingCommand, &[&"opkg"]))
       } else {
-        (E_RUNTIME, format!("opkg info {name} failed: {err}"))
+        (E_RUNTIME, tr(Key::OpkgInfoFailed, &[&name, &err]))
       };
       CliError::new(code, message)
     })?;
@@ -378,7 +377,7 @@ impl PackageManager for OpkgBackend {
       let detail = stderr_or_stdout(&output.stdout, &output.stderr);
       return Err(CliError::new(
         E_RUNTIME,
-        format!("opkg info {name} failed ({}): {detail}", exit_status_text(output.status)),
+        tr(Key::OpkgInfoExit, &[&name, &exit_status_text(output.status), &detail]),
       ));
     }
 
@@ -428,7 +427,7 @@ impl PackageManager for OpkgBackend {
       .arg("install")
       .args(targets)
       .output()
-      .map_err(|err| CliError::new(E_OPKG_INSTALL, format!("opkg install failed: {err}")))?;
+      .map_err(|err| CliError::new(E_OPKG_INSTALL, tr(Key::OpkgInstallFailed, &[&err])))?;
     if output.status.success() {
       return Ok(());
     }
@@ -437,13 +436,10 @@ impl PackageManager for OpkgBackend {
     if detail.to_ascii_lowercase().contains("no space left on device") {
       return Err(CliError::new(
         E_NO_SPACE,
-        format!("{label} install failed: {target} (storage-full). detail=[{detail}]"),
+        tr(Key::InstallStorageFull, &[&label, &target, &detail]),
       ));
     }
-    Err(CliError::new(
-      E_OPKG_INSTALL,
-      format!("{label} install failed: {target} detail=[{detail}]"),
-    ))
+    Err(CliError::new(E_OPKG_INSTALL, tr(Key::BackendInstallFailed, &[&label, &target, &detail])))
   }
 
   fn remove(&self, target: &str) -> CliResult<()> {
@@ -451,21 +447,21 @@ impl PackageManager for OpkgBackend {
       .arg("remove")
       .arg(target)
       .output()
-      .map_err(|err| CliError::new(E_OPKG_REMOVE, format!("opkg remove failed: {err}")))?;
+      .map_err(|err| CliError::new(E_OPKG_REMOVE, tr(Key::OpkgRemoveFailed, &[&err])))?;
     if output.status.success() {
       Ok(())
     } else {
       let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-      Err(CliError::new(E_OPKG_REMOVE, format!("opkg remove failed: {target} detail=[{detail}]")))
+      Err(CliError::new(E_OPKG_REMOVE, tr(Key::OpkgRemoveTargetFailed, &[&target, &detail])))
     }
   }
 
   fn installed(&self) -> CliResult<Vec<(String, String)>> {
     let output = Command::new("opkg").arg("list-installed").output().map_err(|err| {
       let (code, message) = if err.kind() == ErrorKind::NotFound {
-        (E_MISSING_COMMAND, "missing required command: opkg".to_string())
+        (E_MISSING_COMMAND, tr(Key::MissingCommand, &[&"opkg"]))
       } else {
-        (E_RUNTIME, format!("opkg list-installed failed: {err}"))
+        (E_RUNTIME, tr(Key::OpkgListFailed, &[&err]))
       };
       CliError::new(code, message)
     })?;
@@ -473,7 +469,7 @@ impl PackageManager for OpkgBackend {
       let detail = stderr_or_stdout(&output.stdout, &output.stderr);
       return Err(CliError::new(
         E_RUNTIME,
-        format!("opkg list-installed failed ({}): {detail}", exit_status_text(output.status)),
+        tr(Key::OpkgListExit, &[&exit_status_text(output.status), &detail]),
       ));
     }
     let mut packages = parse_installed_list(&String::from_utf8_lossy(&output.stdout));
@@ -578,8 +574,8 @@ fn opkg_list_dir_has_files(dir: &Path) -> bool {
 /// How a command ended, for the messages that report it ended badly.
 fn exit_status_text(status: std::process::ExitStatus) -> String {
   match status.code() {
-    Some(code) => format!("exit {code}"),
-    None => "killed by a signal".to_string(),
+    Some(code) => tr(Key::ExitCode, &[&code]),
+    None => tr(Key::KilledBySignal, &[]),
   }
 }
 

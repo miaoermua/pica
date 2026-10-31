@@ -1,25 +1,22 @@
 use crate::app::{
-  App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, E_DB_INVALID, ensure_dirs,
+  App, CliError, CliResult, E_ARG_INVALID, E_CONFIG_INVALID, JsonMode, ensure_dirs,
 };
 use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
+use crate::commands::search::emit_json;
 use crate::i18n::Key;
 use crate::installed;
 use crate::source;
-use crate::state::read_json_file;
+use crate::state::read_db;
 use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
+use pica_pkg_core::model::db::{Db, DbEntry};
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-fn installed_entry<'a>(app: &App, db: &'a Value, pkgname: &str) -> CliResult<&'a Value> {
-  db.get("installed")
-    .and_then(Value::as_object)
-    .and_then(|installed| installed.get(pkgname))
+fn installed_entry<'a>(app: &App, db: &'a Db, pkgname: &str) -> CliResult<&'a DbEntry> {
+  db.installed
+    .get(pkgname)
     .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))
-}
-
-fn entry_manifest(entry: &Value) -> &Value {
-  entry.get("manifest").unwrap_or(&Value::Null)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -51,29 +48,86 @@ fn format_size_display(size_text: &str) -> String {
 
 pub fn installed(app: &mut App) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  let db = read_json_file(&app.paths.db_file)?;
-  let installed = db
-    .get("installed")
-    .and_then(Value::as_object)
-    .ok_or_else(|| CliError::new(E_DB_INVALID, "db installed is not object"))?;
-
-  let mut names: Vec<String> = installed.keys().cloned().collect();
-  names.sort();
-
-  for pkgname in names {
-    let Some(entry) = installed.get(&pkgname) else {
-      continue;
-    };
-    let manifest = entry_manifest(entry);
-    let pkgver = manifest_get_first(manifest, "pkgver");
-    let pkgrel = manifest_get_first(manifest, "pkgrel");
-    let version = pkgver_cmp_key(&pkgver, &pkgrel);
-    let platform = manifest_get_first(manifest, "platform");
-
-    println!("{pkgname}\t{version}\t{platform}");
+  let db = read_db(&app.paths)?;
+  if json_wanted(app) {
+    let rows: Vec<Value> = db
+      .installed
+      .iter()
+      .map(|(pkgname, entry)| {
+        json!({ "pkgname": pkgname, "version": entry.version(), "platform": entry.field("platform") })
+      })
+      .collect();
+    emit_json(app, &json!({ "packages": rows }));
+    return Ok(());
+  }
+  for (pkgname, entry) in &db.installed {
+    println!("{pkgname}\t{}\t{}", entry.version(), entry.field("platform"));
   }
 
   Ok(())
+}
+
+/// `pica -Qo <path>`: which install wrote `path`.
+///
+/// Pica's own records are asked first, then the system backend, which owns the
+/// files of the packages it installed.
+///
+/// # Errors
+/// Fails when nothing claims the path.
+pub fn owner(app: &mut App, path: &str) -> CliResult<()> {
+  ensure_dirs(&app.paths)?;
+  let db = read_db(&app.paths)?;
+  let owner =
+    db.owner_of(path, "").map(|pkgname| (pkgname.to_string(), "pica".to_string())).or_else(|| {
+      let manager = app.package_manager().ok()?;
+      manager.owns_file(path).map(|name| (name, manager.kind().as_str().to_string()))
+    });
+  let Some((pkgname, backend)) = owner else {
+    return Err(CliError::new(E_ARG_INVALID, app.args(Key::QueryNoOwner, &[path])));
+  };
+
+  if json_wanted(app) {
+    emit_json(app, &json!({ "path": path, "pkgname": pkgname, "backend": backend }));
+  } else {
+    println!("{}", app.args(Key::QueryOwnedBy, &[path, &pkgname, &backend]));
+  }
+  Ok(())
+}
+
+/// `pica -Qu`: installed packages a synced source offers a newer version of.
+///
+/// # Errors
+/// Fails when the database or the sync cache cannot be read.
+pub fn upgradable(app: &mut App) -> CliResult<()> {
+  ensure_dirs(&app.paths)?;
+  let mut rows = Vec::new();
+  for record in crate::commands::upgrade::tracked(app)? {
+    let Some(newest) = crate::commands::upgrade::newest_offered(app, &record)? else {
+      continue;
+    };
+    if !pkgver_ge(&record.installed, &newest) {
+      rows.push((record.pkgname, record.installed, newest));
+    }
+  }
+
+  if json_wanted(app) {
+    let rows: Vec<Value> = rows
+      .iter()
+      .map(|(pkgname, installed, newest)| {
+        json!({ "pkgname": pkgname, "installed": installed, "available": newest })
+      })
+      .collect();
+    emit_json(app, &json!({ "packages": rows }));
+    return Ok(());
+  }
+  for (pkgname, installed, newest) in &rows {
+    println!("{pkgname} {installed} -> {newest}");
+  }
+  Ok(())
+}
+
+fn json_wanted(app: &App) -> bool {
+  app.options.json_mode == JsonMode::All
 }
 
 pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
@@ -81,7 +135,7 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
 
   let candidates = find_pica_candidates_in_index(app, selector)?;
   if candidates.is_empty() {
-    let hint = not_found_hint(app);
+    let hint = not_found_hint(app, selector);
     return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::NotFound, &[selector, &hint])));
   }
 
@@ -96,6 +150,22 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
   // `download_url` is resolved here the same way.
   let download_url = source::artifact_url(&best.url, best.download_url.as_deref(), &best.filename)
     .unwrap_or_else(|_| best.download_url.clone().unwrap_or_default());
+
+  if json_wanted(app) {
+    emit_json(
+      app,
+      &json!({
+        "repo": best.repo, "pkgname": best.pkgname, "appname": best.appname,
+        "version": best.cmpver, "pkgver": best.pkgver, "pkgrel": best.pkgrel,
+        "branch": best.branch, "protocol": best.protocol, "url": best.pkg_url,
+        "luci_url": best.luci_url, "luci_desc": best.luci_desc, "pkgdesc": best.pkgdesc,
+        "os": best.os, "platform": best.platform, "arch": best.arch, "pkgmgr": best.pkgmgr,
+        "pica": best.min_pica, "download_url": download_url, "filename": best.filename,
+        "sha256": best.sha256, "size": best.size, "csize": best.csize,
+      }),
+    );
+    return Ok(());
+  }
 
   println!("Repository      : {}", best.repo);
   println!("Name            : {}", best.pkgname);
@@ -142,9 +212,28 @@ fn field(label: &str, value: &str) {
 
 pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  let db = read_json_file(&app.paths.db_file)?;
+  let db = read_db(&app.paths)?;
   let entry = installed_entry(app, &db, pkgname)?;
-  let manifest = entry_manifest(entry);
+  let manifest = &entry.manifest;
+
+  if json_wanted(app) {
+    let depends = backend_dependencies(app, entry);
+    emit_json(
+      app,
+      &json!({
+        "pkgname": pkgname,
+        "version": entry.version(),
+        "source": installed::entry_source(entry).as_str(),
+        "pkgmgr": installed::entry_backend(entry).kind.as_str(),
+        "installed_at": entry.installed_at,
+        "pkgfile": entry.pkgfile,
+        "requires": declared_constraints(manifest, installed::entry_backend(entry).kind.as_str()),
+        "depends": depends,
+        "manifest": manifest,
+      }),
+    );
+    return Ok(());
+  }
 
   // What the row is, as opposed to what it says about itself: always there.
   println!("Name            : {pkgname}");
@@ -180,15 +269,10 @@ pub fn info(app: &mut App, pkgname: &str) -> CliResult<()> {
   field("Packager", &manifest_get_first(manifest, "packager"));
   field("Build Date", &manifest_get_first(manifest, "builddate"));
   field("Size", &format_size_display(&manifest_get_first(manifest, "size")));
-  field(
-    "Installed At",
-    &entry
-      .get("installed_at")
-      .and_then(Value::as_u64)
-      .map(|value| value.to_string())
-      .unwrap_or_default(),
-  );
-  field("Installed From", entry.get("pkgfile").and_then(Value::as_str).unwrap_or(""));
+  let installed_at =
+    if entry.installed_at > 0 { entry.installed_at.to_string() } else { String::new() };
+  field("Installed At", &installed_at);
+  field("Installed From", &entry.pkgfile);
   field("License", &manifest_get_first(manifest, "license"));
   field("Source Avail", &manifest_get_first(manifest, "source_availability"));
   field("Requires", &declared_constraints(manifest, installed::entry_backend(entry).kind.as_str()));
@@ -232,9 +316,8 @@ fn declared_constraints(manifest: &Value, backend: &str) -> String {
 /// its dependencies in the manifest instead, so the line is omitted for it. A
 /// missing backend command is not an error here: showing information must not
 /// fail because the host cannot talk to its package manager.
-fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
-  let manifest = entry_manifest(entry);
-  let pkgname = manifest_get_first(manifest, "pkgname");
+fn backend_dependencies(app: &mut App, entry: &DbEntry) -> Option<String> {
+  let pkgname = entry.field("pkgname");
   if pkgname.is_empty() {
     return None;
   }
@@ -242,21 +325,23 @@ fn backend_dependencies(app: &mut App, entry: &Value) -> Option<String> {
   if !kind.requires_system_binary() {
     return None;
   }
-  app.select_package_manager(kind.as_str()).ok()?;
-
-  let depends = app.package_manager().ok()?.depends(&pkgname);
+  let depends = app
+    .with_backend(kind, |app| Ok(app.package_manager().map(|manager| manager.depends(&pkgname))))
+    .ok()?
+    .ok()?;
   (!depends.is_empty()).then(|| depends.join(" "))
 }
 
 pub fn files(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
-  let db = read_json_file(&app.paths.db_file)?;
+  let db = read_db(&app.paths)?;
   let entry = installed_entry(app, &db, pkgname)?;
-
-  for item in entry.get("files").and_then(Value::as_array).into_iter().flatten() {
-    if let Some(path) = item.as_str() {
-      println!("{path}");
-    }
+  if json_wanted(app) {
+    emit_json(app, &json!({ "pkgname": pkgname, "files": entry.files, "dirs": entry.dirs }));
+    return Ok(());
+  }
+  for path in &entry.files {
+    println!("{path}");
   }
 
   Ok(())

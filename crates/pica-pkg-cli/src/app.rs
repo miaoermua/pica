@@ -1,6 +1,7 @@
+use crate::i18n::tr;
 use crate::i18n::{Key, Lang};
 use crate::state::{read_json_file, write_json_atomic_pretty};
-use pica_pkg_core::error::PicaError;
+use pica_pkg_core::error::{ErrorCode, PicaError};
 use pica_pkg_core::layout::DEFAULT_LUCI_I18N;
 use serde_json::{Value, json};
 use std::env;
@@ -8,28 +9,32 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_ETC_DIR: &str = "/etc/pica";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/pica";
-pub const E_RUNTIME: &str = "E_RUNTIME";
-pub const E_ARG_INVALID: &str = "E_ARG_INVALID";
-pub const E_IO: &str = "E_IO";
-pub const E_JSON_INVALID: &str = "E_JSON_INVALID";
-pub const E_DB_INVALID: &str = "E_DB_INVALID";
-pub const E_INDEX_INVALID: &str = "E_INDEX_INVALID";
-pub const E_INDEX_UNAVAILABLE: &str = "E_INDEX_UNAVAILABLE";
-pub const E_CONFIG_INVALID: &str = "E_CONFIG_INVALID";
-pub const E_POLICY_INVALID: &str = "E_POLICY_INVALID";
-pub const E_REPO_INVALID: &str = "E_REPO_INVALID";
-pub const E_MISSING_COMMAND: &str = "E_MISSING_COMMAND";
-pub const E_LOCK_BUSY: &str = "E_LOCK_BUSY";
-pub const E_OPKG_INSTALL: &str = "E_OPKG_INSTALL";
-pub const E_OPKG_REMOVE: &str = "E_OPKG_REMOVE";
-pub const E_NO_SPACE: &str = "E_NO_SPACE";
-pub const E_MANIFEST_INVALID: &str = "E_MANIFEST_INVALID";
-pub const E_PACKAGE_INVALID: &str = "E_PACKAGE_INVALID";
-pub const E_PLATFORM_UNSUPPORTED: &str = "E_PLATFORM_UNSUPPORTED";
-pub const E_VERSION_INCOMPATIBLE: &str = "E_VERSION_INCOMPATIBLE";
-pub const E_INTEGRITY_INVALID: &str = "E_INTEGRITY_INVALID";
+pub const E_RUNTIME: ErrorCode = ErrorCode::Runtime;
+pub const E_ARG_INVALID: ErrorCode = ErrorCode::ArgInvalid;
+pub const E_IO: ErrorCode = ErrorCode::Io;
+pub const E_JSON_INVALID: ErrorCode = ErrorCode::JsonInvalid;
+pub const E_DB_INVALID: ErrorCode = ErrorCode::DbInvalid;
+pub const E_INDEX_INVALID: ErrorCode = ErrorCode::IndexInvalid;
+pub const E_INDEX_UNAVAILABLE: ErrorCode = ErrorCode::IndexUnavailable;
+pub const E_CONFIG_INVALID: ErrorCode = ErrorCode::ConfigInvalid;
+pub const E_POLICY_INVALID: ErrorCode = ErrorCode::PolicyInvalid;
+pub const E_REPO_INVALID: ErrorCode = ErrorCode::RepoInvalid;
+pub const E_MISSING_COMMAND: ErrorCode = ErrorCode::MissingCommand;
+pub const E_LOCK_BUSY: ErrorCode = ErrorCode::LockBusy;
+pub const E_OPKG_INSTALL: ErrorCode = ErrorCode::OpkgInstall;
+pub const E_OPKG_REMOVE: ErrorCode = ErrorCode::OpkgRemove;
+pub const E_NO_SPACE: ErrorCode = ErrorCode::NoSpace;
+pub const E_MANIFEST_INVALID: ErrorCode = ErrorCode::ManifestInvalid;
+pub const E_PACKAGE_INVALID: ErrorCode = ErrorCode::PackageInvalid;
+pub const E_PLATFORM_UNSUPPORTED: ErrorCode = ErrorCode::PlatformUnsupported;
+pub const E_VERSION_INCOMPATIBLE: ErrorCode = ErrorCode::VersionIncompatible;
+pub const E_INTEGRITY_INVALID: ErrorCode = ErrorCode::IntegrityInvalid;
 /// Something that can only be answered by a person, asked where there is none.
-pub const E_NOT_INTERACTIVE: &str = "E_NOT_INTERACTIVE";
+pub const E_NOT_INTERACTIVE: ErrorCode = ErrorCode::NotInteractive;
+pub const E_PKGMGR_INSTALL: ErrorCode = ErrorCode::PkgmgrInstall;
+pub const E_PKGMGR_REMOVE: ErrorCode = ErrorCode::PkgmgrRemove;
+/// The user answered "no" to a confirmation; nothing was changed.
+pub const E_CANCELLED: ErrorCode = ErrorCode::Cancelled;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonMode {
@@ -130,18 +135,23 @@ pub struct Options {
   /// Explicit `--lang` value. Overrides the configured language for this run
   /// only; it is never written back to the configuration.
   pub lang: Option<Lang>,
+  /// `--dry-run`: show what a change would do and stop before doing it.
+  pub dry_run: bool,
+  /// `--noconfirm`: answer the confirmation with yes. Unlike
+  /// `--non-interactive` it leaves every other question in place.
+  pub noconfirm: bool,
 }
 
 #[derive(Debug)]
 pub struct CliError {
-  pub code: &'static str,
+  pub code: ErrorCode,
   pub message: String,
 }
 
 pub type CliResult<T> = Result<T, CliError>;
 
 impl CliError {
-  pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+  pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
     Self { code, message: message.into() }
   }
 }
@@ -150,6 +160,7 @@ impl From<PicaError> for CliError {
   fn from(value: PicaError) -> Self {
     match value {
       PicaError::Message(message) => CliError::new(E_RUNTIME, message),
+      PicaError::Coded { code, message } => CliError::new(code, message),
       PicaError::Io(err) => CliError::new(E_IO, err.to_string()),
       PicaError::Json(err) => CliError::new(E_JSON_INVALID, err.to_string()),
     }
@@ -159,8 +170,13 @@ impl From<PicaError> for CliError {
 pub struct App {
   pub paths: Paths,
   pub options: Options,
-  pub package_manager: Option<Box<dyn crate::pkgmgr::PackageManager>>,
-  pub backend: crate::pkgmgr::PackageManagerKind,
+  /// Backends built so far, one per kind. Built on first use and kept, so
+  /// moving between backends costs nothing after the first time.
+  managers: Vec<Box<dyn crate::pkgmgr::PackageManager>>,
+  /// The backend in use. Startup sets it from `--pkgmgr`, the configuration
+  /// or auto-detection; everything later changes it only for a scope, through
+  /// [`App::with_backend`], which puts the previous one back.
+  backend: crate::pkgmgr::PackageManagerKind,
   /// The `apk_force_non_repository` setting, read by
   /// [`App::apply_backend_config`]. Until then the default stands, which is what
   /// the tests and the probing paths see.
@@ -170,6 +186,9 @@ pub struct App {
   /// The language this run speaks: `--lang`, else the configured `language`,
   /// else English. Setup changes it mid-run once the user has picked one.
   pub lang: Lang,
+  /// Set once the user has agreed to a plan that covers several packages, so
+  /// each of them does not ask again.
+  pub confirmed: bool,
 }
 
 impl App {
@@ -177,16 +196,47 @@ impl App {
     let backend = crate::pkgmgr::detect_kind();
     let apk_force_non_repository = true;
     let lang = options.lang.unwrap_or_else(|| conf_get_language(&paths.conf_file));
+    lang.make_current();
     Self {
       paths,
       options,
-      package_manager: crate::pkgmgr::package_manager_for(backend),
+      managers: crate::pkgmgr::package_manager_for(backend).into_iter().collect(),
       backend,
       apk_force_non_repository,
       json_last_phase: String::new(),
       json_has_text: false,
       lang,
+      confirmed: false,
     }
+  }
+
+  /// Asks whether to go ahead with the plan just shown.
+  ///
+  /// Nobody is asked where nobody could answer: `--non-interactive`,
+  /// `--noconfirm`, a stdin that is not a terminal and a plan already agreed to
+  /// all go ahead, which is what every run did before the question existed.
+  /// "No" is an error, so the exit status says nothing was done.
+  pub fn confirm(&mut self) -> CliResult<()> {
+    if self.confirmed
+      || self.options.noconfirm
+      || self.options.non_interactive
+      || !crate::commands::setup::stdin_is_interactive()
+    {
+      return Ok(());
+    }
+    if prompt_yn(self.text(Key::ConfirmProceed), true) {
+      Ok(())
+    } else {
+      Err(CliError::new(E_CANCELLED, self.text(Key::Cancelled)))
+    }
+  }
+
+  /// Ends a dry run here: says so and reports whether to stop.
+  pub fn stop_for_dry_run(&mut self) -> bool {
+    if self.options.dry_run {
+      self.info(Key::DryRunDone);
+    }
+    self.options.dry_run
   }
 
   /// The text for `key` in this run's language.
@@ -223,11 +273,12 @@ impl App {
     self.log_warn(message);
   }
 
+  /// The system package manager of the backend in use. `pica` has none.
   pub fn package_manager(&self) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
-    self
-      .package_manager
-      .as_deref()
-      .ok_or_else(|| CliError::new(E_MISSING_COMMAND, "no supported package manager found"))
+    let found = self.backend.requires_system_binary().then(|| {
+      self.managers.iter().find(|manager| manager.kind() == self.backend).map(AsRef::as_ref)
+    });
+    found.flatten().ok_or_else(|| CliError::new(E_MISSING_COMMAND, tr(Key::NoPackageManager, &[])))
   }
 
   /// Backend identity of this invocation, including the Pica-native `pica`.
@@ -236,26 +287,77 @@ impl App {
     self.backend
   }
 
-  /// Switches backend explicitly. A backend that needs a system binary which is
-  /// absent is an error rather than a silent fallback, so packages never land in
-  /// the wrong package database; `pica` needs no command and always succeeds.
-  pub fn select_package_manager(&mut self, value: &str) -> CliResult<()> {
-    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
-      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid pkgmgr: {value}")))?;
-    if !kind.requires_system_binary() {
-      self.backend = kind;
-      self.package_manager = None;
-      return Ok(());
-    }
-    if self.backend == kind && self.package_manager.is_some() {
+  /// Runs `body` with `kind` as the backend, and puts the previous backend back
+  /// afterwards, whether `body` succeeded or not.
+  ///
+  /// This is the only way code after startup changes the backend, so what one
+  /// package needs never leaks into the next: `-Su` over an `opkg` record and
+  /// a `pica` record asks each with its own backend, in either order.
+  ///
+  /// A backend that needs a system binary which is absent is an error rather
+  /// than a silent fallback, so packages never land in the wrong package
+  /// database; `pica` needs no command and always succeeds.
+  pub fn with_backend<T>(
+    &mut self,
+    kind: crate::pkgmgr::PackageManagerKind,
+    body: impl FnOnce(&mut Self) -> CliResult<T>,
+  ) -> CliResult<T> {
+    self.ensure_manager(kind)?;
+    let previous = std::mem::replace(&mut self.backend, kind);
+    let result = body(self);
+    self.backend = previous;
+    result
+  }
+
+  /// The backend a recorded install is handled with: an explicit `--pkgmgr`,
+  /// else the one the record names.
+  #[must_use]
+  pub fn backend_for_record(
+    &self,
+    recorded: crate::pkgmgr::PackageManagerKind,
+  ) -> crate::pkgmgr::PackageManagerKind {
+    self
+      .options
+      .pkgmgr
+      .as_deref()
+      .and_then(crate::pkgmgr::PackageManagerKind::parse)
+      .unwrap_or(recorded)
+  }
+
+  /// Makes `manager` the backend of this run, in place of the host's package
+  /// manager. Tests use it to stand a stub in.
+  #[cfg(test)]
+  pub(crate) fn use_manager(&mut self, manager: Box<dyn crate::pkgmgr::PackageManager>) {
+    let kind = manager.kind();
+    self.managers.retain(|existing| existing.kind() != kind);
+    self.managers.push(manager);
+    self.backend = kind;
+  }
+
+  /// Sets the backend a test runs with, without asking the host for it.
+  #[cfg(test)]
+  pub(crate) fn with_backend_for_tests(&mut self, kind: crate::pkgmgr::PackageManagerKind) {
+    self.backend = kind;
+  }
+
+  fn ensure_manager(&mut self, kind: crate::pkgmgr::PackageManagerKind) -> CliResult<()> {
+    if !kind.requires_system_binary() || self.managers.iter().any(|m| m.kind() == kind) {
       return Ok(());
     }
     let manager = crate::pkgmgr::package_manager_with(kind, self.apk_force_non_repository)
       .ok_or_else(|| {
-        CliError::new(E_MISSING_COMMAND, format!("missing required command: {}", kind.as_str()))
+        CliError::new(E_MISSING_COMMAND, tr(Key::MissingCommand, &[&kind.as_str()]))
       })?;
+    self.managers.push(manager);
+    Ok(())
+  }
+
+  /// Sets the backend of the whole run. Only startup does this.
+  fn set_backend(&mut self, value: &str) -> CliResult<()> {
+    let kind = crate::pkgmgr::PackageManagerKind::parse(value)
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, tr(Key::InvalidPkgmgr, &[&value])))?;
+    self.ensure_manager(kind)?;
     self.backend = kind;
-    self.package_manager = Some(manager);
     Ok(())
   }
 
@@ -268,15 +370,17 @@ impl App {
   /// setting to carry.
   pub fn apply_backend_config(&mut self) -> CliResult<()> {
     self.apk_force_non_repository = conf_get_apk_force_non_repository(&self.paths.conf_file)?;
+    // Rebuilt with the setting just read: the detected backend was built with
+    // the default before the configuration was known.
+    self.managers.clear();
     if self.backend.requires_system_binary() {
-      self.package_manager =
-        crate::pkgmgr::package_manager_with(self.backend, self.apk_force_non_repository);
+      self.ensure_manager(self.backend)?;
     }
     if let Some(value) = self.options.pkgmgr.clone() {
-      return self.select_package_manager(&value);
+      return self.set_backend(&value);
     }
     if let Some(value) = conf_get_pkgmgr(&self.paths.conf_file) {
-      return self.select_package_manager(&value);
+      return self.set_backend(&value);
     }
     Ok(())
   }
@@ -292,7 +396,7 @@ impl App {
 
   pub fn log_warn(&mut self, message: impl AsRef<str>) {
     self.json_has_text = true;
-    eprintln!("warning: {}", message.as_ref());
+    eprintln!("{}", self.args(Key::WarningLine, &[message.as_ref()]));
   }
 
   pub fn emit_success(&self, command: &str, target: &str) {
@@ -314,7 +418,7 @@ impl App {
 
       let payload = json!({
           "ok": false,
-          "code": err.code,
+          "code": err.code.as_str(),
           "message": err.message,
           "phase": phase,
       });
@@ -340,31 +444,29 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
   let mut optional_deps = OptionalDeps::Ask;
   let mut optional_given = false;
   let mut lang = None;
+  let mut dry_run = false;
+  let mut noconfirm = false;
   let mut positional = Vec::new();
 
   let mut index = 0;
   while index < args.len() {
     match args[index].as_str() {
-      "--json" => {
-        json_mode = JsonMode::All;
-        index += 1;
-      }
-      "--json-errors" => {
-        json_mode = JsonMode::Errors;
-        index += 1;
-      }
-      "--non-interactive" => {
-        non_interactive = true;
+      // The switches: each sets one thing and takes no value.
+      "--json" | "--json-errors" | "--non-interactive" | "--dry-run" | "--noconfirm" | "--yes" => {
+        match args[index].as_str() {
+          "--json" => json_mode = JsonMode::All,
+          "--json-errors" => json_mode = JsonMode::Errors,
+          "--non-interactive" => non_interactive = true,
+          "--dry-run" => dry_run = true,
+          _ => noconfirm = true,
+        }
         index += 1;
       }
       // Both flags answer the same question, so guessing which one wins would
       // be a silent change of what the user asked for. Say so instead.
       "--with-optional" | "--no-optional" => {
         if optional_given {
-          return Err(CliError::new(
-            E_ARG_INVALID,
-            "--with-optional and --no-optional are mutually exclusive",
-          ));
+          return Err(CliError::new(E_ARG_INVALID, tr(Key::OptionalFlagsExclusive, &[])));
         }
         optional_given = true;
         optional_deps =
@@ -373,9 +475,8 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       }
       "--feed-policy" => {
         let value = flag_value(args, index, "--feed-policy", "<mode>", E_POLICY_INVALID)?;
-        feed_policy = FeedPolicy::parse(value).ok_or_else(|| {
-          CliError::new(E_POLICY_INVALID, format!("invalid --feed-policy: {value}"))
-        })?;
+        feed_policy = FeedPolicy::parse(value)
+          .ok_or_else(|| CliError::new(E_POLICY_INVALID, tr(Key::InvalidFeedPolicy, &[&value])))?;
         index += 2;
       }
       "--fetch-timeout" => {
@@ -396,7 +497,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       "--pkgmgr" => {
         let value = flag_value(args, index, "--pkgmgr", "<opkg|apk|pica>", E_CONFIG_INVALID)?;
         if crate::pkgmgr::PackageManagerKind::parse(value).is_none() {
-          return Err(CliError::new(E_CONFIG_INVALID, format!("invalid --pkgmgr: {value}")));
+          return Err(CliError::new(E_CONFIG_INVALID, tr(Key::InvalidPkgmgrFlag, &[&value])));
         }
         pkgmgr = Some(value.clone());
         index += 2;
@@ -406,7 +507,7 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
         let value = flag_value(args, index, "--lang", "<zh-CN|en-US>", E_CONFIG_INVALID)?;
         lang = Some(
           Lang::parse(value)
-            .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("invalid --lang: {value}")))?,
+            .ok_or_else(|| CliError::new(E_CONFIG_INVALID, tr(Key::InvalidLangFlag, &[&value])))?,
         );
         index += 2;
       }
@@ -428,6 +529,8 @@ pub fn parse_options(args: &[String]) -> CliResult<(Options, Vec<String>)> {
       pkgmgr,
       optional_deps,
       lang,
+      dry_run,
+      noconfirm,
     },
     positional,
   ))
@@ -439,15 +542,17 @@ fn flag_value<'a>(
   index: usize,
   flag: &str,
   takes: &str,
-  code: &'static str,
+  code: ErrorCode,
 ) -> CliResult<&'a String> {
-  args.get(index + 1).ok_or_else(|| CliError::new(code, format!("{flag} requires {takes}")))
+  args
+    .get(index + 1)
+    .ok_or_else(|| CliError::new(code, tr(Key::RequiresArgument, &[&flag, &takes])))
 }
 
 fn parse_positive_u64_option(flag: &str, value: &str) -> CliResult<u64> {
   let parsed = parse_u64_option(flag, value)?;
   if parsed == 0 {
-    return Err(CliError::new(E_CONFIG_INVALID, format!("invalid {flag}: {value}")));
+    return Err(CliError::new(E_CONFIG_INVALID, tr(Key::InvalidOptionValue, &[&flag, &value])));
   }
   Ok(parsed)
 }
@@ -455,27 +560,26 @@ fn parse_positive_u64_option(flag: &str, value: &str) -> CliResult<u64> {
 fn parse_u64_option(flag: &str, value: &str) -> CliResult<u64> {
   value
     .parse::<u64>()
-    .map_err(|_| CliError::new(E_CONFIG_INVALID, format!("invalid {flag}: {value}")))
+    .map_err(|_| CliError::new(E_CONFIG_INVALID, tr(Key::InvalidOptionValue, &[&flag, &value])))
 }
 
 fn parse_u32_option(flag: &str, value: &str) -> CliResult<u32> {
   value
     .parse::<u32>()
-    .map_err(|_| CliError::new(E_CONFIG_INVALID, format!("invalid {flag}: {value}")))
+    .map_err(|_| CliError::new(E_CONFIG_INVALID, tr(Key::InvalidOptionValue, &[&flag, &value])))
 }
 
 pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
-  std::fs::create_dir_all(&paths.etc_dir).map_err(|err| {
-    CliError::new(E_IO, format!("mkdir {} failed: {err}", paths.etc_dir.display()))
-  })?;
+  std::fs::create_dir_all(&paths.etc_dir)
+    .map_err(|err| CliError::new(E_IO, tr(Key::MkdirFailed, &[&paths.etc_dir.display(), &err])))?;
   std::fs::create_dir_all(&paths.state_dir).map_err(|err| {
-    CliError::new(E_IO, format!("mkdir {} failed: {err}", paths.state_dir.display()))
+    CliError::new(E_IO, tr(Key::MkdirFailed, &[&paths.state_dir.display(), &err]))
   })?;
   std::fs::create_dir_all(&paths.cache_dir).map_err(|err| {
-    CliError::new(E_IO, format!("mkdir {} failed: {err}", paths.cache_dir.display()))
+    CliError::new(E_IO, tr(Key::MkdirFailed, &[&paths.cache_dir.display(), &err]))
   })?;
   std::fs::create_dir_all(&paths.repos_cache_dir).map_err(|err| {
-    CliError::new(E_IO, format!("mkdir {} failed: {err}", paths.repos_cache_dir.display()))
+    CliError::new(E_IO, tr(Key::MkdirFailed, &[&paths.repos_cache_dir.display(), &err]))
   })?;
 
   if !paths.conf_file.is_file() {
@@ -543,12 +647,6 @@ pub(crate) fn prompt_yn(question: &str, default_yes: bool) -> bool {
   }
 }
 
-pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
-  let conf = read_json_file(conf_file).ok()?;
-  let value = conf.get("i18n").and_then(Value::as_str).unwrap_or(DEFAULT_LUCI_I18N);
-  Some(value.to_string())
-}
-
 /// Reads the configured backend. `null`, a missing key and an empty string all
 /// mean "auto-detect"; an unrecognized value is an error so a typo cannot
 /// silently pick the wrong package database.
@@ -576,19 +674,9 @@ pub(crate) fn conf_get_apk_force_non_repository(conf_file: &Path) -> CliResult<b
     Some(Value::Bool(value)) => Ok(*value),
     Some(other) => Err(CliError::new(
       E_CONFIG_INVALID,
-      format!(
-        "invalid \"apk_force_non_repository\" in {}: expected true or false, found {other}",
-        conf_file.display()
-      ),
+      tr(Key::InvalidApkForceSetting, &[&conf_file.display(), &other]),
     )),
   }
-}
-
-pub(crate) fn resolve_lang(conf_file: &Path) -> String {
-  let conf = read_json_file(conf_file).ok();
-  conf
-    .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
-    .unwrap_or_else(|| DEFAULT_LUCI_I18N.to_string())
 }
 
 /// The interface language stored in the configuration, or the default.
@@ -603,9 +691,61 @@ pub(crate) fn conf_get_language(conf_file: &Path) -> Lang {
 
 #[cfg(test)]
 mod tests {
-  use super::{FeedPolicy, conf_get_apk_force_non_repository, conf_get_pkgmgr, parse_options};
+  use super::{
+    App, CliError, E_RUNTIME, FeedPolicy, Paths, conf_get_apk_force_non_repository,
+    conf_get_pkgmgr, parse_options,
+  };
+  use crate::pkgmgr::PackageManagerKind;
   use serde_json::json;
   use std::fs;
+
+  fn app_in(root: &std::path::Path) -> App {
+    let (options, _) = parse_options(&["--pkgmgr".to_string(), "pica".to_string()]).expect("parse");
+    let paths = Paths {
+      etc_dir: root.to_path_buf(),
+      conf_file: root.join("pica.json"),
+      state_dir: root.to_path_buf(),
+      db_file: root.join("db.json"),
+      index_file: root.join("index.json"),
+      cache_dir: root.join("cache"),
+      repos_cache_dir: root.join("cache/repos"),
+      report_file: root.join("report.json"),
+      lock_file: root.join("db.lck"),
+    };
+    let mut app = App::new(paths, options);
+    app.with_backend_for_tests(PackageManagerKind::Pica);
+    app
+  }
+
+  #[test]
+  fn a_scoped_backend_is_put_back_whatever_the_scope_returns() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut app = app_in(dir.path());
+
+    // `pica` needs no command, so the scope can always be entered here.
+    app
+      .with_backend(PackageManagerKind::Pica, |app| {
+        assert_eq!(app.backend(), PackageManagerKind::Pica);
+        Ok(())
+      })
+      .expect("ok scope");
+    assert_eq!(app.backend(), PackageManagerKind::Pica);
+
+    let err = app
+      .with_backend(PackageManagerKind::Pica, |_| -> Result<(), CliError> {
+        Err(CliError::new(E_RUNTIME, "boom"))
+      })
+      .expect_err("the scope's error comes back");
+    assert_eq!(err.message, "boom");
+    assert_eq!(app.backend(), PackageManagerKind::Pica, "a failing scope restores it too");
+  }
+
+  #[test]
+  fn an_explicit_backend_outranks_the_recorded_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app = app_in(dir.path());
+    assert_eq!(app.backend_for_record(PackageManagerKind::Opkg), PackageManagerKind::Pica);
+  }
 
   #[test]
   fn parse_options_fetch_settings() {
@@ -625,6 +765,21 @@ mod tests {
     assert_eq!(options.fetch_retry_delay, 2);
     assert_eq!(options.feed_policy, FeedPolicy::Ask);
     assert_eq!(positional, vec!["-S".to_string()]);
+  }
+
+  #[test]
+  fn parse_options_reads_the_plan_switches() {
+    let input: Vec<String> =
+      ["--dry-run", "-R", "a", "--yes", "b"].iter().map(ToString::to_string).collect();
+    let (options, positional) = parse_options(&input).expect("parse options");
+    assert!(options.dry_run);
+    assert!(options.noconfirm);
+    assert!(!options.non_interactive, "--yes answers the confirmation, nothing else");
+    assert_eq!(positional, vec!["-R".to_string(), "a".to_string(), "b".to_string()]);
+
+    let (options, _) = parse_options(&["-R".to_string()]).expect("parse options");
+    assert!(!options.dry_run);
+    assert!(!options.noconfirm);
   }
 
   #[test]

@@ -1,4 +1,4 @@
-use crate::error::{PicaError, PicaResult};
+use crate::error::{ErrorCode, PicaError, PicaResult};
 use crate::selector::Selector;
 use crate::version::pkgver_cmp_key;
 use serde_json::{Map, Value};
@@ -184,7 +184,7 @@ impl Manifest {
   pub fn require_non_empty(&self, key: &str) -> PicaResult<String> {
     let value = self.get_first(key);
     if value.is_empty() {
-      Err(PicaError::msg(format!("manifest missing {key}")))
+      Err(PicaError::coded(ErrorCode::ManifestInvalid, format!("manifest missing {key}")))
     } else {
       Ok(value)
     }

@@ -15,6 +15,8 @@
 //! rewritten by anyone on the path.
 
 use crate::app::{CliError, CliResult, E_CONFIG_INVALID, E_POLICY_INVALID};
+use crate::i18n::Key;
+use crate::i18n::tr;
 use pica_pkg_core::repo::{artifact_path_problem, is_supported_url, relative_path_problem};
 
 /// How far a redirect chain may go before the client gives up.
@@ -77,13 +79,10 @@ impl FetchPolicy {
   /// Returns an error naming the scheme, host or scope that is refused.
   pub(crate) fn check(self, url: &str) -> CliResult<()> {
     let parts = split(url)
-      .ok_or_else(|| CliError::new(E_POLICY_INVALID, format!("not an absolute URL: {url}")))?;
+      .ok_or_else(|| CliError::new(E_POLICY_INVALID, tr(Key::NotAbsoluteUrl, &[&url])))?;
 
     if !parts.authority.is_empty() && parts.authority.contains('@') {
-      return Err(CliError::new(
-        E_POLICY_INVALID,
-        format!("refusing a URL with credentials in it: {url}"),
-      ));
+      return Err(CliError::new(E_POLICY_INVALID, tr(Key::UrlWithCredentials, &[&url])));
     }
 
     match parts.scheme {
@@ -91,10 +90,7 @@ impl FetchPolicy {
         if self.allow_file {
           Ok(())
         } else {
-          Err(CliError::new(
-            E_POLICY_INVALID,
-            format!("a remote source may not download from this machine: {url}"),
-          ))
+          Err(CliError::new(E_POLICY_INVALID, tr(Key::RemoteSourceLocalUrl, &[&url])))
         }
       }
       "https" => Ok(()),
@@ -103,18 +99,10 @@ impl FetchPolicy {
         if scope.is_local() || self.allow_public_http {
           Ok(())
         } else {
-          Err(CliError::new(
-            E_POLICY_INVALID,
-            format!(
-              "plain HTTP is only used for local sources; {url} is public — use https, or set \
-               allow_insecure_http for this source if that is really what you want"
-            ),
-          ))
+          Err(CliError::new(E_POLICY_INVALID, tr(Key::PlainHttpPublic, &[&url])))
         }
       }
-      other => {
-        Err(CliError::new(E_POLICY_INVALID, format!("unsupported URL scheme {other}: {url}")))
-      }
+      other => Err(CliError::new(E_POLICY_INVALID, tr(Key::UnsupportedScheme, &[&other, &url]))),
     }
   }
 
@@ -126,10 +114,7 @@ impl FetchPolicy {
     self.check(to)?;
 
     if scheme_of(from) == Some("https") && scheme_of(to) == Some("http") {
-      return Err(CliError::new(
-        E_POLICY_INVALID,
-        format!("refusing to follow a redirect from https to {to}"),
-      ));
+      return Err(CliError::new(E_POLICY_INVALID, tr(Key::RedirectDowngrade, &[&to])));
     }
 
     Ok(())
@@ -293,13 +278,12 @@ fn join_checked(root: &str, relative: &str, problem: Option<&str>) -> CliResult<
   if let Some(reason) = problem {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("{relative:?} is not a safe relative path: {reason}"),
+      tr(Key::UnsafeRelativePath, &[&format!("{relative:?}"), &reason]),
     ));
   }
 
-  let parts = split(root).ok_or_else(|| {
-    CliError::new(E_CONFIG_INVALID, format!("source root is not an absolute URL: {root}"))
-  })?;
+  let parts = split(root)
+    .ok_or_else(|| CliError::new(E_CONFIG_INVALID, tr(Key::SourceRootNotAbsolute, &[&root])))?;
 
   let root_path = parts.path.trim_end_matches('/');
   Ok(format!("{}://{}{root_path}/{relative}", parts.scheme, parts.authority))
@@ -316,7 +300,7 @@ fn join_checked(root: &str, relative: &str, problem: Option<&str>) -> CliResult<
 /// a safe relative path.
 pub(crate) fn join_sibling(file_url: &str, relative: &str) -> CliResult<String> {
   let parts = split(file_url)
-    .ok_or_else(|| CliError::new(E_CONFIG_INVALID, format!("not an absolute URL: {file_url}")))?;
+    .ok_or_else(|| CliError::new(E_CONFIG_INVALID, tr(Key::NotAbsoluteUrl, &[&file_url])))?;
 
   let dir = match parts.path.rfind('/') {
     Some(index) => &parts.path[..=index],
@@ -338,7 +322,7 @@ pub(crate) fn join_sibling(file_url: &str, relative: &str) -> CliResult<String> 
 pub(crate) fn resolve_location(current: &str, location: &str) -> CliResult<String> {
   let location = location.trim();
   if location.is_empty() {
-    return Err(CliError::new(E_POLICY_INVALID, "redirect without a Location value"));
+    return Err(CliError::new(E_POLICY_INVALID, tr(Key::RedirectNoLocation, &[])));
   }
 
   if split(location).is_some() {
@@ -346,15 +330,11 @@ pub(crate) fn resolve_location(current: &str, location: &str) -> CliResult<Strin
   }
 
   if location.starts_with("//") {
-    return Err(CliError::new(
-      E_POLICY_INVALID,
-      format!("refusing a protocol-relative redirect: {location}"),
-    ));
+    return Err(CliError::new(E_POLICY_INVALID, tr(Key::RedirectProtocolRelative, &[&location])));
   }
 
-  let parts = split(current).ok_or_else(|| {
-    CliError::new(E_POLICY_INVALID, format!("cannot resolve a redirect from {current}"))
-  })?;
+  let parts = split(current)
+    .ok_or_else(|| CliError::new(E_POLICY_INVALID, tr(Key::RedirectUnresolvable, &[&current])))?;
 
   let (path, query) = match location.split_once('?') {
     Some((path, query)) => (path, Some(query)),

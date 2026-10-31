@@ -1,8 +1,11 @@
-use super::pipeline::{PackageFields, installs_declared_dependencies};
+use super::deps::installs_declared_dependencies;
+use super::pipeline::PackageFields;
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
   E_PLATFORM_UNSUPPORTED, E_VERSION_INCOMPATIBLE,
 };
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::platform::{
   ArchVerdict, check_arch, detect_luci_variant, detect_os, detect_package_arches, normalize_uname,
 };
@@ -132,7 +135,7 @@ fn dep_entries(
       // "missing" would be a claim about the feeds that pica cannot make. For an
       // optional one it is only a reason not to offer it.
       Err(err) if dep.optional => {
-        app.log_warn(format!("optional dependency {} was skipped: {}", dep.name, err.message));
+        app.log_warn(tr(Key::OptionalDepSkipped, &[&dep.name, &err.message]));
         "unknown".to_string()
       }
       Err(err) => return Err(err),
@@ -148,7 +151,7 @@ fn dep_entries(
       Some(Some(violations)) => {
         if let Some(message) = violations.first() {
           if dep.optional {
-            app.log_warn(format!("{}: {message}", crate::constraints::BOUND_UNMET));
+            app.log_warn(format!("{}: {message}", crate::constraints::bound_unmet()));
           } else {
             return Err(CliError::new(E_VERSION_INCOMPATIBLE, message.clone()));
           }
@@ -156,11 +159,9 @@ fn dep_entries(
       }
       // Installed, bounded, and no version to compare: unchecked, not satisfied.
       // Recording `true` here would assert something nobody verified.
-      Some(None) => app.log_warn(format!(
-        "installed version of {} is unknown, so the declared {} was not checked",
-        dep.name,
-        dep.requirement()
-      )),
+      Some(None) => {
+        app.log_warn(tr(Key::InstalledVersionUnknown, &[&dep.name, &dep.requirement()]));
+      }
       None => {}
     }
 
@@ -289,24 +290,16 @@ fn check_package_arch(app: &mut App, pkg: &PackageFields) -> CliResult<()> {
   match check_arch(&pkg.arch, &host_arches) {
     ArchVerdict::Backend | ArchVerdict::Kernel => Ok(()),
     ArchVerdict::Related => {
-      app.log_warn(format!(
-        "arch {} was accepted on a family match alone ({})",
-        pkg.arch,
-        host_arches.describe()
-      ));
+      app.log_warn(tr(Key::ArchFamilyMatch, &[&pkg.arch, &host_arches.describe()]));
       Ok(())
     }
     ArchVerdict::Unverified => {
-      app.log_warn(format!(
-        "cannot determine this host's package architecture, so arch={} was not checked ({})",
-        pkg.arch,
-        host_arches.describe()
-      ));
+      app.log_warn(tr(Key::ArchUnchecked, &[&pkg.arch, &host_arches.describe()]));
       Ok(())
     }
     ArchVerdict::Mismatch => Err(CliError::new(
       E_PLATFORM_UNSUPPORTED,
-      format!("unsupported arch: pkg={} ({})", pkg.arch, host_arches.describe()),
+      tr(Key::UnsupportedArch, &[&pkg.arch, &host_arches.describe()]),
     )),
   }
 }
@@ -346,21 +339,12 @@ fn check_resolvable_dependencies(
   if !required.is_empty() {
     return Err(CliError::new(
       E_PACKAGE_INVALID,
-      format!(
-        "package declares {} but pkgmgr={} cannot resolve dependencies; \
-         rebuild it with pkgmgr=opkg or pkgmgr=apk, or drop the dependency",
-        required.join(" "),
-        pkg.pkgmgr
-      ),
+      tr(Key::PicaCannotResolveDeps, &[&required.join(" "), &pkg.pkgmgr]),
     ));
   }
 
   if !optional.is_empty() {
-    app.log_warn(format!(
-      "pkgmgr={} cannot install optional dependencies; skipping {}",
-      pkg.pkgmgr,
-      optional.join(" ")
-    ));
+    app.log_warn(tr(Key::PicaSkipsOptional, &[&pkg.pkgmgr, &optional.join(" ")]));
   }
 
   Ok(())
@@ -380,14 +364,14 @@ pub(super) fn validate_package(
   if !pkg.uname.is_empty() && pkg_uname_norm != host_uname {
     return Err(CliError::new(
       E_PLATFORM_UNSUPPORTED,
-      format!("unsupported uname: pkg={} host={host_uname_raw}", pkg.uname),
+      tr(Key::UnsupportedUname, &[&pkg.uname, &host_uname_raw]),
     ));
   }
 
   if pkg.os != "all" && pkg.os != host_os {
     return Err(CliError::new(
       E_PLATFORM_UNSUPPORTED,
-      format!("unsupported os: pkg={} host={host_os}", pkg.os),
+      tr(Key::UnsupportedOs, &[&pkg.os, &host_os]),
     ));
   }
 
@@ -398,41 +382,34 @@ pub(super) fn validate_package(
   // `pkgmgr` is validated while resolving the backend; re-checking it here would
   // duplicate the rule in two places and let them drift.
   if !has_payload(tmpdir) {
-    return Err(CliError::new(
-      E_PACKAGE_INVALID,
-      "package would be empty: it ships no root/ or scripts/, and its pkgs/ holds no packages",
-    ));
+    return Err(CliError::new(E_PACKAGE_INVALID, tr(Key::PackageEmpty, &[])));
   }
 
   if !is_valid_source_availability(&pkg.source_availability) {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!(
-        "invalid source_availability value: {} (supported: {})",
-        pkg.source_availability,
-        SOURCE_AVAILABILITY_VALUES.join(", ")
+      tr(
+        Key::InvalidSourceAvailability,
+        &[&pkg.source_availability, &SOURCE_AVAILABILITY_VALUES.join(", ")],
       ),
     ));
   }
 
   if manifest.has_type("luci") {
     if pkg.luci.is_empty() {
-      return Err(CliError::new(E_CONFIG_INVALID, "type=luci requires luci=<lua1|js2>"));
+      return Err(CliError::new(E_CONFIG_INVALID, tr(Key::LuciTypeNeedsVariant, &[])));
     }
     if pkg.luci != "lua1" && pkg.luci != "js2" {
-      return Err(CliError::new(E_CONFIG_INVALID, format!("invalid luci value: {}", pkg.luci)));
+      return Err(CliError::new(E_CONFIG_INVALID, tr(Key::InvalidLuci, &[&pkg.luci])));
     }
     let host_luci = detect_luci_variant(app);
     if host_luci == "unknown" {
-      return Err(CliError::new(
-        E_PLATFORM_UNSUPPORTED,
-        format!("luci variant required ({}) but cannot detect host", pkg.luci),
-      ));
+      return Err(CliError::new(E_PLATFORM_UNSUPPORTED, tr(Key::LuciUndetectable, &[&pkg.luci])));
     }
     if host_luci != pkg.luci {
       return Err(CliError::new(
         E_PLATFORM_UNSUPPORTED,
-        format!("unsupported luci variant: pkg={} host={host_luci}", pkg.luci),
+        tr(Key::UnsupportedLuci, &[&pkg.luci, &host_luci]),
       ));
     }
   }

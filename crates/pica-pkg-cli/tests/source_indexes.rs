@@ -388,12 +388,24 @@ fn an_entry_with_an_invalid_name_is_skipped_and_the_rest_of_the_source_stays() {
 }
 
 #[test]
-fn a_target_after_the_first_is_refused_instead_of_dropped() {
+fn a_second_argument_is_never_dropped() {
   let sandbox = Sandbox::new();
 
-  sandbox.run(&["-S", "first", "second"]).failure().stderr(contains("unexpected argument: second"));
-  sandbox.run(&["-R", "first", "second"]).failure().stderr(contains("unexpected argument: second"));
+  // A command that takes one argument refuses the next one.
+  sandbox
+    .run(&["-Qi", "first", "second"])
+    .failure()
+    .stderr(contains("unexpected argument: second"));
   sandbox.run(&["-Q", "stray"]).failure().stderr(contains("unexpected argument: stray"));
+
+  // One that takes several tries every one of them and says how it went.
+  let assert = sandbox.run(&["-R", "first", "second"]).failure();
+  let output = assert.get_output();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(stdout.contains("0 succeeded, 2 failed"), "{stdout}");
+  assert!(stderr.contains("not installed: first"), "{stderr}");
+  assert!(stderr.contains("not installed: second"), "{stderr}");
 }
 
 #[test]

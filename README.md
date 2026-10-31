@@ -28,16 +28,24 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 
 - `pica setup`：交互式初始化（界面语言、软件源、每个源启用的后端，随后同步）
 - `pica -S`：同步 pica 仓库索引（源根 `index.json` -> 各后端 `index.json` -> 本机同步缓存）
-- `pica -S <appname>`：按应用名安装（默认：自动在 opkg/pica 源之间决策）
-- `pica -Su`：升级所有已安装的 pica 包（从 index.json 选择最新版本并安装）
+- `pica -S <appname>...`：按应用名安装，可一次给多个（默认：自动在 opkg/pica 源之间决策）
+- `pica -Su`：升级所有已安装的 pica 包（先列出待升级清单并确认，单个失败不影响其他包，结束时汇总）
 - `pica -Syu`：先 `-S` 再 `-Su`
 - `pica -Si <appname>`：显示仓库远端包信息（基于已同步 index）
+- `pica -Ss <关键词>`：搜索已同步的源（名字、描述，支持拼写容错；`--all` 显示本机不可装的结果）
+- `pica -Sl [source]`：列出已同步的源发布的软件包
+- `pica -Qs <关键词>`：搜索已安装的软件包
+- `pica -Qo <path>`：查询文件属于哪个已安装的包
+- `pica -Qu`：列出有新版本可用的已安装包
 - `pica -So <appname>`：强制走系统包管理器安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
-- `pica -Sp <appname>`：强制走 pica 镜像源安装（从已同步的索引解析并下载 pkg.tar.gz）
+- `pica -Sp <appname>...`：强制走 pica 镜像源安装（从已同步的索引解析并下载 pkg.tar.gz）
 - `pica --pkgmgr <opkg|apk|pica>`：指定安装后端（优先级：`--pkgmgr` > manifest > `pica.json` > 自动探测）
 - `pica --lang <zh-CN|en-US>`：本次运行的界面语言（只影响本次，不写回配置）
-- `pica -U <pkgfile>`：从本地 `.pkg.tar.gz` 安装/更新（类似 pacman -U）
-- `pica -R <pkgname>`：卸载（不处理依赖关系）
+- `pica -U <pkgfile|url>...`：从本地 `.pkg.tar.gz` 或 URL 安装/更新（类似 pacman -U）
+- `pica -R <pkgname>...`：卸载（不处理依赖关系）
+- `pica --dry-run ...`：只展示 `-S`/`-Sp`/`-So`/`-U`/`-R`/`-Su` 的执行计划，不做任何更改
+- `pica --noconfirm ...`（别名 `--yes`）：变更前不再询问；`--non-interactive` 或非终端时本来就不询问
+- `pica --json ...`：`-Q`、`-Qi`、`-Ql`、`-Qs`、`-Qo`、`-Qu`、`-Si`、`-Ss`、`-Sl` 输出 JSON 数据
 - `pica -Q`：列出已安装的 pica 包
 - `pica -Qi <pkgname>`：显示已安装包信息
 - `pica -Ql <pkgname>`：列出该包安装到系统的文件路径
