@@ -395,8 +395,15 @@ fn a_second_argument_is_never_dropped() {
   sandbox
     .run(&["-Qi", "first", "second"])
     .failure()
+    .stderr(contains("-Qi takes one argument"))
     .stderr(contains("unexpected argument: second"));
-  sandbox.run(&["-Q", "stray"]).failure().stderr(contains("unexpected argument: stray"));
+  // A command that takes none says so, instead of asking for the argument it
+  // was just handed.
+  sandbox
+    .run(&["-Q", "stray"])
+    .failure()
+    .stderr(contains("-Q takes no argument"))
+    .stderr(contains("unexpected argument: stray"));
 
   // One that takes several tries every one of them and says how it went.
   let assert = sandbox.run(&["-R", "first", "second"]).failure();

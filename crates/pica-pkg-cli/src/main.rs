@@ -131,7 +131,11 @@ fn reject_extra_args(app: &App, args: &[String]) -> CliResult<()> {
   };
   match args.get(accepted) {
     Some(extra) => {
-      Err(CliError::new(E_ARG_INVALID, app.args(Key::TooManyArguments, &[&args[0], extra])))
+      // `accepted` counts the command itself, so 1 means the command carries no
+      // operand at all. Telling a user that `-Q` "takes one argument" right
+      // after they passed one reads as if it wanted it.
+      let key = if accepted == 1 { Key::UnexpectedArgument } else { Key::TooManyArguments };
+      Err(CliError::new(E_ARG_INVALID, app.args(key, &[&args[0], extra])))
     }
     None => Ok(()),
   }

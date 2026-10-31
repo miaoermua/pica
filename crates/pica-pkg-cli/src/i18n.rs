@@ -512,6 +512,7 @@ pub(crate) enum Key {
   InvalidPkgname,
   InvalidAppname,
   TooManyArguments,
+  UnexpectedArgument,
 }
 
 /// The English wording. Exhaustive: every key has a string here.
@@ -679,6 +680,7 @@ fn english(key: Key) -> &'static str {
       "invalid appname {0}: start with a letter or digit and use only letters, digits and . _ + -"
     }
     Key::TooManyArguments => "{0} takes one argument; unexpected argument: {1}",
+    Key::UnexpectedArgument => "{0} takes no argument; unexpected argument: {1}",
     Key::NoPackageManager => "no supported package manager found",
     Key::MissingCommand => "missing required command: {0}",
     Key::InvalidPkgmgr => "invalid pkgmgr: {0}",
@@ -1097,6 +1099,7 @@ fn chinese(key: Key) -> &'static str {
     Key::InvalidPkgname => "pkgname {0} 无效：须以字母或数字开头，只能使用字母、数字和 . _ + - @",
     Key::InvalidAppname => "appname {0} 无效：须以字母或数字开头，只能使用字母、数字和 . _ + -",
     Key::TooManyArguments => "{0} 只接受一个参数；多余的参数：{1}",
+    Key::UnexpectedArgument => "{0} 不接受参数；多余的参数：{1}",
     Key::NoPackageManager => "未找到受支持的包管理器",
     Key::MissingCommand => "缺少必需的命令：{0}",
     Key::InvalidPkgmgr => "无效的 pkgmgr：{0}",
@@ -1757,6 +1760,7 @@ mod tests {
     Key::InvalidPkgname,
     Key::InvalidAppname,
     Key::TooManyArguments,
+    Key::UnexpectedArgument,
     Key::NoPackageManager,
     Key::MissingCommand,
     Key::InvalidPkgmgr,
