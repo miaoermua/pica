@@ -1,3 +1,4 @@
+use crate::i18n::tr;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,8 +126,8 @@ fn inspect(lock_dir: &Path, liveness: &impl Fn(u32) -> Liveness) -> Verdict {
   // died there, and only its age tells them apart.
   match lock_dir_age(lock_dir) {
     Some(age) if age >= ACQUIRE_GRACE => Verdict::Stale,
-    Some(_) => Verdict::Unverified("a lock being taken".to_string()),
-    None => Verdict::Unverified("a lock without a pid".to_string()),
+    Some(_) => Verdict::Unverified(tr(Key::LockBeingTaken, &[])),
+    None => Verdict::Unverified(tr(Key::LockWithoutPid, &[])),
   }
 }
 
@@ -174,7 +175,7 @@ impl Drop for LockGuard {
 
 fn ensure_dir(path: &Path) -> CliResult<()> {
   fs::create_dir_all(path)
-    .map_err(|err| CliError::new(E_IO, format!("mkdir {} failed: {err}", path.display())))
+    .map_err(|err| CliError::new(E_IO, tr(Key::MkdirFailed, &[&path.display(), &err])))
 }
 
 #[cfg(test)]

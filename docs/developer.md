@@ -8,7 +8,7 @@
 > [!NOTE]
 >
 > 💡 寻找包格式协议？<br/>
-> 关于打包规则、`.pkg.tar.gz` 的内部结构定义、`manifest` 文件规范说明与 `repo.json` 强约束条件，请统一阅读 [Pica 标准规范 (standard.md)](./standard.md)。
+> 关于打包规则、`.pkg.tar.gz` 的内部结构定义、`manifest` 文件规范说明与后端索引强约束条件，请统一阅读 [Pica 标准规范 (standard.md)](./standard.md)。
 >
 > 💡 寻找使用方法？<br/>
 > 了解命令行工具的基础用法及防风险警告，请阅读 [Pica 用户指引 (user.md)](./user.md)。
@@ -20,7 +20,7 @@
 ```text
 .
   crates/
-    pica-pkg-core/    归档、manifest、repo.json 与基础 IO
+    pica-pkg-core/    manifest、索引协议、命名规则、协议常量（layout）与基础 IO
     pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/初始化向导/后端）
                        src/i18n.rs 放界面语言与全部用户可见文本
     pica-pkg-pack/    pica-pack 命令（构建与打包）
@@ -35,7 +35,7 @@
 ### 脚本说明与调用
 
 - 入口：`cargo run -p pica-pkg-pack --`（产物二进制为 `pica-pack`）
-- 职责：把符合 `standard.md` 的 `pkgdir` 打成 `.pkg.tar.gz`，并按后端生成 `repo.json` 与 `SHA256SUMS`。
+- 职责：把符合 `standard.md` 的 `pkgdir` 打成 `.pkg.tar.gz`，并按后端生成 `index.json` 与 `SHA256SUMS`，在输出根目录生成入口 `index.json`。
 
 ### 用法
 
@@ -126,7 +126,7 @@ rename 落位是"最终"的：一旦改名，旧内容就再也摸不到了。�
 
 ### 安装的提交顺序与失败处理
 
-- **顺序**：hook → `root/` 部署 → `scripts/.env` → `record_installation`（先数据库、后安装报告）→ `mark_committed` → `finish`。数据库是"装上了没有"的唯一答案：`-Qi`、`-R`、`-U` 都只读它，报告不是。记账发生在文件已经落盘之后、完成提示之前，所以看到完成提示就意味着 `db.json` 里已经有这条记录。
+- **顺序**：依赖预检 → 计划与确认（`--dry-run` 在此结束）→ hook → `root/` 部署 → `scripts/.env` → `record_installation`（先数据库、后安装报告）→ `finish` → `remove_orphans`。数据库是"装上了没有"的唯一答案：`-Qi`、`-R`、`-U` 都只读它，报告不是。记账发生在文件已经落盘之后、完成提示之前，所以看到完成提示就意味着 `db.json` 里已经有这条记录。
 - **成功才报完成**：`Installed <n> files, <bytes>` 与 `Transaction completed` 只在 `failed` 为假时打印（前者还要求后端是 pica：native 后端自己会报，Pica 再数一遍就是第二个答案）。`failed` 为真的那条路径是"回滚不完整、写了残留记录"的分支，它只报错误与未恢复的路径，不会先说一句"事务完成"再报失败。
 - **报告写不进去**：文件已经落盘、数据库已经记下，报告失败是一条 `InstallReportFailed` 告警，不回滚文件。反过来的顺序不存在——数据库先写，写不进去就是安装失败。
 - **失败的升级保留旧记录**：回滚已经把上一版的文件放回来，`db.json` 里那条仍描述这一版；回滚删不掉的新路径用 `db_record_remnant` 合并进同一条记录（`manifest`、`pkgfile`、`installed_at` 不动），`-R` 才有东西可删。首次安装失败没有旧记录，才新建一条，否则那些文件无人认领。
@@ -134,9 +134,9 @@ rename 落位是"最终"的：一旦改名，旧内容就再也摸不到了。�
 - **Pica 自己的文件不归 payload 管**：`deploy_payload` **在取备份之前**就拒绝要写 Pica 状态目录的载荷（`E_PACKAGE_INVALID`）：`/etc/pica/pica.json`、`/var/lib/pica/{db.json,index.json,install-report.json,db.lck}` 这几个文件，以及 `<lock_file>.d`、`<state_dir>`、`<etc_dir>`（按 `Paths` 的实际取值）和 `<安装根>/usr/lib/pica/scripts/`、`<安装根>/etc/pica/env.d/` 下的任何路径。这些正是本次事务要读写的对象，让载荷落进去等于让包覆盖自己的账本，或者往 `db.lck.d/pid` 里写一个不存在的 pid、让锁被下一个进程判成陈旧；脚本目录里则是 `-R`/`-U` 会执行的 hook。判定既在 walk 之前也在快照之前，所以拒绝时设备上的文件不但没被写，也没有被"复制出去再放回来"——后者会换掉 inode、断开硬链接，而文件内容看起来没变。这是防误撞的护栏，不是权限边界：安装 hook 本来就是 root 任意代码，直接写这些文件拦不住。
 - **判定看落点，不看拼写**：上级组件里已有的符号链接、载荷自己要创建的符号链接，都按内核的解析顺序算到最终位置再比较，所以 `usr/lib/demo -> ../../var/lib/pica` 时 `usr/lib/demo/db.json` 会被认成数据库，先放一个 `opt/alias -> ../var/lib/pica` 也会；悬空链接同样算，`create_dir_all` 会顺着它把目录建在它指向的地方。解析不出来的路径（读不出的链接、成环超过 32 跳、名字里带 `..`）在部署前拒绝（`E_PACKAGE_INVALID`），不猜。指向安装根**之外**的符号链接是另一件事：那里没有 Pica 的状态可保护，护栏不据此拒绝，交给 walk 按既有语义拒（`payload symlink escapes the target root`）——这时别的条目可能已经落盘，走的是回滚，而不是"一个字节都没动"。整个检查在 walk 开始之前一次算完，与条目在第几个被走到无关。
 - **快照只覆盖 walk 会替换的路径**：`snapshot_payload` 对 `root/` 里的目录只递归、不取备份（walk 对已存在的目录只是往里合并，从不替换目录本身），对文件和符号链接才取；因此"目标处是符号链接指向目录"这类情况不会出现无谓的 unlink + 重建。取备份失败（缓存不可写、目标不可读、目标处是 socket/fifo/设备节点）是 `E_IO`，此时设备上一个字节还没动。
-- **恢复按插入逆序**：`restore` 倒着走备份条目。同一路径只会有一次备份；父条目是文件时不可能有子条目（普通文件没有子节点，符号链接指向目录时 walk 也不替换链接本身），所以逆序不需要额外排序就是部署的逆操作。备份表里也有 payload 之外的两类条目——`env.d/<pkg>.env` 与保留的 hook——它们不会与 payload 路径互为父子：护栏已经禁止载荷写进那两个目录。
+- **恢复按插入逆序**：`restore` 倒着走备份条目。同一路径只会有一次备份；父条目是文件时不可能有子条目（普通文件没有子节点，符号链接指向目录时 walk 也不替换链接本身），所以逆序不需要额外排序就是部署的逆操作。备份表里也有 payload 之外的两类条目——`env.d/<pkg>.env` 与升级时被整组替换的保留脚本——它们不会与 payload 路径互为父子：护栏已经禁止载荷写进那两个目录。保留脚本的目录在升级时被整个清空，恢复时会先重建父目录再放回文件。
 - **恢复可以重跑**：第一次恢复部分失败时，条目不会被清掉（备份目录也保留），修好故障后再跑一次会补齐；已经恢复过的条目会被再写一遍同样的内容，不删除、也不写入失败版本的内容。
-- **升级不删除旧版多出来的文件**：升级就是同 `pkgname` 的一次安装，`db.json` 被新清单覆盖，旧版独有、新版不再发布的路径留在盘上但不再被记录（`-R` 也删不到）。这是既有语义，本次未改。
+- **升级删除旧版多出来的文件**：`record_installation` 返回旧记录有、新部署没有的路径，`finish` 之后由 `remove_orphans` 删除。仍被别的 Pica 记录认领（`Db::owner_of`）或被系统后端认领（`owns_file`）的路径跳过；删不掉的只告警（`InstallOrphanKept`），不回滚已经提交的升级。放在 `finish` 之后，是因为在那之前升级仍可能回滚，而回滚要用到这些旧文件。
 - **只放回 walk 真正碰过的文件**：`install_payload_with` 把 walk 走过的目标边写边记（`deployed`），回滚时文件名条目只有在这个集合里才放回副本——walk 没走到的文件还是原样，用副本覆盖一遍只会换 inode、断硬链接、白读白写一个大文件。符号链接与空目录例外，因为它们被先 unlink 再重建，失败时名字是**缺失**的，副本是唯一来路。Pica 自己写的文件（`env.d/<pkg>.env`、保留的 hook）走的是 `copy` 而不是 rename，失败也可能已经截断，所以永远放回——**不能把"walk 没报告过"推广到所有文件类型**。
 - **三个不同的问题**：①"备份过"只说明快照阶段把目标复制进了 `cache/backup/<pkg>-XXXX/`，不说明目标被改过——walk 可能根本没走到它；②"walk 报告过"说明它被当作已替换，但不等于"必须放回"：Pica 自己 `copy` 出来的 env 与保留 hook 无论如何都要放回，只有 walk 用 rename 换掉的普通文件才按 `deployed` 集合过滤；③"恢复了"只是把本次动过的路径还原，**不构成整次安装的原子性**——多文件之间没有共同提交点，进程中途被杀就是部分旧、部分新。另外，放回一定写新 inode，属主、ACL、xattr、硬链接拓扑都不保证保留。
 - **回滚失败要复述**：`rollback` 把放不回去的路径以 `content:<路径> (<原因>)` 收进 `leftovers`，同时保留备份目录（那是唯一副本）；有 leftovers 时错误消息改成"回滚未完成"，不会把部分恢复说成成功。
@@ -168,10 +168,11 @@ PICA_ETC_DIR=/tmp/pica-etc PICA_STATE_DIR=/tmp/pica-var pica -S
 
 ### 界面语言（i18n）
 
-- 语言与文本都在 `src/i18n.rs`：`Lang`（`EnUs` / `ZhCn`）负责解析代码、决定配置读写；`Key` 是唯一的文本键，`Lang::text(key)` 取正文，`Lang::args(key, &[...])` 先替换 `{0}`/`{1}` 再用。业务代码里不写语言判断，也不写裸的英文句子。
+- 语言与文本都在 `src/i18n.rs`：`Lang`（`EnUs` / `ZhCn`）负责解析代码、决定配置读写；`Key` 是唯一的文本键，`Lang::text(key)` 取正文，`Lang::args(key, &[...])` 先替换 `{0}`/`{1}` 再用。手里没有 `App` 的代码（下载、后端、源校验）用 `tr(key, &[&a, &b])`，参数可以是任何实现 `Display` 的值；它读的是本线程的当前语言，由 `App::new`、`setup` 和 `main` 在解析参数前通过 `Lang::make_current` 设置。业务代码里不写语言判断，也不写裸的英文句子。
+- 防回退：`i18n.rs` 的测试 `no_sentence_is_written_outside_this_table` 扫描 `src/` 中 `format!`、`CliError::new`、`log_info`/`log_warn`、打印宏等调用里的字符串字面量，含英文单词且含空格的一律报错。确实不是文案的（程序名、单位、标签）写进测试里的 `NOT_TEXT`，并说明原因。
 - 语言来源优先级：`--lang` > `pica.json` 的 `language` > 英文。`--lang` 只在本次运行生效，不回写配置；写错的代码或未知语言一律按英文继续，不让一个手写配置把工具变成砖头。
 - 加一条文案：在 `Key` 里加一个变体，在 `english()` / `chinese()` 两张表各补一行，并加进 `ALL_KEYS`。两张表都是穷尽 `match`，漏一处编译不过；`ALL_KEYS` 驱动的测试还会检查两边的 `{n}` 占位符个数一致。
-- 不翻译的东西：包名、命令、配置键、协议字段、文件路径、`E_*` 错误码，以及 `--help` / `--version` / `-Qi` 的字段名。`--json-errors` 的 `code` 恒定，只有 `message` 随语言变。
+- 不翻译的东西：包名、命令、配置键、协议字段、文件路径、`E_*` 错误码、`--version`、`-Qi`/`-Si` 的字段名、JSON 输出与安装报告（其中可选依赖的 `reason` 保持英文）。`--help` 翻译说明文字，命令列不变。`--json-errors` 的 `code` 恒定，只有 `message` 随语言变。第三方工具的原始输出作为占位符参数原样保留。
 - 第三方工具的错误原文不丢：本地化的只是外层句式，原始输出（`opkg`/`apk` 的输出、`io::Error` 的文本）作为参数塞进占位符。
 
 ### 命令底层微观事务工作流

@@ -1,37 +1,28 @@
 use crate::app::{App, CliError, CliResult, E_ARG_INVALID, ensure_dirs};
 use crate::format;
+use crate::i18n::tr;
 use crate::i18n::{Key, Lang};
 use crate::installed::entry_backend;
 use crate::pkgmgr::PackageManagerKind;
-use crate::state::{db_del_installed, read_json_file};
+use crate::state::{luci_i18n, read_db, write_db};
 use crate::system::run_command_capture_output;
 use pica_pkg_core::io::{PayloadInstall, remove_payload};
-use pica_pkg_core::manifest::{
-  get_array_for as manifest_get_array_for, get_scalar as manifest_get_scalar,
-};
+use pica_pkg_core::layout::{DEFAULT_LUCI_I18N, SCRIPTS_DIR};
+use pica_pkg_core::manifest::get_array_for as manifest_get_array_for;
+use pica_pkg_core::model::db::{Db, DbEntry};
 use pica_pkg_core::version::pkgver_cmp_key;
-use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-const SCRIPTS_DIR: &str = "/usr/lib/pica/scripts";
 
 pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
-  let db = read_json_file(&app.paths.db_file)?;
+  let mut db = read_db(&app.paths)?;
   let entry = db
-    .get("installed")
-    .and_then(Value::as_object)
-    .and_then(|installed| installed.get(pkgname))
+    .installed
+    .get(pkgname)
     .cloned()
     .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))?;
-  let manifest = entry
-    .get("manifest")
-    .cloned()
-    .ok_or_else(|| CliError::new(E_ARG_INVALID, app.args(Key::NotInstalled, &[pkgname])))?;
-
-  let script_remove = manifest_get_scalar(&manifest, "script_remove");
   // How the package was installed is the only correct way to uninstall it, so
   // the recorded backend wins over any current CLI/config selection. Rows from
   // releases that stored the backend elsewhere resolve through the same ladder
@@ -40,17 +31,46 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   let kind = backend.kind;
   let pkgmgr = kind.as_str().to_string();
   if backend.is_inferred() {
-    let origin = backend.origin.as_str().to_string();
+    let origin = backend.origin.text();
     let name = pkgname.to_string();
     let using = pkgmgr.clone();
     app.warn_args(Key::RemoveBackendInferred, &[&name, &origin, &using]);
   }
 
-  app.select_package_manager(kind.as_str())?;
+  app.with_backend(kind, |app| remove_with_backend(app, pkgname, &entry, kind, &mut db))
+}
+
+/// The removal itself, with the backend that installed the package in use.
+fn remove_with_backend(
+  app: &mut App,
+  pkgname: &str,
+  entry: &DbEntry,
+  kind: PackageManagerKind,
+  db: &mut Db,
+) -> CliResult<()> {
+  let script_remove = entry.scalar("script_remove");
+  let pkgmgr = kind.as_str().to_string();
   // The version is the one the database recorded for the package being taken
   // away, not whatever the index offers now.
-  let header = removal_header(app.lang, pkgname, &recorded_version(&manifest));
+  let header = removal_header(app.lang, pkgname, &recorded_version(entry));
   app.log_info(header);
+
+  let remove_set = backend_packages(app, entry, kind);
+  let files = entry.owned_paths().map(ToString::to_string).collect::<Vec<_>>();
+
+  // The plan: what the record says will go. Nothing has run yet, so a dry run
+  // or a "no" leaves the package exactly as it was.
+  if !files.is_empty() {
+    app.info_args(Key::PlanRemoveFiles, &[&files.len().to_string()]);
+  }
+  if kind.requires_system_binary() && !remove_set.is_empty() {
+    let names = remove_set.iter().map(String::as_str).collect::<Vec<_>>().join(" ");
+    app.info_args(Key::PlanRemoveBackend, &[&pkgmgr, &names]);
+  }
+  if app.stop_for_dry_run() {
+    return Ok(());
+  }
+  app.confirm()?;
 
   let remove_target = if script_remove.starts_with('/') || script_remove.is_empty() {
     script_remove.clone()
@@ -58,25 +78,6 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     format!("{pkgname}/{script_remove}")
   };
   run_script(app, &remove_target, "remove")?;
-
-  let mut remove_set = BTreeSet::new();
-  for app_name in manifest_get_array_for(&manifest, "app", kind.as_str()) {
-    let trimmed = app_name.trim();
-    if !trimmed.is_empty() {
-      remove_set.insert(trimmed.to_string());
-    }
-  }
-
-  let app_i18n_template = manifest_get_scalar(&manifest, "app_i18n");
-  if !app_i18n_template.is_empty() {
-    let lang = read_json_file(&app.paths.conf_file)
-      .ok()
-      .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
-      .unwrap_or_else(|| "zh-cn".to_string());
-    if lang == "zh-cn" {
-      remove_set.insert(app_i18n_template.replace("{lang}", &lang));
-    }
-  }
 
   if kind.requires_system_binary() {
     for package_name in remove_set {
@@ -89,13 +90,8 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   // removal cannot drift from what was actually installed. Entries installed by
   // a native backend record package names instead of paths, and `remove_payload`
   // ignores those; non-absolute entries are dropped here for clarity.
-  let files = json_string_list(&entry, "files")
-    .into_iter()
-    .filter(|path| path.starts_with('/'))
-    .collect::<Vec<_>>();
   let (to_remove, kept_owned) = exclude_system_owned(app, kind, files);
-  let payload =
-    PayloadInstall { files: to_remove, dirs: json_string_list(&entry, "dirs"), size: 0 };
+  let payload = PayloadInstall { files: to_remove, dirs: entry.dirs.clone(), size: 0 };
   let outcome = remove_payload(&payload);
 
   // What actually happened, not what the record claimed: a path that was gone
@@ -105,17 +101,31 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     app.log_info(format!("  {line}"));
   }
 
-  db_del_installed(&app.paths.db_file, pkgname)?;
+  db.installed.remove(pkgname);
+  write_db(&app.paths, db)?;
   app.info(Key::TransactionCompleted);
   Ok(())
 }
 
-fn json_string_list(entry: &Value, key: &str) -> Vec<String> {
-  entry
-    .get(key)
-    .and_then(Value::as_array)
-    .map(|items| items.iter().filter_map(Value::as_str).map(ToString::to_string).collect())
-    .unwrap_or_default()
+/// The backend packages a record brought in: its `app` list and, where the
+/// `LuCI` language asks for one, its translation package.
+fn backend_packages(app: &App, entry: &DbEntry, kind: PackageManagerKind) -> BTreeSet<String> {
+  let mut remove_set = BTreeSet::new();
+  for app_name in manifest_get_array_for(&entry.manifest, "app", kind.as_str()) {
+    let trimmed = app_name.trim();
+    if !trimmed.is_empty() {
+      remove_set.insert(trimmed.to_string());
+    }
+  }
+
+  let app_i18n_template = entry.scalar("app_i18n");
+  if !app_i18n_template.is_empty() {
+    let lang = luci_i18n(&app.paths);
+    if lang == DEFAULT_LUCI_I18N {
+      remove_set.insert(app_i18n_template.replace("{lang}", &lang));
+    }
+  }
+  remove_set
 }
 
 /// Drops payload paths the system backend still attributes to another package.
@@ -146,7 +156,7 @@ fn exclude_system_owned(
   for (path, owner) in files.into_iter().zip(owners) {
     match owner {
       Some(owner) => {
-        app.log_warn(format!("keeping {path}: still owned by {owner}"));
+        app.log_warn(tr(Key::KeepingOwnedFile, &[&path, &owner]));
         dropped += 1;
       }
       None => kept.push(path),
@@ -169,12 +179,12 @@ fn removal_header(lang: Lang, pkgname: &str, version: &str) -> String {
 ///
 /// The manifest the record keeps is the one the install wrote, so this is the
 /// version that was installed, built the same way the header of an install is.
-fn recorded_version(manifest: &Value) -> String {
-  let pkgver = manifest_get_scalar(manifest, "pkgver");
+fn recorded_version(entry: &DbEntry) -> String {
+  let pkgver = entry.scalar("pkgver");
   if pkgver.is_empty() {
     return String::new();
   }
-  pkgver_cmp_key(&pkgver, &manifest_get_scalar(manifest, "pkgrel"))
+  pkgver_cmp_key(&pkgver, &entry.scalar("pkgrel"))
 }
 
 /// `Removed 4 files; kept 1 file owned by opkg`, or `None` when the record held
@@ -232,7 +242,7 @@ fn run_script(app: &mut App, script_rel: &str, label: &str) -> CliResult<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{recorded_version, removal_header, removal_summary};
+  use super::{DbEntry, recorded_version, removal_header, removal_summary};
   use crate::i18n::Lang;
   use pretty_assertions::assert_eq;
   use serde_json::json;
@@ -258,7 +268,8 @@ mod tests {
 
   #[test]
   fn the_recorded_version_is_built_from_the_stored_pkgver_and_pkgrel() {
-    assert_eq!(recorded_version(&json!({"pkgver": "1.2.3", "pkgrel": "4"})), "1.2.3-4");
-    assert_eq!(recorded_version(&json!({"pkgver": "", "pkgrel": "4"})), "");
+    let entry = |manifest| DbEntry { manifest, ..DbEntry::default() };
+    assert_eq!(recorded_version(&entry(json!({"pkgver": "1.2.3", "pkgrel": "4"}))), "1.2.3-4");
+    assert_eq!(recorded_version(&entry(json!({"pkgver": "", "pkgrel": "4"}))), "");
   }
 }

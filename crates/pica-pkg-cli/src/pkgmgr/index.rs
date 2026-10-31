@@ -21,6 +21,8 @@
 use crate::app::{
   CliError, CliResult, E_INDEX_UNAVAILABLE, E_LOCK_BUSY, E_MISSING_COMMAND, E_RUNTIME,
 };
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::system::stderr_or_stdout;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -106,7 +108,7 @@ fn unavailable(
     String::new()
   } else {
     let conf: Vec<String> = conf.iter().map(|path| path.display().to_string()).collect();
-    format!(" (repositories come from {})", conf.join(", "))
+    tr(Key::IndexReposFrom, &[&conf.join(", ")])
   };
 
   // The refresh's own words, which already name the command that failed: the
@@ -119,7 +121,7 @@ fn unavailable(
 
   CliError::new(
     E_INDEX_UNAVAILABLE,
-    format!("{} index unavailable: {}{origin}{refresh}", source.backend(), missing.join("; ")),
+    tr(Key::IndexUnavailableDetail, &[&source.backend(), &missing.join("; "), &origin, &refresh]),
   )
 }
 
@@ -136,13 +138,13 @@ impl RefreshOutcome {
   /// not fetch, so the code carries information of its own.
   pub(crate) fn failure(&self, program: &str) -> String {
     let status = match self.code {
-      Some(code) => format!("exit {code}"),
-      None => "killed by a signal".to_string(),
+      Some(code) => tr(Key::ExitCode, &[&code]),
+      None => tr(Key::KilledBySignal, &[]),
     };
     if self.detail.is_empty() {
-      format!("{program} update failed ({status}, no output)")
+      tr(Key::UpdateFailedSilent, &[&program, &status])
     } else {
-      format!("{program} update failed ({status}): {}", self.detail)
+      tr(Key::UpdateFailedStatus, &[&program, &status, &self.detail])
     }
   }
 }
@@ -154,7 +156,7 @@ impl RefreshOutcome {
 /// different fixes.
 pub(crate) fn run_refresh(command: &[String]) -> CliResult<RefreshOutcome> {
   let Some((program, args)) = command.split_first() else {
-    return Err(CliError::new(E_RUNTIME, "no index refresh command is configured"));
+    return Err(CliError::new(E_RUNTIME, tr(Key::NoRefreshCommand, &[])));
   };
 
   let output = Command::new(program).args(args).output().map_err(|err| {
@@ -162,9 +164,9 @@ pub(crate) fn run_refresh(command: &[String]) -> CliResult<RefreshOutcome> {
     // binary that ran and failed, and the two are worth telling apart.
     let code = if err.kind() == ErrorKind::NotFound { E_MISSING_COMMAND } else { E_RUNTIME };
     if err.kind() == ErrorKind::NotFound {
-      CliError::new(code, format!("missing required command: {program}"))
+      CliError::new(code, tr(Key::MissingCommand, &[&program]))
     } else {
-      CliError::new(code, format!("{program} update failed: {err}"))
+      CliError::new(code, tr(Key::UpdateFailed, &[&program, &err]))
     }
   })?;
 

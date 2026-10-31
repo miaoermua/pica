@@ -1707,6 +1707,54 @@ fn a_real_upgrade_prints_the_old_and_new_version_once() {
 }
 
 #[test]
+fn one_failed_upgrade_does_not_stop_the_others_and_the_run_says_so() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let good_old = sandbox.root_only_artifact_version("aa-good", "1.0.0", "pica", "");
+  let bad_old = sandbox.root_only_artifact_version("bb-bad", "1.0.0", "pica", "");
+  for (name, artifact) in [("aa-good", &good_old), ("bb-bad", &bad_old)] {
+    let sha = artifact_sha256(artifact);
+    sandbox.write_index(&repo_index(name, "1.0.0", artifact, &sha, 1024, 512));
+    sandbox.run(&["-Sp", name]).success();
+  }
+
+  // Both have a newer version; the bad one's hash does not match its artifact.
+  let good_new = sandbox.root_only_artifact_version("aa-good", "1.1.0", "pica", "");
+  let bad_new = sandbox.root_only_artifact_version("bb-bad", "1.1.0", "pica", "");
+  let good = serde_json::from_str::<serde_json::Value>(&repo_index(
+    "aa-good",
+    "1.1.0",
+    &good_new,
+    &artifact_sha256(&good_new),
+    1024,
+    512,
+  ))
+  .expect("index");
+  let bad = serde_json::from_str::<serde_json::Value>(&repo_index(
+    "bb-bad",
+    "1.1.0",
+    &bad_new,
+    &"0".repeat(64),
+    1024,
+    512,
+  ))
+  .expect("index");
+  let mut both = good.clone();
+  let packages =
+    both["repos"]["sandbox"]["indexes"]["pica"]["packages"].as_array_mut().expect("packages");
+  packages.push(bad["repos"]["sandbox"]["indexes"]["pica"]["packages"][0].clone());
+  sandbox.write_index(&both.to_string());
+
+  let assert = sandbox.run(&["-Su"]).failure();
+  let stdout = stdout_of(&assert);
+  assert!(stdout.contains(":: Upgrading aa-good (1.0.0-1 -> 1.1.0-1)"), "{stdout}");
+  assert!(stdout.contains("1 upgraded, 0 skipped, 1 failed"), "{stdout}");
+  assert.stderr(contains("bb-bad: upgrade failed")).stderr(contains("failed to upgrade: bb-bad"));
+
+  let _ = fs::remove_file("/tmp/aa-good.conf");
+  let _ = fs::remove_file("/tmp/bb-bad.conf");
+}
+
+#[test]
 fn a_downgrade_names_both_versions_instead_of_calling_it_an_upgrade() {
   let sandbox = Sandbox::new(EMPTY_DB);
   let newer = sandbox.root_only_artifact_version("down-demo", "1.1.0", "pica", "");
@@ -1963,4 +2011,72 @@ fn a_bound_on_a_dependency_whose_version_cannot_be_read_is_not_called_satisfied(
   let report = fs::read_to_string(sandbox.state_dir().join("install-report.json"))
     .expect("read the install report");
   assert!(!report.contains("bound_satisfied"), "{report}");
+}
+
+// -- Plans: --dry-run, the confirmation and several targets --------------------
+
+#[test]
+fn a_dry_run_install_writes_neither_the_database_nor_the_payload() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("plan-dry", "pica", "");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+  let before = sandbox.db();
+
+  let assert = sandbox.run(&["--dry-run", "-U", artifact]).success();
+  let stdout = stdout_of(&assert);
+  assert!(stdout.contains("Installing plan-dry (1.0.0-1)"), "{stdout}");
+  assert!(stdout.contains("Dry run: nothing was changed"), "{stdout}");
+  assert_eq!(sandbox.db(), before);
+  assert!(!Path::new("/tmp/plan-dry.conf").exists(), "the payload must not be written");
+}
+
+#[test]
+fn a_dry_run_is_refused_where_there_is_nothing_to_preview() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  sandbox.run(&["--dry-run", "-S"]).failure().stderr(contains("--dry-run"));
+}
+
+#[test]
+fn several_targets_are_handled_one_by_one_and_summarised() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let first = sandbox.root_only_artifact("plan-a", "pica", "");
+  let second = sandbox.root_only_artifact("plan-b", "pica", "");
+  let first = first.to_str().expect("artifact path is utf-8");
+  let second = second.to_str().expect("artifact path is utf-8");
+
+  let assert = sandbox.run(&["-U", first, second]).success();
+  let stdout = stdout_of(&assert);
+  assert!(stdout.contains("Targets (2)"), "{stdout}");
+  assert!(stdout.contains("2 succeeded, 0 failed"), "{stdout}");
+  assert!(sandbox.db()["installed"]["plan-a"].is_object());
+  assert!(sandbox.db()["installed"]["plan-b"].is_object());
+
+  sandbox.run(&["-R", "plan-a", "plan-b"]).success();
+  assert_eq!(sandbox.db()["installed"], serde_json::json!({}));
+}
+
+#[test]
+fn a_failed_target_does_not_stop_the_next_one() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("plan-after", "pica", "");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let assert = sandbox.run(&["-U", "/nonexistent/missing.pkg.tar.gz", artifact]).failure();
+  let stdout = stdout_of(&assert);
+  assert!(stdout.contains("1 succeeded, 1 failed"), "{stdout}");
+  assert!(sandbox.db()["installed"]["plan-after"].is_object());
+  sandbox.run(&["-R", "plan-after"]).success();
+}
+
+#[test]
+fn a_no_at_the_confirmation_changes_nothing() {
+  let sandbox = Sandbox::new(EMPTY_DB);
+  let artifact = sandbox.root_only_artifact("plan-no", "pica", "");
+  let artifact = artifact.to_str().expect("artifact path is utf-8");
+
+  let mut cmd = sandbox.command();
+  cmd.env("PICA_ASSUME_TTY", "1").args(["--json-errors", "-U", artifact]).write_stdin("n\n");
+  cmd.assert().failure().stderr(contains("E_CANCELLED"));
+  assert!(sandbox.db()["installed"].get("plan-no").is_none());
+  assert!(!Path::new("/tmp/plan-no.conf").exists());
 }

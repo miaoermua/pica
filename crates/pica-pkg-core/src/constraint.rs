@@ -365,8 +365,8 @@ mod tests {
   #[test]
   fn empty_items_mean_no_dependencies() {
     // `base@apk =` reads back as `[""]`, and that must stay "nothing declared".
-    assert!(parse_all(&[String::new()]).expect("empty list parses").is_empty());
-    assert!(parse_all(&[" ".to_string()]).expect("blank list parses").is_empty());
+    assert_eq!(parse_all(&[String::new()]).expect("empty list parses"), Vec::new());
+    assert_eq!(parse_all(&[" ".to_string()]).expect("blank list parses"), Vec::new());
 
     let list = parse_all(&["libfoo>=1.0".to_string(), String::new()]).expect("parses");
     assert_eq!(names(&list), vec!["libfoo".to_string()]);

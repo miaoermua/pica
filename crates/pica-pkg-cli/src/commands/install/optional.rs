@@ -23,8 +23,10 @@
 use super::feed::DependencySource;
 use super::precheck::DeclaredDeps;
 use crate::app::{App, OptionalDeps};
-use crate::constraints::BOUND_UNMET;
+use crate::constraints::bound_unmet;
 use crate::format;
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::pkgmgr::FeedCandidate;
 use pica_pkg_core::{constraint, version};
 use serde_json::{Value, json};
@@ -45,6 +47,31 @@ pub(crate) enum Availability {
   /// Shipped in the artifact's `pkgs/` and installed with that batch. The batch
   /// is indivisible, so the item is shown and not selectable.
   Packaged,
+}
+
+/// Why an optional dependency cannot be delivered, as the install report
+/// records it. The report is read by programs, so it stays in these words;
+/// [`reason_text`] is what a person is shown.
+pub(crate) const FROM_PKGS: &str = "this artifact installs its dependencies from pkgs/";
+pub(crate) const NO_SOURCE: &str = "this install has no dependency source";
+pub(crate) const PACKAGED_BUT_FEEDS: &str =
+  "packaged in the artifact, but this install uses the feeds";
+pub(crate) const FEEDS_UNREADABLE: &str = "the feeds could not be read";
+pub(crate) const NOT_IN_FEEDS: &str = "not available from the feeds";
+pub(crate) const PICA_CANNOT_INSTALL: &str = "pkgmgr=pica cannot install dependencies";
+
+/// `reason` in the run's language.
+fn reason_text(reason: &str) -> String {
+  let key = match reason {
+    FROM_PKGS => Key::ReasonFromPkgs,
+    NO_SOURCE => Key::ReasonNoSource,
+    PACKAGED_BUT_FEEDS => Key::ReasonPackagedButFeeds,
+    FEEDS_UNREADABLE => Key::ReasonFeedsUnreadable,
+    NOT_IN_FEEDS => Key::ReasonNotInFeeds,
+    PICA_CANNOT_INSTALL => Key::ReasonPicaCannotInstall,
+    other => return other.to_string(),
+  };
+  tr(key, &[])
 }
 
 /// One optional dependency, with what is known about it.
@@ -147,7 +174,7 @@ impl Plan {
     }
 
     for (reason, names) in by_reason {
-      app.log_warn(format!("optional dependencies skipped ({}): {}", reason, names.join(" ")));
+      app.log_warn(tr(Key::OptionalSkipped, &[&reason_text(reason), &names.join(" ")]));
     }
   }
 
@@ -291,10 +318,7 @@ fn ask(app: &App, package: &str, plan: &mut Plan) {
   // would block a cron job or swallow a script's input.
   if app.options.non_interactive || !std::io::stdin().is_terminal() {
     if !app.options.non_interactive {
-      eprintln!(
-        "pica: stdin is not a terminal; installing no optional dependencies \
-         (use --with-optional to include them)"
-      );
+      eprintln!("{}", tr(Key::OptionalNoTerminal, &[]));
     }
     return;
   }
@@ -308,7 +332,7 @@ fn ask(app: &App, package: &str, plan: &mut Plan) {
     .collect();
 
   loop {
-    eprint!("Select optional packages by number, `all`, or press Enter to skip: ");
+    eprint!("{}", tr(Key::OptionalSelectPrompt, &[]));
     let _ = std::io::stderr().flush();
 
     let mut input = String::new();
@@ -336,16 +360,16 @@ fn ask(app: &App, package: &str, plan: &mut Plan) {
 /// Kept separate from the prompt so the formatting can be asserted without a
 /// terminal, and so the text cannot accidentally go to stdout.
 pub(crate) fn render(package: &str, plan: &Plan) -> String {
-  let mut out = format!("Optional dependencies for {package}\n\n");
+  let mut out = tr(Key::OptionalTitle, &[&package]);
   let width = plan.items.iter().map(|item| item.name.len()).max().unwrap_or(0);
 
   for (index, item) in plan.items.iter().enumerate() {
     let (mark, detail) = match item.availability {
       Availability::Installed => ("[+]", installed_detail(item)),
-      Availability::Packaged => {
-        ("[+]", "installed from the artifact's pkgs/ with this request".to_string())
+      Availability::Packaged => ("[+]", tr(Key::OptionalFromPkgs, &[])),
+      Availability::Unavailable(reason) => {
+        ("[-]", tr(Key::OptionalUnavailable, &[&reason_text(reason)]))
       }
-      Availability::Unavailable(reason) => ("[-]", format!("unavailable ({reason})")),
       Availability::Available => {
         let mark = if item.selected { "[x]" } else { "[ ]" };
         (mark, sizes(item))
@@ -355,9 +379,7 @@ pub(crate) fn render(package: &str, plan: &Plan) -> String {
   }
 
   if plan.items.iter().any(|item| item.download.is_some() || item.installed_size.is_some()) {
-    out.push_str(
-      "\nSizes are this package alone, as its feed records them; they exclude dependencies.\n",
-    );
+    out.push_str(&tr(Key::OptionalSizesNote, &[]));
   }
   out
 }
@@ -373,20 +395,21 @@ pub(crate) fn render(package: &str, plan: &Plan) -> String {
 /// failure mode.
 fn installed_detail(item: &Item) -> String {
   if !item.bound_unmet {
-    return "already installed".to_string();
+    return tr(Key::OptionalAlreadyInstalled, &[]);
   }
   match &item.requirement {
-    Some(requirement) => format!("already installed, but {BOUND_UNMET} ({requirement})"),
-    None => format!("already installed, but {BOUND_UNMET}"),
+    Some(requirement) => tr(Key::OptionalInstalledUnmetReq, &[&bound_unmet(), &requirement]),
+    None => tr(Key::OptionalInstalledUnmet, &[&bound_unmet()]),
   }
 }
 
 fn sizes(item: &Item) -> String {
-  let download = item.download.map_or_else(|| "Unknown".to_string(), format::bytes);
+  let unknown = || tr(Key::SizeUnknown, &[]);
+  let download = item.download.map_or_else(unknown, format::bytes);
   let installed = item
     .installed_size
-    .map_or_else(|| "Unknown".to_string(), |bytes| format!("~{} (est.)", format::bytes(bytes)));
-  format!("Download: {download}  Installed: {installed}")
+    .map_or_else(unknown, |bytes| tr(Key::SizeEstimated, &[&format::bytes(bytes)]));
+  tr(Key::OptionalSizes, &[&download, &installed])
 }
 
 /// Parses one line of the selector into the 1-based numbers it names.
@@ -408,10 +431,9 @@ pub(crate) fn parse_selection(input: &str, selectable: &[usize]) -> Result<Vec<u
     if token.is_empty() {
       continue;
     }
-    let number: usize =
-      token.parse().map_err(|_| format!("`{token}` is not a number; nothing was selected"))?;
+    let number: usize = token.parse().map_err(|_| tr(Key::OptionalNotNumber, &[&token]))?;
     if !selectable.contains(&number) {
-      return Err(format!("`{token}` is not one of the offered numbers; nothing was selected"));
+      return Err(tr(Key::OptionalNotOffered, &[&token]));
     }
     if !chosen.contains(&number) {
       chosen.push(number);
@@ -463,17 +485,15 @@ fn availability(
     Some("feed") if group == "kmod" => Availability::Available,
     Some("feed") => match source {
       Some(DependencySource::Feeds) => Availability::Available,
-      Some(DependencySource::Containers) => {
-        Availability::Unavailable("this artifact installs its dependencies from pkgs/")
-      }
-      None => Availability::Unavailable("this install has no dependency source"),
+      Some(DependencySource::Containers) => Availability::Unavailable(FROM_PKGS),
+      None => Availability::Unavailable(NO_SOURCE),
     },
     Some("packaged") => match source {
       Some(DependencySource::Containers) => Availability::Packaged,
-      _ => Availability::Unavailable("packaged in the artifact, but this install uses the feeds"),
+      _ => Availability::Unavailable(PACKAGED_BUT_FEEDS),
     },
-    Some("unknown") => Availability::Unavailable("the feeds could not be read"),
-    _ => Availability::Unavailable("not available from the feeds"),
+    Some("unknown") => Availability::Unavailable(FEEDS_UNREADABLE),
+    _ => Availability::Unavailable(NOT_IN_FEEDS),
   }
 }
 
@@ -507,7 +527,7 @@ fn feed_offers(app: &mut App, names: &[&str]) -> HashMap<String, FeedCandidate> 
     // The figures are an extra, not a prerequisite: an index that stopped
     // answering after the precheck leaves the install possible with the sizes
     // unknown, which the selector already knows how to say.
-    app.log_warn(format!("optional dependency sizes are unknown: {}", err.message));
+    app.log_warn(tr(Key::OptionalSizesUnknown, &[&err.message]));
   }
   offers
 }
@@ -546,7 +566,7 @@ mod tests {
     };
     let text = render("demo", &plan);
     assert!(text.contains("already installed"), "{text}");
-    assert!(!text.contains(BOUND_UNMET), "{text}");
+    assert!(!text.contains(bound_unmet().as_str()), "{text}");
     let entry = &plan.report("installed")[0];
     assert!(entry.get("reason").is_none(), "{entry}");
     assert!(entry.get("bound_satisfied").is_none(), "a satisfied bound is not restated: {entry}");
@@ -564,10 +584,10 @@ mod tests {
 
     let text = render("demo", &plan);
     let line = text.lines().find(|line| line.contains("present")).expect("the item is listed");
-    assert!(line.contains(BOUND_UNMET), "{line}");
+    assert!(line.contains(bound_unmet().as_str()), "{line}");
     assert!(line.contains(">=2.0"), "the declared constraint is named: {line}");
     assert_eq!(
-      text.lines().filter(|line| line.contains(BOUND_UNMET)).count(),
+      text.lines().filter(|line| line.contains(bound_unmet().as_str())).count(),
       1,
       "the detail stays on the item's own line: {text}"
     );
@@ -609,7 +629,7 @@ mod tests {
     let plan = Plan { items: vec![item("plain", Availability::Installed)] };
     let text = render("demo", &plan);
     assert!(text.contains("already installed"), "{text}");
-    assert!(!text.contains(BOUND_UNMET), "{text}");
+    assert!(!text.contains(bound_unmet().as_str()), "{text}");
     let entry = &plan.report("installed")[0];
     assert!(entry.get("reason").is_none(), "{entry}");
     assert!(entry.get("bound_satisfied").is_none(), "{entry}");
@@ -868,7 +888,7 @@ mod tests {
     };
     assert!(plan.covers("app", "bundled"));
     assert!(!plan.covers("app", "present"));
-    assert!(plan.selected_names("app").is_empty());
+    assert_eq!(plan.selected_names("app"), Vec::<String>::new());
   }
 
   #[test]

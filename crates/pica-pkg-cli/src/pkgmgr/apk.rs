@@ -3,7 +3,12 @@ use super::apk_repositories::{
 };
 use super::index::{self, IndexSource, run_refresh};
 use super::{FeedCandidate, PackageManager, PackageManagerKind, describe_targets};
-use crate::app::{CliError, CliResult, E_MISSING_COMMAND, E_NO_SPACE, E_RUNTIME};
+use crate::app::{
+  CliError, CliResult, E_MISSING_COMMAND, E_NO_SPACE, E_PACKAGE_INVALID, E_PKGMGR_INSTALL,
+  E_PKGMGR_REMOVE, E_RUNTIME,
+};
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::system::stderr_or_stdout;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -106,8 +111,7 @@ impl IndexSource for ApkIndex {
     if dir.is_none() && fetched > 0 {
       let dirs: Vec<String> =
         self.cache_dirs.iter().map(|path| path.display().to_string()).collect();
-      missing
-        .push(format!("no index cache directory ({}) for {fetched} repositories", dirs.join(", ")));
+      missing.push(tr(Key::ApkNoCacheDir, &[&dirs.join(", "), &fetched]));
     }
 
     // apk names the index of a remote repository after a digest of its index
@@ -118,9 +122,9 @@ impl IndexSource for ApkIndex {
       let (path, complaint) = match &repository.index {
         // A local repository carries its index itself: apk reads it where it
         // lies, so that file is the one that has to be there.
-        IndexFile::Local(path) => (path.clone(), format!("no index file at {}", path.display())),
+        IndexFile::Local(path) => (path.clone(), tr(Key::NoIndexFile, &[&path.display()])),
         IndexFile::Fetched(name) => match dir {
-          Some(dir) => (dir.join(name), format!("no cached index for {}", repository.printable)),
+          Some(dir) => (dir.join(name), tr(Key::NoCachedIndex, &[&repository.printable])),
           // said once above, for every repository that wants a cached index
           None => continue,
         },
@@ -161,9 +165,9 @@ impl PackageManager for ApkBackend {
   fn package_exists(&self, name: &str) -> CliResult<bool> {
     let output = Command::new("apk").args(["search", "--exact", name]).output().map_err(|err| {
       let (code, message) = if err.kind() == ErrorKind::NotFound {
-        (E_MISSING_COMMAND, "missing required command: apk".to_string())
+        (E_MISSING_COMMAND, tr(Key::MissingCommand, &[&"apk"]))
       } else {
-        (E_RUNTIME, format!("apk search --exact {name} failed: {err}"))
+        (E_RUNTIME, tr(Key::ApkSearchFailed, &[&name, &err]))
       };
       CliError::new(code, message)
     })?;
@@ -189,14 +193,10 @@ impl PackageManager for ApkBackend {
       // A match that is not this package by name: a feed package that
       // `provides` it, which is what `apk add <name>` would resolve to.
       Some(0) => Ok(true),
-      Some(code) => Err(CliError::new(
-        E_RUNTIME,
-        format!("apk search --exact {name} failed (exit {code}): {}", detail()),
-      )),
-      None => Err(CliError::new(
-        E_RUNTIME,
-        format!("apk search --exact {name} was killed by a signal: {}", detail()),
-      )),
+      Some(code) => {
+        Err(CliError::new(E_RUNTIME, tr(Key::ApkSearchExit, &[&name, &code, &detail()])))
+      }
+      None => Err(CliError::new(E_RUNTIME, tr(Key::ApkSearchKilled, &[&name, &detail()]))),
     }
   }
 
@@ -238,7 +238,7 @@ impl PackageManager for ApkBackend {
 
     let output = install_command(targets, forced)?
       .output()
-      .map_err(|err| CliError::new("E_APK_INSTALL", format!("apk add failed: {err}")))?;
+      .map_err(|err| CliError::new(E_PKGMGR_INSTALL, tr(Key::ApkAddFailed, &[&err])))?;
     if output.status.success() {
       return Ok(());
     }
@@ -248,40 +248,31 @@ impl PackageManager for ApkBackend {
     let target = describe_targets(targets);
     let mut detail = stderr_or_stdout(&output.stdout, &output.stderr);
     if local && !forced {
-      detail.push_str(
-        "; a local apk needs --force-non-repository on apk 3.x for a package no repository provides, \
-         and this request ran without it (set \"apk_force_non_repository\": true in pica.json)",
-      );
+      detail.push_str(&tr(Key::ApkNeedsForce, &[]));
     }
     if forced && detail.to_ascii_lowercase().contains("force-non-repository") {
-      detail.push_str(
-        "; this apk does not accept --force-non-repository (set \"apk_force_non_repository\": false \
-         in pica.json)",
-      );
+      detail.push_str(&tr(Key::ApkRejectsForce, &[]));
     }
     if detail.to_ascii_lowercase().contains("no space left on device") {
       return Err(CliError::new(
         E_NO_SPACE,
-        format!("{label} install failed: {target} (storage-full). detail=[{detail}]"),
+        tr(Key::InstallStorageFull, &[&label, &target, &detail]),
       ));
     }
-    Err(CliError::new(E_RUNTIME, format!("{label} install failed: {target} detail=[{detail}]")))
+    Err(CliError::new(E_PKGMGR_INSTALL, tr(Key::BackendInstallFailed, &[&label, &target, &detail])))
   }
 
   fn remove(&self, target: &str) -> CliResult<()> {
     let output = Command::new("apk")
       .args(["del", target])
       .output()
-      .map_err(|err| CliError::new(E_RUNTIME, format!("apk del failed: {err}")))?;
+      .map_err(|err| CliError::new(E_PKGMGR_REMOVE, tr(Key::ApkDelFailed, &[&err])))?;
     if output.status.success() {
       Ok(())
     } else {
       Err(CliError::new(
-        E_RUNTIME,
-        format!(
-          "apk del failed: {target} detail=[{}]",
-          stderr_or_stdout(&output.stdout, &output.stderr)
-        ),
+        E_PKGMGR_REMOVE,
+        tr(Key::ApkDelTargetFailed, &[&target, &stderr_or_stdout(&output.stdout, &output.stderr)]),
       ))
     }
   }
@@ -290,18 +281,15 @@ impl PackageManager for ApkBackend {
     let output =
       Command::new("apk").args(["list", "--installed", "-q"]).output().map_err(|err| {
         let (code, message) = if err.kind() == ErrorKind::NotFound {
-          (E_MISSING_COMMAND, "missing required command: apk".to_string())
+          (E_MISSING_COMMAND, tr(Key::MissingCommand, &[&"apk"]))
         } else {
-          (E_RUNTIME, format!("apk list --installed failed: {err}"))
+          (E_RUNTIME, tr(Key::ApkListFailed, &[&err]))
         };
         CliError::new(code, message)
       })?;
     if !output.status.success() {
       let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-      return Err(CliError::new(
-        E_RUNTIME,
-        format!("apk list --installed failed ({}): {detail}", output.status),
-      ));
+      return Err(CliError::new(E_RUNTIME, tr(Key::ApkListExit, &[&output.status, &detail])));
     }
     let mut packages: Vec<(String, String)> =
       String::from_utf8_lossy(&output.stdout).lines().filter_map(split_installed_line).collect();
@@ -369,10 +357,7 @@ fn install_command(targets: &[String], force_non_repository: bool) -> CliResult<
   // meaning and is refused rather than guessed at.
   let local = is_local_apk_path(first);
   if targets.iter().any(|target| is_local_apk_path(target) != local) {
-    return Err(CliError::new(
-      "E_PACKAGE_INVALID",
-      "one apk request cannot mix local apk files with package names",
-    ));
+    return Err(CliError::new(E_PACKAGE_INVALID, tr(Key::ApkMixedRequest, &[])));
   }
 
   if local {
@@ -395,7 +380,7 @@ fn install_command(targets: &[String], force_non_repository: bool) -> CliResult<
     for target in targets {
       let path = Path::new(target)
         .canonicalize()
-        .map_err(|err| CliError::new("E_PACKAGE_INVALID", format!("invalid local apk: {err}")))?;
+        .map_err(|err| CliError::new(E_PACKAGE_INVALID, tr(Key::InvalidLocalApk, &[&err])))?;
       command.arg(path);
     }
   } else {
@@ -403,10 +388,7 @@ fn install_command(targets: &[String], force_non_repository: bool) -> CliResult<
       if !valid_package_name(target)
         || Path::new(target).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
       {
-        return Err(CliError::new(
-          "E_PACKAGE_INVALID",
-          "expected a package name or an existing local apk file",
-        ));
+        return Err(CliError::new(E_PACKAGE_INVALID, tr(Key::ApkTargetInvalid, &[])));
       }
     }
     command.arg("--");
@@ -577,9 +559,9 @@ fn apk_size(fields: &serde_json::Map<String, serde_json::Value>, key: &str) -> O
 fn search_candidates(name: &str) -> CliResult<Vec<FeedCandidate>> {
   let output = Command::new("apk").args(["search", "--exact", name]).output().map_err(|err| {
     let (code, message) = if err.kind() == ErrorKind::NotFound {
-      (E_MISSING_COMMAND, "missing required command: apk".to_string())
+      (E_MISSING_COMMAND, tr(Key::MissingCommand, &[&"apk"]))
     } else {
-      (E_RUNTIME, format!("apk search --exact {name} failed: {err}"))
+      (E_RUNTIME, tr(Key::ApkSearchFailed, &[&name, &err]))
     };
     CliError::new(code, message)
   })?;
@@ -598,17 +580,11 @@ fn search_candidates(name: &str) -> CliResult<Vec<FeedCandidate>> {
     Some(0 | 1) => Ok(candidates),
     Some(code) => Err(CliError::new(
       E_RUNTIME,
-      format!(
-        "apk search --exact {name} failed (exit {code}): {}",
-        stderr_or_stdout(&output.stdout, &output.stderr)
-      ),
+      tr(Key::ApkSearchExit, &[&name, &code, &stderr_or_stdout(&output.stdout, &output.stderr)]),
     )),
     None => Err(CliError::new(
       E_RUNTIME,
-      format!(
-        "apk search --exact {name} was killed by a signal: {}",
-        stderr_or_stdout(&output.stdout, &output.stderr)
-      ),
+      tr(Key::ApkSearchKilled, &[&name, &stderr_or_stdout(&output.stdout, &output.stderr)]),
     )),
   }
 }

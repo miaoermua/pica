@@ -15,7 +15,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 ## 特性
 
 > 说明：Bash 版被完整实现重构，后续更新以 Rust 版实现为主。
-> 
+>
 > 当前版本仍为实验性，不代表 Pica 最终品质，请使用时保持 Pica 为最新版本。
 
 - 🆓 **高度自由**：用户友好，全开源，自建用户仓库
@@ -27,17 +27,25 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 ## CLI（当前支持）
 
 - `pica setup`：交互式初始化（界面语言、软件源、每个源启用的后端，随后同步）
-- `pica -S`：同步 pica 仓库索引（repo.json -> index.json）
-- `pica -S <appname>`：按应用名安装（默认：自动在 opkg/pica 源之间决策）
-- `pica -Su`：升级所有已安装的 pica 包（从 index.json 选择最新版本并安装）
+- `pica -S`：同步 pica 仓库索引（源根 `index.json` -> 各后端 `index.json` -> 本机同步缓存）
+- `pica -S <appname>...`：按应用名安装，可一次给多个（默认：自动在 opkg/pica 源之间决策）
+- `pica -Su`：升级所有已安装的 pica 包（先列出待升级清单并确认，单个失败不影响其他包，结束时汇总）
 - `pica -Syu`：先 `-S` 再 `-Su`
 - `pica -Si <appname>`：显示仓库远端包信息（基于已同步 index）
+- `pica -Ss <关键词>`：搜索已同步的源（名字、描述，支持拼写容错；`--all` 显示本机不可装的结果）
+- `pica -Sl [source]`：列出已同步的源发布的软件包
+- `pica -Qs <关键词>`：搜索已安装的软件包
+- `pica -Qo <path>`：查询文件属于哪个已安装的包
+- `pica -Qu`：列出有新版本可用的已安装包
 - `pica -So <appname>`：强制走系统包管理器安装（会尝试安装 `app/luci-app-*/luci-i18n-*`）
-- `pica -Sp <appname>`：强制走 pica 镜像源安装（从 repo.json 解析并下载 pkg.tar.gz）
+- `pica -Sp <appname>...`：强制走 pica 镜像源安装（从已同步的索引解析并下载 pkg.tar.gz）
 - `pica --pkgmgr <opkg|apk|pica>`：指定安装后端（优先级：`--pkgmgr` > manifest > `pica.json` > 自动探测）
 - `pica --lang <zh-CN|en-US>`：本次运行的界面语言（只影响本次，不写回配置）
-- `pica -U <pkgfile>`：从本地 `.pkg.tar.gz` 安装/更新（类似 pacman -U）
-- `pica -R <pkgname>`：卸载（不处理依赖关系）
+- `pica -U <pkgfile|url>...`：从本地 `.pkg.tar.gz` 或 URL 安装/更新（类似 pacman -U）
+- `pica -R <pkgname>...`：卸载（不处理依赖关系）
+- `pica --dry-run ...`：只展示 `-S`/`-Sp`/`-So`/`-U`/`-R`/`-Su` 的执行计划，不做任何更改
+- `pica --noconfirm ...`（别名 `--yes`）：变更前不再询问；`--non-interactive` 或非终端时本来就不询问
+- `pica --json ...`：`-Q`、`-Qi`、`-Ql`、`-Qs`、`-Qo`、`-Qu`、`-Si`、`-Ss`、`-Sl` 输出 JSON 数据
 - `pica -Q`：列出已安装的 pica 包
 - `pica -Qi <pkgname>`：显示已安装包信息
 - `pica -Ql <pkgname>`：列出该包安装到系统的文件路径
@@ -54,7 +62,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 
 - 当前标准归档类型：`*.pkg.tar.gz`（pica 自有封装格式）。
 - 安装后端：`opkg`、`apk`、`pica`。前两者把 `pkgs/` 交给系统包管理器安装；`pica` 的产物只有 `scripts/` 与 `root/`，不接受任何容器。
-- `pkgmgr` 是包身份的一部分：同一应用可以同时发布三个后端的包，文件名尾部分别为无后缀 / `-apk` / `-pica`。
+- `pkgmgr` 是包身份的一部分：同一应用可以同时发布三个后端的包，文件名尾部分别为 `-opkg` / `-apk` / `-pica`。
 - 包内载荷可包含 `scripts/`（生命周期脚本）、`root/`（按路径镜像的真实根文件系统载荷）、`pkgs/`（`.ipk`/`.apk` 容器，仅 `opkg`/`apk` 后端）。
 - `root/` 中的文件按路径直接部署（如 `root/etc/init.d/hello` → `/etc/init.d/hello`），无需生命周期脚本。
 - 安装失败会自动回滚：已装依赖与已铺文件均按安装前状态还原。
@@ -86,7 +94,7 @@ Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制
 ```
 
 - `language`：pica 自身的界面语言，`zh-CN` 或 `en-US`（缺省、写错或写了不支持的语言都按英文）；由 `pica setup` 写入，`pica --lang` 可临时覆盖
-- `repos[]`：pica 仓库列表（`pica -S` 同步与 `pica -Si/-Sp` 查询/安装使用）；`backends` 是该源启用的后端组合，不写则按旧的 `repo.json` 方式读取
+- `repos[]`：pica 仓库列表（`pica -S` 同步与 `pica -Si/-Sp` 查询/安装使用）；`backends` 是该源启用的后端组合，必填
 - `i18n`：默认 LuCI i18n 语言（用于安装 `luci-i18n-<app>-<lang>`，与 `language` 无关，不影响 pica 自身输出语言）
 - `apk_force_non_repository`（默认 `true`）：apk 后端安装 Pica 归档中的本地 `.apk` 时是否加 `--force-non-repository`。OpenWrt 25.12 起的 apk-tools 3.x 会拒绝不属于任何仓库的软件包，因此默认开启；Pica 会先读 `apk --version`，2.x 不传该参数。详见 `docs/standard.md`
 

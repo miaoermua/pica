@@ -1,77 +1,83 @@
+mod backup;
+mod deps;
 mod feed;
+mod guard;
+mod hooks;
 mod optional;
+mod payload;
 mod pipeline;
+#[cfg(test)]
+mod pipeline_tests;
 mod precheck;
+mod transaction;
 
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_INTEGRITY_INVALID, E_REPO_INVALID,
-  E_VERSION_INCOMPATIBLE, conf_get_i18n, ensure_dirs,
+  E_VERSION_INCOMPATIBLE, ensure_dirs,
 };
 use crate::candidate::{find_pica_candidates_in_index, not_found_hint};
 use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::installed::{self, EntrySource};
 use crate::platform::{detect_os, detect_platform};
 use crate::source;
-use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read_json_file};
+use crate::state::{luci_i18n, new_entry, read_db, write_db};
 use crate::system::{fetch_url, need_cmd};
 use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::io::now_unix_secs;
+use pica_pkg_core::layout::{DEFAULT_LUCI_I18N, PKG_EXTENSION};
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_gt, ver_ge};
 use pipeline::IndexSizes;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::Path;
 
 pub fn app_auto(app: &mut App, selector: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
 
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
-  let installed_pkg = db_find_installed_pkgname_by_selector(&app.paths.db_file, &parsed)?;
-  if let Some(pkgname) = installed_pkg {
-    let db = read_json_file(&app.paths.db_file)?;
-    let entry =
-      db.get("installed").and_then(Value::as_object).and_then(|installed| installed.get(&pkgname));
-
-    if let Some(entry) = entry {
+  let db = read_db(&app.paths)?;
+  {
+    if let Some((_, entry)) = db.find(&parsed.appname, &parsed.branch) {
       // Reinstalling must reproduce the original install: the backend decides
       // which `pkgs/<backend>/` payload applies, and the channel decides whether
       // a Pica artifact exists at all. A recorded backend therefore outranks the
       // config file and auto-detection, but not an explicit `--pkgmgr`.
-      if app.options.pkgmgr.is_none() {
-        app.select_package_manager(installed::entry_backend(entry).kind.as_str())?;
-      }
-
+      let kind = app.backend_for_record(installed::entry_backend(entry).kind);
       // Feed installs never had an artifact, so there is nothing to re-resolve.
-      if installed::entry_source(entry) == EntrySource::Feed {
-        app_via_package_manager(app, selector)?;
-      } else {
-        pica_from_repo(app, selector)?;
-      }
-      return Ok(());
+      let from_feeds = installed::entry_source(entry) == EntrySource::Feed;
+      return app.with_backend(kind, |app| {
+        if from_feeds {
+          app_via_package_manager(app, selector)
+        } else {
+          pica_from_repo(app, selector)
+        }
+      });
     }
   }
 
-  let package_manager = app.package_manager()?;
-
   // Whether the feeds decide this request at all. Under a policy that will not
   // install from them, the answer is not consulted — and asking anyway would
-  // make a pica-repo install depend on an index whose answer nothing uses.
-  let feeds_decide = if app.options.non_interactive {
-    matches!(
-      app.options.feed_policy,
-      crate::app::FeedPolicy::Ask
-        | crate::app::FeedPolicy::FeedFirst
-        | crate::app::FeedPolicy::FeedOnly
-    )
-  } else {
-    !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
-  };
+  // make a pica-repo install depend on an index whose answer nothing uses. A
+  // host whose backend is `pica` has no feeds to ask.
+  let feeds_decide = app.backend().requires_system_binary()
+    && if app.options.non_interactive {
+      matches!(
+        app.options.feed_policy,
+        crate::app::FeedPolicy::Ask
+          | crate::app::FeedPolicy::FeedFirst
+          | crate::app::FeedPolicy::FeedOnly
+      )
+    } else {
+      !matches!(app.options.feed_policy, crate::app::FeedPolicy::PackagedOnly)
+    };
 
   if feeds_decide && !Selector::is_structured(selector) {
     // The feeds decide whether this install goes to the package manager, so the
     // answer has to be one: an index nobody could fetch would send a package the
     // feeds do carry to the pica repository instead.
+    let package_manager = app.package_manager()?;
     package_manager.update_index()?;
     if package_manager.package_exists(&parsed.appname)? {
       app_via_package_manager(app, selector)?;
@@ -94,7 +100,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
+  let lang = luci_i18n(&app.paths);
   let package_manager = app.package_manager()?;
   // This function installs from the feeds, so a feed whose index could not be
   // read is reported as itself: "package not found" would name a fact about a
@@ -102,7 +108,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   package_manager.update_index()?;
 
   let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
-  if lang == "zh-cn" {
+  if lang == DEFAULT_LUCI_I18N {
     candidates.push(format!("luci-i18n-{appname}-{lang}"));
   }
 
@@ -120,8 +126,18 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
+  // The plan is the list itself; the backend prints its own resolution when it
+  // runs.
+  let backend = package_manager.kind().as_str();
+  app.info_args(Key::PlanBackendInstall, &[backend, &to_install.join(" ")]);
+  if app.stop_for_dry_run() {
+    return Ok(());
+  }
+  app.confirm()?;
+
   // The candidates that were found are one request: an app and its i18n pack
   // are installed together, so the backend resolves them in one transaction.
+  let package_manager = app.package_manager()?;
   package_manager.install(package_manager.kind().as_str(), &to_install)?;
   let mut base_ver = package_manager.installed_version(&appname).unwrap_or_default();
   if base_ver.is_empty() {
@@ -150,8 +166,10 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
 
   // The native package manager owns these files; `files` records the package
   // names so `-Ql` can still show what this entry brought in.
-  db_set_installed(&app.paths.db_file, &appname, &manifest, backend, &to_install, &[])?;
-  app.log_info("Transaction completed");
+  let mut db = read_db(&app.paths)?;
+  db.installed.insert(appname.clone(), new_entry(&manifest, backend, &to_install, &[]));
+  write_db(&app.paths, &db)?;
+  app.log_info(tr(Key::TransactionCompleted, &[]));
   Ok(())
 }
 
@@ -161,7 +179,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
 
   let candidates = find_pica_candidates_in_index(app, selector)?;
   if candidates.is_empty() {
-    let hint = not_found_hint(app);
+    let hint = not_found_hint(app, selector);
     return Err(CliError::new(E_CONFIG_INVALID, app.args(Key::NotFound, &[selector, &hint])));
   }
 
@@ -185,7 +203,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
-  if best.filename.contains('/') || !best.filename.ends_with(".pkg.tar.gz") {
+  if best.filename.contains('/') || !best.filename.ends_with(PKG_EXTENSION) {
     return Err(CliError::new(
       E_REPO_INVALID,
       app.args(Key::InstallInvalidFilename, &[&best.repo, &best.filename]),
@@ -199,20 +217,13 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  // `download_url` is used whenever the index publishes one; a relative value
-  // is resolved against the source root, which is the same base the descriptor
-  // uses. The `/packages/` form stays as the fallback for indexes written
-  // before `download_url` was universal.
-  let download_url = match &best.download_url {
-    Some(url) if is_supported_url(url) => url.clone(),
-    Some(url) => source::join_child(&best.url, url).map_err(|err| {
+  let download_url = source::artifact_url(&best.url, best.download_url.as_deref(), &best.filename)
+    .map_err(|err| {
       CliError::new(
         E_REPO_INVALID,
         app.args(Key::InstallInvalidDownloadUrl, &[&best.repo, &best.pkgname, &err.message]),
       )
-    })?,
-    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
-  };
+    })?;
 
   let policy = source::download_policy(&best.url, best.allow_insecure_http);
 
@@ -302,8 +313,8 @@ pub fn sanitize_cache_filename(value: &str) -> String {
   if out.is_empty() {
     out = format!("remote-{}-{}", now_unix_secs(), std::process::id());
   }
-  if !out.ends_with(".pkg.tar.gz") {
-    out.push_str(".pkg.tar.gz");
+  if !out.ends_with(PKG_EXTENSION) {
+    out.push_str(PKG_EXTENSION);
   }
 
   out
