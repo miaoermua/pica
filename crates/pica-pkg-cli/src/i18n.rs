@@ -164,6 +164,7 @@ pub(crate) enum Key {
   SyncStarted,
   SyncDownloading,
   SyncUpdated,
+  SyncPackageSkipped,
   SyncNoRepos,
   SyncReposNotArray,
   SyncRepoMissingName,
@@ -230,6 +231,9 @@ pub(crate) enum Key {
   LockCleanupFailed,
   LockUnverified,
   LockFailed,
+  InvalidPkgname,
+  InvalidAppname,
+  TooManyArguments,
 }
 
 /// The English wording. Exhaustive: every key has a string here.
@@ -285,6 +289,7 @@ fn english(key: Key) -> &'static str {
     Key::SyncStarted => "Synchronizing package databases...",
     Key::SyncDownloading => "{0} downloading...",
     Key::SyncUpdated => "{0} updated",
+    Key::SyncPackageSkipped => "{0}: skipped an entry of the {1} index: invalid {2} {3}",
     Key::SyncNoRepos => {
       "no repos configured in {0}; add at least one entry with \"url\" and \"backends\""
     }
@@ -362,6 +367,13 @@ fn english(key: Key) -> &'static str {
     }
     Key::LockCleanupFailed => "cannot lock pica database: stale lock cleanup failed for {0}: {1}",
     Key::LockFailed => "cannot lock pica database: {0}",
+    Key::InvalidPkgname => {
+      "invalid pkgname {0}: start with a letter or digit and use only letters, digits and . _ + - @"
+    }
+    Key::InvalidAppname => {
+      "invalid appname {0}: start with a letter or digit and use only letters, digits and . _ + -"
+    }
+    Key::TooManyArguments => "{0} takes one target at a time; unexpected argument: {1}",
   }
 }
 
@@ -412,6 +424,7 @@ fn chinese(key: Key) -> &'static str {
     Key::SyncStarted => "正在同步软件源……",
     Key::SyncDownloading => "正在下载 {0}...",
     Key::SyncUpdated => "{0} 已更新",
+    Key::SyncPackageSkipped => "{0}：已跳过 {1} 索引中的一个条目：{2} 无效：{3}",
     Key::SyncNoRepos => "未在 {0} 中配置软件源；请至少添加一个含 \"url\" 与 \"backends\" 的条目",
     Key::SyncReposNotArray => "配置项 {0} 不是数组",
     Key::SyncRepoMissingName => "repo[{0}] 缺少 name",
@@ -482,6 +495,9 @@ fn chinese(key: Key) -> &'static str {
     }
     Key::LockCleanupFailed => "无法锁定 pica 数据库：清理陈旧锁 {0} 失败：{1}",
     Key::LockFailed => "无法锁定 pica 数据库：{0}",
+    Key::InvalidPkgname => "pkgname {0} 无效：须以字母或数字开头，只能使用字母、数字和 . _ + - @",
+    Key::InvalidAppname => "appname {0} 无效：须以字母或数字开头，只能使用字母、数字和 . _ + -",
+    Key::TooManyArguments => "{0} 一次只能指定一个目标；多余的参数：{1}",
   }
 }
 
@@ -596,6 +612,7 @@ mod tests {
     Key::SyncStarted,
     Key::SyncDownloading,
     Key::SyncUpdated,
+    Key::SyncPackageSkipped,
     Key::SyncNoRepos,
     Key::SyncReposNotArray,
     Key::SyncRepoMissingName,
@@ -656,5 +673,8 @@ mod tests {
     Key::LockCleanupFailed,
     Key::LockUnverified,
     Key::LockFailed,
+    Key::InvalidPkgname,
+    Key::InvalidAppname,
+    Key::TooManyArguments,
   ];
 }

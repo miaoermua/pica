@@ -94,10 +94,8 @@ pub fn sync_info(app: &mut App, selector: &str) -> CliResult<()> {
 
   // `-Si` shows the address the install would actually use, so a relative
   // `download_url` is resolved here the same way.
-  let download_url = match &best.download_url {
-    Some(url) => source::join_child(&best.url, url).unwrap_or_else(|_| url.clone()),
-    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
-  };
+  let download_url = source::artifact_url(&best.url, best.download_url.as_deref(), &best.filename)
+    .unwrap_or_else(|_| best.download_url.clone().unwrap_or_default());
 
   println!("Repository      : {}", best.repo);
   println!("Name            : {}", best.pkgname);

@@ -868,7 +868,7 @@ mod tests {
     };
     assert!(plan.covers("app", "bundled"));
     assert!(!plan.covers("app", "present"));
-    assert!(plan.selected_names("app").is_empty());
+    assert_eq!(plan.selected_names("app"), Vec::<String>::new());
   }
 
   #[test]

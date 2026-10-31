@@ -958,7 +958,7 @@ Installed-Size: 2
       parse_depends_field(control),
       vec!["libc".to_string(), "libubox".to_string(), "luci-base".to_string()]
     );
-    assert!(parse_depends_field("Package: demo\n").is_empty());
+    assert_eq!(parse_depends_field("Package: demo\n"), Vec::<String>::new());
   }
 
   #[test]

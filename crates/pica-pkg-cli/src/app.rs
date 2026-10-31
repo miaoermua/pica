@@ -1,6 +1,7 @@
 use crate::i18n::{Key, Lang};
 use crate::state::{read_json_file, write_json_atomic_pretty};
 use pica_pkg_core::error::PicaError;
+use pica_pkg_core::layout::DEFAULT_LUCI_I18N;
 use serde_json::{Value, json};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -480,7 +481,7 @@ pub fn ensure_dirs(paths: &Paths) -> CliResult<()> {
   if !paths.conf_file.is_file() {
     let content = json!({
         "repos": [],
-        "i18n": "zh-cn",
+        "i18n": DEFAULT_LUCI_I18N,
         "pkgmgr": Value::Null,
     });
     write_json_atomic_pretty(&paths.conf_file, &content)?;
@@ -544,7 +545,7 @@ pub(crate) fn prompt_yn(question: &str, default_yes: bool) -> bool {
 
 pub(crate) fn conf_get_i18n(conf_file: &Path) -> Option<String> {
   let conf = read_json_file(conf_file).ok()?;
-  let value = conf.get("i18n").and_then(Value::as_str).unwrap_or("zh-cn");
+  let value = conf.get("i18n").and_then(Value::as_str).unwrap_or(DEFAULT_LUCI_I18N);
   Some(value.to_string())
 }
 
@@ -587,7 +588,7 @@ pub(crate) fn resolve_lang(conf_file: &Path) -> String {
   let conf = read_json_file(conf_file).ok();
   conf
     .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
-    .unwrap_or_else(|| "zh-cn".to_string())
+    .unwrap_or_else(|| DEFAULT_LUCI_I18N.to_string())
 }
 
 /// The interface language stored in the configuration, or the default.

@@ -6,11 +6,9 @@ use crate::source::{self, FetchPolicy};
 use crate::state::{Transaction, read_json_file, repo_package_sets};
 use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor};
+use pica_pkg_core::layout::SUPPORTED_PKGMGRS;
+use pica_pkg_core::repo::{parse_backend_index_skipping, parse_entry_descriptor};
 use serde_json::{Value, json};
-
-/// Backends a source may advertise. Kept as text so an error can list them.
-const SUPPORTED_BACKENDS: &str = "opkg, apk, pica";
 
 /// Everything one sync publishes, built before a single byte is written.
 ///
@@ -191,7 +189,7 @@ fn configured_backends(
         E_CONFIG_INVALID,
         app.args(
           Key::SyncUnsupportedBackend,
-          &[&index, name, &format!("{text:?}"), SUPPORTED_BACKENDS],
+          &[&index, name, &format!("{text:?}"), &SUPPORTED_PKGMGRS.join(", ")],
         ),
       )
     })?;
@@ -237,7 +235,7 @@ fn fetch_text(
 /// `index.json` is the only entry. A source that does not serve it is reported
 /// as such; there is no second format to fall back to.
 fn sync_source(
-  app: &App,
+  app: &mut App,
   name: &str,
   root: &str,
   wanted: &[String],
@@ -282,12 +280,18 @@ fn sync_source(
     let url = source::join_sibling(&entry_url, path)?;
     let text = fetch_text(app, name, &format!("{mgr} index"), &url, policy)?;
 
-    let parsed = parse_backend_index(&text, mgr).map_err(|error| {
+    let (parsed, skipped) = parse_backend_index_skipping(&text, mgr).map_err(|error| {
       CliError::new(
         E_REPO_INVALID,
         app.args(Key::SyncIndexInvalid, &[name, mgr, &url, &error.to_string()]),
       )
     })?;
+    for package in skipped {
+      app.warn_args(
+        Key::SyncPackageSkipped,
+        &[name, mgr, package.field, &format!("{:?}", package.value)],
+      );
+    }
 
     indexes.insert(
       mgr.clone(),

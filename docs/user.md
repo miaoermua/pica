@@ -5,7 +5,7 @@
 > 🚧 **阶段性警告 (WIP)** 🚧
 >
 > Pica 现阶段正处于**开发版本**进程中。
-> 其命令行交互、内部工作架构与打包协议尚在设计调整周期内。**开发团队当前无法对此工具或它托管安装的软件包提供任何最终品质保证（No Warranty）。** 
+> 其命令行交互、内部工作架构与打包协议尚在设计调整周期内。**开发团队当前无法对此工具或它托管安装的软件包提供任何最终品质保证（No Warranty）。**
 > 强烈建议您仅在测试环境或能够承担配置损毁风险的开发设备上使用它。对于不可预知的错误导致的数据丢失或系统异常，我们概不负责。
 
 ## 简介
@@ -70,6 +70,7 @@ pica -S
 ```
 
 输出示例：
+
 ```text
 :: Synchronizing package databases...
 :: main downloading...
@@ -93,7 +94,7 @@ pica -S
 - `url` 指向源的根目录，客户端自己去找 `index.json`（入口描述）和它指出的后端索引，不假设固定的域名或路径。
 - `backends` 是这个源启用的后端组合，只抓这些后端的索引。`opkg + pica`、`apk + pica` 都合法，按你设备要用的后端写。源没有声明你写的某个后端时，`-S` 会直接报错并列出它实际声明了哪些，不会拿别的后端顶替。
 - 想换组合，改完 `backends` 后重新 `pica -S`：只有被启用的后端的索引在本地。
-- 旧配置（只有 `name` / `url`，源目录下放 `repo.json`）继续可用，行为与以前一致。若源只提供新的 `index.json` 而你又没写 `backends`，客户端会退回入口描述并抓取它声明的所有后端。
+- `backends` 必填：缺失时 `-S` 直接报错。客户端不读取 `repo.json`，也没有旧格式回退。
 
 局域网里的自建源可以直接用明文 HTTP，例如 `http://192.168.1.10/pica/r`：本机回环、私有网段与链路本地地址默认允许。**公网**地址默认只接受 `https`，确需明文时在该源条目上加 `"allow_insecure_http": true`；这是每个源自己的选择，不是全局开关。
 
@@ -106,6 +107,7 @@ pica -S miaoer-app
 ```
 
 输出示例：
+
 ```text
 :: Downloading miaoer-app (0.2.8-1) from main...
 :: Installing miaoer-app (0.2.8-1)
@@ -146,6 +148,7 @@ pica -R miaoer-app
 ```
 
 输出示例：
+
 ```text
 :: Removing miaoer-app (0.2.8-1)
 :: Removing opkg package: miaoer-app

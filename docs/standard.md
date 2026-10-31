@@ -43,10 +43,10 @@
 `<suffix>` 只由 `pkgmgr` 单向生成，永不反向解析：
 
 | `pkgmgr` | `<suffix>` |
-| --- | --- |
-| `opkg` | `-opkg` |
-| `apk` | `-apk` |
-| `pica` | `-pica` |
+| -------- | ---------- |
+| `opkg`   | `-opkg`    |
+| `apk`    | `-apk`     |
+| `pica`   | `-pica`    |
 
 说明：
 
@@ -71,12 +71,12 @@
 
 `scripts/` 中约定的文件名与 `manifest` 的对应关系：
 
-| 文件 | `manifest` 字段 | 执行时机 |
-| --- | --- | --- |
-| `scripts/install` | `script_install` | 首次安装时执行 |
-| `scripts/update` | `script_update` | 覆盖安装/升级时执行 |
-| `scripts/remove` | `script_remove` | 卸载时执行 |
-| `scripts/.env` | — | 提供默认 `PICA_KEEP_SCRIPT_*` 策略 |
+| 文件              | `manifest` 字段  | 执行时机                           |
+| ----------------- | ---------------- | ---------------------------------- |
+| `scripts/install` | `script_install` | 首次安装时执行                     |
+| `scripts/update`  | `script_update`  | 覆盖安装/升级时执行                |
+| `scripts/remove`  | `script_remove`  | 卸载时执行                         |
+| `scripts/.env`    | —                | 提供默认 `PICA_KEEP_SCRIPT_*` 策略 |
 
 `root/` 内的路径必须是相对路径，且不得包含 `..`、不得以 `/` 开头；安装时若发现逃逸路径会直接拒绝该包。
 
@@ -120,10 +120,10 @@ Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交
 
 `pkgmgr = apk|opkg` 时，`pkgs/` 里的容器由系统包管理器安装。Pica 只把**归档解包后落在临时目录里的容器文件路径**交给后端，自己不打开它；“按名字从仓库安装”是另一种请求，两者不加同一个参数：
 
-| 请求 | 命令形态 | 信任来源 |
-| --- | --- | --- |
-| Pica 归档里的本地容器 | `apk add --allow-untrusted [--force-non-repository] -- <path>` | Pica 对归档自身的校验（`repo` 渠道安装时先比对 `repo.json` 的 `sha256`）；`--pkgmgr`/`-U` 手工指定的文件由操作者自己负责 |
-| 仓库包（`app/base/kmod` 清单） | `apk add -- <name>` | apk 自己的仓库与签名机制，Pica 不做任何放宽 |
+| 请求                           | 命令形态                                                       | 信任来源                                                                                                            |
+| ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Pica 归档里的本地容器          | `apk add --allow-untrusted [--force-non-repository] -- <path>` | Pica 对归档自身的校验（`repo` 渠道安装时先比对后端索引的 `sha256`）；`--pkgmgr`/`-U` 手工指定的文件由操作者自己负责 |
+| 仓库包（`app/base/kmod` 清单） | `apk add -- <name>`                                            | apk 自己的仓库与签名机制，Pica 不做任何放宽                                                                         |
 
 - **`--allow-untrusted`**：豁免 apk 对包签名的检查。Pica 归档里的 `.apk` 不一定由本机信任的密钥签名，所以要装就得放宽；请把它理解为“信任的是这个归档，而不是这个 `.apk` 的签名”。仓库包（按名字安装）永远不会带上这个参数。
 - **`--force-non-repository`**：apk-tools 3.x（OpenWrt 25.12 及以后）会拒绝安装不属于任何已配置仓库的软件包，本地文件因此需要显式允许；2.x 没有这个选项，传入未知选项会让命令直接失败，所以 Pica 先读 `apk --version` 的大版本号：**≥3 才加，2.x 不加，读不出来时按需要加处理**（读不出来时更可能遇上 3.x 的拒绝，而多传参数会以 `unrecognized option` 明确报错并提示改配置）。
@@ -144,15 +144,18 @@ Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交
 
 ## pica-pack 输出目录约定
 
-默认情况下（不传 `--outdir`），`pica-pack` 输出到 `pica-pack/bin/<pkgname>/<backend>/`：
+不传 `--outdir` 时，输出根目录是 `pica-pack` 可执行文件所在目录下的 `bin/<pkgname>/`：
 
 ```
-pica-pack/bin/<pkgname>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>-opkg.pkg.tar.gz
-pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
-pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
+<outdir>/index.json                 入口描述
+<outdir>/opkg/index.json            后端索引
+<outdir>/opkg/SHA256SUMS
+<outdir>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>-opkg.pkg.tar.gz
+<outdir>/apk/...
+<outdir>/pica/...
 ```
 
-每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。
+每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。输出根目录可以原样发布为软件源：索引条目的 `download_url` 写的是相对源根的 `<backend>/<filename>`。
 
 ## 软件源地址：根地址、入口描述与后端索引
 
@@ -201,7 +204,8 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 ## 下载地址与协议策略
 
-- `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，与入口描述里的 manager path 同一套校验。
+- `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，校验规则与入口描述里的 manager path 相同，另外允许 `@`、`+`、`~`，因为文件名里会出现它们。
+- 条目没有 `download_url` 时，下载地址回落为 `<root>/packages/<filename>`。`pica-pack` 写出的索引总是带这个字段（文件名含相对路径不允许的字符时除外，此时构建告警）。
 - 公网明文 HTTP 默认拒绝；本机回环、私有网段、链路本地地址允许明文 HTTP（局域网自建源就是这类）；每个源可用 `allow_insecure_http` 单独放行公网明文。远端源不得通过 `file://` 让客户端读本机文件，本地源（`file://` 根地址）不受此限。
 - 重定向逐跳检查：每一跳都按上述策略重新判定，最多 5 跳；`https` 不得重定向到 `http`。
 - `sha256` 校验失败即失败：不换用其他地址、不重试下一个源、不进入缓存。
@@ -212,6 +216,7 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 - `schema` 必须为 `1`，`mgr` 必须等于它在入口描述里的键
 - `packages` 必须为数组
+- `pkgname`、`appname` 必须符合「包命名」一节的字符集；不符合的条目被跳过并告警，其余条目照常同步
 - 每个 package 项必须包含非空字符串字段：
   - `pkgname`
   - `pkgver`
@@ -234,11 +239,12 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 - 未识别的额外字段会被原样保留（`flatten`），不会在同步时丢失
 
 安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与索引条目的 `sha256` 一致，否则失败。
+
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，或一条安全的相对路径（相对源根地址解析），用于覆盖默认下载路径
 
 同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 
-任一约束不满足，`pica -S` 会拒绝该源。
+除上述名字规则外，任一约束不满足，`pica -S` 都会拒绝该源。
 
 ## URL 安装
 
@@ -404,7 +410,6 @@ luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hel
 branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
-source = pica
 
 # Optional strong compatibility gate
 # uname = aarch64
@@ -546,7 +551,7 @@ luci = lua1
 - `type = luci` 表示“该包包含/依赖 LuCI Web UI”。如果声明了 `type = luci`，必须同时声明 `luci = lua1|js2`。
 - `type = cli` 表示“该包提供纯命令行程序/脚本”。
 - 仅声明 `type = cli` 时，不需要 `luci = ...`。
-- `source` 用于记录安装来源（例如 `pica` / `opkg` / `local` / `url`），便于升级与排错。默认可不写；安装后 CLI 会在本地数据库里补全 `source`。
+- `source` 不需要写：安装时写入 `db.json` 的 `source` 由实际渠道决定，manifest 里的值不参与决策。
 
 ### 依赖版本约束（`app` / `base` / `kmod`）
 
@@ -598,13 +603,13 @@ kmod = kmod-tun>=0.1?
 
 装不装由 `--with-optional` / `--no-optional` 决定，默认是"能问就问"：
 
-| 情况 | 行为 |
-| --- | --- |
-| 默认、stdin 是终端 | 列出可选项，按编号、`all` 或回车跳过 |
+| 情况                                       | 行为                                                       |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| 默认、stdin 是终端                         | 列出可选项，按编号、`all` 或回车跳过                       |
 | 默认、stdin 不是终端或 `--non-interactive` | 一个不装；不是终端时在 stderr 说明可以用 `--with-optional` |
-| `--with-optional` | 所有可装的可选项都装，不询问、不需要终端 |
-| `--no-optional` | 一个不装，也不输出上一条提示 |
-| 两个一起给 | `E_ARG_INVALID`，不猜哪个优先 |
+| `--with-optional`                          | 所有可装的可选项都装，不询问、不需要终端                   |
+| `--no-optional`                            | 一个不装，也不输出上一条提示                               |
+| 两个一起给                                 | `E_ARG_INVALID`，不猜哪个优先                              |
 
 - "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
 - 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。已装但版本不满足声明的约束时，`outcome` 仍是 `installed_before`（这次安装确实不会动它），但选择器会写明"已装版本不满足声明的约束（约束原文）"，报告条目带 `bound_satisfied: false`——与预检条目同名同义，只写否定，键缺席即这次没有可比的版本。
@@ -659,17 +664,19 @@ luci-i18n-myapp-zh-cn # i18n
 pica 用两个字段承载“名字”，职责不同，不能混用：
 
 - `appname`：纯上游应用名，是命令行的选择键。`Package::app_key()` 取 `appname`（为空时回落到 `pkgname`）；`pica -S <app>` 收集候选时只按 `appname` 匹配，与它来自哪个源、`pkgname` 是什么无关。
-- `pkgname`：这个包在 pica 源里的唯一身份，原样写进产物文件名（`pica-pack` 只要求它非空，不校验字符集）。区分“谁做的 / 什么形态”的后缀只加在 `pkgname` 上。
+- `pkgname`：这个包在 pica 源里的唯一身份，原样写进产物文件名。区分“谁做的 / 什么形态”的后缀只加在 `pkgname` 上。
+
+字符集：两个名字都必须以 ASCII 字母或数字开头，其余字符只能是字母、数字和 `. _ + -`，长度不超过 128；`pkgname` 额外允许 `@`。`pica-pack` 构建、`pica -S` 同步、安装解包后都按这条规则检查：构建直接失败，同步跳过该条目并告警，安装报 `E_MANIFEST_INVALID`，都发生在写入任何文件之前。
 
 按“谁做的、做成什么形态”选择 `pkgname`：
 
-| 情况 | `pkgname` | `appname` |
-| --- | --- | --- |
-| 上游官方支持 OpenWrt / LuCI | `demo` | `demo` |
-| OpenWrt 官方社区打包 | `demo` | `demo` |
-| 只有二进制可用（上游没有现成的 OpenWrt 打包，pica 只是把可执行文件铺上去） | `demo-bin` | `demo` |
-| 第三方个人做的 | `demo@<用户名>` | `demo` |
-| 第三方社区 / 组织做的 | `demo@<组织名>` | `demo` |
+| 情况                                                                       | `pkgname`       | `appname` |
+| -------------------------------------------------------------------------- | --------------- | --------- |
+| 上游官方支持 OpenWrt / LuCI                                                | `demo`          | `demo`    |
+| OpenWrt 官方社区打包                                                       | `demo`          | `demo`    |
+| 只有二进制可用（上游没有现成的 OpenWrt 打包，pica 只是把可执行文件铺上去） | `demo-bin`      | `demo`    |
+| 第三方个人做的                                                             | `demo@<用户名>` | `demo`    |
+| 第三方社区 / 组织做的                                                      | `demo@<组织名>` | `demo`    |
 
 约定：
 
@@ -764,6 +771,7 @@ LICENSE
 app
 app(branch)
 app:branch
+app@branch
 ```
 
 约定：
@@ -799,7 +807,6 @@ platform = amd64
 uname = x86_64
 
 pica = 0.2.8
-source = pica
 
 type = luci
 luci = lua1

@@ -128,7 +128,7 @@ mod tests {
       assert!(!backend.package_extensions().is_empty(), "{backend:?}");
     }
     assert!(!BuildBackend::Pica.expects_containers());
-    assert!(BuildBackend::Pica.package_extensions().is_empty());
+    assert_eq!(BuildBackend::Pica.package_extensions(), [] as [&str; 0]);
   }
 
   #[test]

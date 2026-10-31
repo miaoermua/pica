@@ -334,6 +334,69 @@ fn a_relative_download_url_is_resolved_against_the_source_root() {
 }
 
 #[test]
+fn an_artifact_beside_its_backend_index_installs_through_its_download_url() {
+  let sandbox = Sandbox::new();
+  let artifact = sandbox.artifact("beside-demo", "1.0.0");
+  let name = artifact.file_name().and_then(|n| n.to_str()).expect("filename").to_string();
+  let target = sandbox.source_dir().join("pica").join(&name);
+  fs::create_dir_all(sandbox.source_dir().join("pica")).expect("mkdir pica");
+  fs::rename(&artifact, &target).expect("move artifact");
+
+  // The layout `pica-pack --outdir` writes: nothing under `packages/`.
+  let mut pkg = package("beside-demo", "1.0.0", "pica", &format!("pica/{name}"));
+  pkg["sha256"] = json!(sha256_of(&target));
+
+  sandbox.write("index.json", &descriptor(&json!({ "pica": { "path": "pica/index.json" } })));
+  sandbox.write("pica/index.json", &backend_index("pica", &[pkg]));
+  sandbox.write_conf(&json!([{
+    "name": "main",
+    "url": sandbox.source_url(),
+    "backends": ["pica"],
+  }]));
+
+  sandbox.run(&["-S"]).success();
+  sandbox
+    .run(&["-Sp", "beside-demo"])
+    .success()
+    .stdout(contains("Installing beside-demo (1.0.0-1)"));
+}
+
+#[test]
+fn an_entry_with_an_invalid_name_is_skipped_and_the_rest_of_the_source_stays() {
+  let sandbox = Sandbox::new();
+  let artifact = sandbox.artifact("good-demo", "1.0.0");
+  let name = artifact.file_name().and_then(|n| n.to_str()).expect("filename").to_string();
+  let target = sandbox.source_dir().join("pica").join(&name);
+  fs::create_dir_all(sandbox.source_dir().join("pica")).expect("mkdir pica");
+  fs::rename(&artifact, &target).expect("move artifact");
+
+  let mut good = package("good-demo", "1.0.0", "pica", &format!("pica/{name}"));
+  good["sha256"] = json!(sha256_of(&target));
+  let mut bad = package("bad-demo", "1.0.0", "pica", "");
+  bad["pkgname"] = json!("../evil");
+
+  sandbox.write("index.json", &descriptor(&json!({ "pica": { "path": "pica/index.json" } })));
+  sandbox.write("pica/index.json", &backend_index("pica", &[bad, good]));
+  sandbox.write_conf(&json!([{
+    "name": "main",
+    "url": sandbox.source_url(),
+    "backends": ["pica"],
+  }]));
+
+  sandbox.run(&["-S"]).success().stderr(contains("invalid pkgname \"../evil\""));
+  sandbox.run(&["-Sp", "good-demo"]).success().stdout(contains("Installing good-demo (1.0.0-1)"));
+}
+
+#[test]
+fn a_target_after_the_first_is_refused_instead_of_dropped() {
+  let sandbox = Sandbox::new();
+
+  sandbox.run(&["-S", "first", "second"]).failure().stderr(contains("unexpected argument: second"));
+  sandbox.run(&["-R", "first", "second"]).failure().stderr(contains("unexpected argument: second"));
+  sandbox.run(&["-Q", "stray"]).failure().stderr(contains("unexpected argument: stray"));
+}
+
+#[test]
 fn a_package_nobody_publishes_says_which_backends_were_searched() {
   let sandbox = Sandbox::new();
   sandbox.write("index.json", &descriptor(&json!({ "pica": { "path": "pica/index.json" } })));

@@ -16,6 +16,7 @@ use crate::state::{db_find_installed_pkgname_by_selector, db_set_installed, read
 use crate::system::{fetch_url, need_cmd};
 use pica_pkg_core::PICA_VERSION;
 use pica_pkg_core::io::now_unix_secs;
+use pica_pkg_core::layout::{DEFAULT_LUCI_I18N, PKG_EXTENSION};
 use pica_pkg_core::repo::is_supported_url;
 use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_gt, ver_ge};
@@ -94,7 +95,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| "zh-cn".to_string());
+  let lang = conf_get_i18n(&app.paths.conf_file).unwrap_or_else(|| DEFAULT_LUCI_I18N.to_string());
   let package_manager = app.package_manager()?;
   // This function installs from the feeds, so a feed whose index could not be
   // read is reported as itself: "package not found" would name a fact about a
@@ -102,7 +103,7 @@ pub fn app_via_package_manager(app: &mut App, selector: &str) -> CliResult<()> {
   package_manager.update_index()?;
 
   let mut candidates = vec![appname.clone(), format!("luci-app-{appname}")];
-  if lang == "zh-cn" {
+  if lang == DEFAULT_LUCI_I18N {
     candidates.push(format!("luci-i18n-{appname}-{lang}"));
   }
 
@@ -185,7 +186,7 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     }
   }
 
-  if best.filename.contains('/') || !best.filename.ends_with(".pkg.tar.gz") {
+  if best.filename.contains('/') || !best.filename.ends_with(PKG_EXTENSION) {
     return Err(CliError::new(
       E_REPO_INVALID,
       app.args(Key::InstallInvalidFilename, &[&best.repo, &best.filename]),
@@ -199,20 +200,13 @@ pub fn pica_from_repo(app: &mut App, selector: &str) -> CliResult<()> {
     ));
   }
 
-  // `download_url` is used whenever the index publishes one; a relative value
-  // is resolved against the source root, which is the same base the descriptor
-  // uses. The `/packages/` form stays as the fallback for indexes written
-  // before `download_url` was universal.
-  let download_url = match &best.download_url {
-    Some(url) if is_supported_url(url) => url.clone(),
-    Some(url) => source::join_child(&best.url, url).map_err(|err| {
+  let download_url = source::artifact_url(&best.url, best.download_url.as_deref(), &best.filename)
+    .map_err(|err| {
       CliError::new(
         E_REPO_INVALID,
         app.args(Key::InstallInvalidDownloadUrl, &[&best.repo, &best.pkgname, &err.message]),
       )
-    })?,
-    None => format!("{}/packages/{}", best.url.trim_end_matches('/'), best.filename),
-  };
+    })?;
 
   let policy = source::download_policy(&best.url, best.allow_insecure_http);
 
@@ -302,8 +296,8 @@ pub fn sanitize_cache_filename(value: &str) -> String {
   if out.is_empty() {
     out = format!("remote-{}-{}", now_unix_secs(), std::process::id());
   }
-  if !out.ends_with(".pkg.tar.gz") {
-    out.push_str(".pkg.tar.gz");
+  if !out.ends_with(PKG_EXTENSION) {
+    out.push_str(PKG_EXTENSION);
   }
 
   out

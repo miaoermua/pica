@@ -338,7 +338,7 @@ mod tests {
     let apk_base_raw = manifest.get_array_for("base", "apk");
     let apk_base: Vec<&str> =
       apk_base_raw.iter().map(String::as_str).filter(|item| !item.is_empty()).collect();
-    assert!(apk_base.is_empty());
+    assert_eq!(apk_base, Vec::<String>::new());
     assert_eq!(manifest.get_first_for("app", "apk"), "demo-v3");
     assert_eq!(manifest.get_first_for("app", "pica"), "demo");
   }
@@ -378,7 +378,7 @@ mod tests {
     let mixed = Manifest::from_text("targets = opkg, apk\ntargets = pica\n").expect("parse");
     assert_eq!(mixed.targets(), vec!["opkg", "apk", "pica"]);
 
-    assert!(Manifest::from_text("pkgname = x").expect("parse").targets().is_empty());
+    assert_eq!(Manifest::from_text("pkgname = x").expect("parse").targets(), Vec::<String>::new());
   }
 
   #[test]

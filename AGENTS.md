@@ -3,9 +3,9 @@
 Pica（Pica Is a Compact Archiver）是面向 OpenWrt 的紧凑包管理器，Rust workspace，产出两个二进制：
 
 - `pica`（`crates/pica-pkg-cli`）：设备端 CLI，负责同步、安装、升级、卸载、查询
-- `pica-pack`（`crates/pica-pkg-pack`）：构建端打包器，把 `pkgdir` 打成 `.pkg.tar.gz` 并生成 `repo.json` / `SHA256SUMS`
+- `pica-pack`（`crates/pica-pkg-pack`）：构建端打包器，把 `pkgdir` 打成 `.pkg.tar.gz` 并生成入口 `index.json`、后端 `index.json` 与 `SHA256SUMS`
 
-协议（包格式、文件名、`manifest`、`repo.json`、`db.json`）的权威文档是 `docs/standard.md`，内部机制说明在 `docs/developer.md`，实现在做/不做的清单在 `crates/README.md`。改代码前先读这三份中相关的一节，不要凭猜测改协议。
+协议（包格式、文件名、`manifest`、`index.json`、`db.json`）的权威文档是 `docs/standard.md`，内部机制说明在 `docs/developer.md`，实现在做/不做的清单在 `crates/README.md`。改代码前先读这三份中相关的一节，不要凭猜测改协议。
 
 ## 命令
 
@@ -21,15 +21,15 @@ cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|p
 cargo run -p pica-pkg-cli -- -Q
 ```
 
-- CI（`.github/workflows/openwrt-rust-binaries.yml`）只跑 `cargo test` 和 `cross build`（`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`），**不跑 fmt/clippy/dprint**，格式与 lint 必须本地自查。
+- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和 `cross build`（`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`）。
 - `Makefile` 与 `installer.sh` 当前是空文件，没有可用目标。
 - workspace 级 lints：`unsafe_code = "forbid"`，clippy `all` + `pedantic` 均为 `warn`；三个 crate 都 `[lints] workspace = true`，pedantic 告警要处理而不是加 `#[allow]` 绕过。
 
 ## 代码地图
 
 ```text
-crates/pica-pkg-core/src/     协议与共享类型：manifest.rs / repo.rs / version.rs / selector.rs
-                              / constraint.rs / io.rs / error.rs（无 CLI 依赖）
+crates/pica-pkg-core/src/     协议与共享类型：manifest.rs / repo.rs / layout.rs / naming.rs / version.rs
+                              / selector.rs / constraint.rs / io.rs / error.rs（无 CLI 依赖）
 crates/pica-pkg-cli/src/      main.rs（手写参数解析，不用 clap）、app.rs（路径与环境）、i18n.rs
     commands/                 install/{mod,pipeline,precheck,optional,feed}.rs、sync.rs、query.rs
                               、remove.rs、setup.rs、upgrade.rs
@@ -44,17 +44,17 @@ crates/pica-pkg-pack/src/     build.rs、matrix.rs、backend.rs、payload.rs、a
 
 ## 协议冻结：改这些等于改外部契约
 
-外部消费者是软件源仓库（`pica-pkg-repo` 的 CI 与已发布索引）和已装机的设备。下列任何一项变化都会让已发布的 `repo.json`/产物失配，动手前必须先与维护者确认，并优先找向后兼容的最小方案：
+外部消费者是软件源仓库（`pica-pkg-repo` 的 CI 与已发布索引）和已装机的设备。下列任何一项变化都会让已发布的索引/产物失配，动手前必须先与维护者确认，并优先找向后兼容的最小方案：
 
 - 产物文件名：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-opkg|-apk|-pica].pkg.tar.gz`，`platform = all` 时省略 platform 段；后缀只由 `pkgmgr` 单向生成，永不反向解析
 - 包内结构：`manifest`（必需）+ `scripts/` + `root/` + `pkgs/`（仅 opkg/apk）+ `LICENSE`
-- `repo.json`：`schema` 必须为 `2`，必需字段与 `filename` 一致性校验（见 `docs/standard.md`「repo.json 强约束」）；未识别字段要原样保留（flatten）
+- 源根 `index.json` 与后端 `index.json`：`schema` 必须为 `1`，必需字段与 `filename` 一致性校验（见 `docs/standard.md`「后端索引强约束」）；未识别字段要原样保留（flatten）
 - `db.json` 字段语义：`source`（渠道）与 `pkgmgr`（实际后端）职责不同，旧记录的解析阶梯不能变
 - 状态路径：`/etc/pica/pica.json`、`/etc/pica/env.d/`、`/var/lib/pica/{db.json,index.json,db.lck,cache/}`、`/usr/lib/pica/scripts/<pkgname>/`
 - `manifest` 字段名、`<key>@<backend>` 覆盖规则、`app_i18n` 的 `{lang}` 模板
-- 命名规则：`appname` 是选择键（纯上游应用名，不含 `@`），`pkgname` 是源内身份（`-bin` / `@<谁>` 只进 `pkgname`）
+- 命名规则：`appname` 是选择键（纯上游应用名，不含 `@`），`pkgname` 是源内身份（`-bin` / `@<谁>` 只进 `pkgname`）；字符集由 `pica_pkg_core::naming` 判定
 
-行为级修复同样要 bump 版本：三个 crate 的 `version` 同步改（当前 `0.4.4`）。
+行为级修复同样要 bump 版本：改根 `Cargo.toml` 的 `[workspace.package] version`（当前 `0.4.5`），`PICA_VERSION` 随之变化。
 
 ## 约定
 

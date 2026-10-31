@@ -8,7 +8,7 @@
 > [!NOTE]
 >
 > 💡 寻找包格式协议？<br/>
-> 关于打包规则、`.pkg.tar.gz` 的内部结构定义、`manifest` 文件规范说明与 `repo.json` 强约束条件，请统一阅读 [Pica 标准规范 (standard.md)](./standard.md)。
+> 关于打包规则、`.pkg.tar.gz` 的内部结构定义、`manifest` 文件规范说明与后端索引强约束条件，请统一阅读 [Pica 标准规范 (standard.md)](./standard.md)。
 >
 > 💡 寻找使用方法？<br/>
 > 了解命令行工具的基础用法及防风险警告，请阅读 [Pica 用户指引 (user.md)](./user.md)。
@@ -20,7 +20,7 @@
 ```text
 .
   crates/
-    pica-pkg-core/    归档、manifest、repo.json 与基础 IO
+    pica-pkg-core/    manifest、索引协议、命名规则、协议常量（layout）与基础 IO
     pica-pkg-cli/     pica 命令（安装/卸载/查询/同步/初始化向导/后端）
                        src/i18n.rs 放界面语言与全部用户可见文本
     pica-pkg-pack/    pica-pack 命令（构建与打包）
@@ -35,7 +35,7 @@
 ### 脚本说明与调用
 
 - 入口：`cargo run -p pica-pkg-pack --`（产物二进制为 `pica-pack`）
-- 职责：把符合 `standard.md` 的 `pkgdir` 打成 `.pkg.tar.gz`，并按后端生成 `repo.json` 与 `SHA256SUMS`。
+- 职责：把符合 `standard.md` 的 `pkgdir` 打成 `.pkg.tar.gz`，并按后端生成 `index.json` 与 `SHA256SUMS`，在输出根目录生成入口 `index.json`。
 
 ### 用法
 

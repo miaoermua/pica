@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 
 use pica_pkg_core::error::{PicaError, PicaResult};
 use pica_pkg_core::io::{copy_symlink, ensure_dir, symlink_escapes_root};
-
-use crate::build::ROOT;
+use pica_pkg_core::layout::ROOT;
 
 /// Copies `source` into `destination`, which becomes the artifact's `root/`.
 ///

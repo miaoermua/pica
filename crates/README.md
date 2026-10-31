@@ -40,7 +40,7 @@ Rust workspace for pica migration.
 - Matrix build per backend for `pkgs/<backend>/<platform>/<arch>`
 - Build manifest rewrite (`builddate/size/platform/arch/pkgver/pkgrel/pkgmgr` injection)
 - `size` counted from what a device installs: `root/` plus each container's unpacked payload for `opkg`/`apk`; a container that cannot be unpacked (apk-tools 3.x ADB) is reported as unmeasured rather than counted as zero
-- Per-backend `repo.json` (schema 2) and `SHA256SUMS`
+- Per-backend `index.json` (schema 1) and `SHA256SUMS`, plus an entry `index.json` at the output root
 - Archive creation via system `tar`
 
 ### `pica`

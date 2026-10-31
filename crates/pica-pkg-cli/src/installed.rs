@@ -14,12 +14,13 @@
 //! release keeps working without being rewritten.
 
 use crate::pkgmgr::PackageManagerKind;
+use pica_pkg_core::layout::PKG_EXTENSION;
 use pica_pkg_core::manifest::get_scalar;
 use serde_json::Value;
 
-/// File name suffix of a Pica artifact. Feed installs record the backend name
-/// in `pkgfile` instead, which is what makes that column a usable discriminator.
-const ARTIFACT_SUFFIX: &str = ".pkg.tar.gz";
+// A Pica artifact is recognised by `PKG_EXTENSION`. Feed installs record the
+// backend name in `pkgfile` instead, which is what makes that column a usable
+// discriminator.
 
 /// How Pica obtained an installed package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +151,7 @@ pub fn entry_backend(entry: &Value) -> EntryBackend {
   if let Some(kind) = PackageManagerKind::parse_legacy(entry_pkgfile(entry)) {
     return EntryBackend { kind, origin: PkgmgrOrigin::LegacyPkgfile };
   }
-  if entry_pkgfile(entry).ends_with(ARTIFACT_SUFFIX) {
+  if entry_pkgfile(entry).ends_with(PKG_EXTENSION) {
     return EntryBackend { kind: PackageManagerKind::Pica, origin: PkgmgrOrigin::Default };
   }
 
@@ -169,7 +170,7 @@ pub fn entry_source(entry: &Value) -> EntrySource {
   if let Some(source) = EntrySource::parse(&get_scalar(manifest, "source")) {
     return source;
   }
-  if entry_pkgfile(entry).ends_with(ARTIFACT_SUFFIX) {
+  if entry_pkgfile(entry).ends_with(PKG_EXTENSION) {
     return EntrySource::Repo;
   }
 

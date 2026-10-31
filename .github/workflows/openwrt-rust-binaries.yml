@@ -10,12 +10,40 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "**/*.md"
+      - "clippy.toml"
+      - "dprint.json"
+      - "rustfmt.toml"
       - ".github/workflows/openwrt-rust-binaries.yml"
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Markdown formatting
+        uses: dprint/check@v2.3
+
   test:
     name: test (workspace)
     runs-on: ubuntu-latest
@@ -35,7 +63,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: test
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:

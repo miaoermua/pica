@@ -6,6 +6,7 @@ use crate::pkgmgr::PackageManagerKind;
 use crate::state::{db_del_installed, read_json_file};
 use crate::system::run_command_capture_output;
 use pica_pkg_core::io::{PayloadInstall, remove_payload};
+use pica_pkg_core::layout::{DEFAULT_LUCI_I18N, SCRIPTS_DIR};
 use pica_pkg_core::manifest::{
   get_array_for as manifest_get_array_for, get_scalar as manifest_get_scalar,
 };
@@ -13,8 +14,6 @@ use pica_pkg_core::version::pkgver_cmp_key;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-const SCRIPTS_DIR: &str = "/usr/lib/pica/scripts";
 
 pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
   ensure_dirs(&app.paths)?;
@@ -72,8 +71,8 @@ pub fn pkg(app: &mut App, pkgname: &str) -> CliResult<()> {
     let lang = read_json_file(&app.paths.conf_file)
       .ok()
       .and_then(|value| value.get("i18n").and_then(Value::as_str).map(ToString::to_string))
-      .unwrap_or_else(|| "zh-cn".to_string());
-    if lang == "zh-cn" {
+      .unwrap_or_else(|| DEFAULT_LUCI_I18N.to_string());
+    if lang == DEFAULT_LUCI_I18N {
       remove_set.insert(app_i18n_template.replace("{lang}", &lang));
     }
   }

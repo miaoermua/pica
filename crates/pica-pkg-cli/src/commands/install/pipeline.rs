@@ -23,23 +23,17 @@ use pica_pkg_core::io::make_temp_dir;
 use pica_pkg_core::io::{
   PayloadInstall, copy_symlink, deploy_file, install_payload_with, remove_payload,
 };
+use pica_pkg_core::layout::{
+  DEFAULT_LUCI_I18N, ENV_DIR, MANIFEST, PKGS, ROOT, SCRIPTS, SCRIPTS_DIR,
+};
 use pica_pkg_core::manifest::Manifest;
+use pica_pkg_core::naming::{is_valid_appname, is_valid_pkgname};
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_gt, ver_ge};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Pkgdir layout inside a built artifact. See docs/standard.md.
-const MANIFEST: &str = "manifest";
-const SCRIPTS: &str = "scripts";
-const ROOT: &str = "root";
-const PKGS: &str = "pkgs";
-
-/// Where kept lifecycle scripts and env files live on the target system.
-const SCRIPTS_DIR: &str = "/usr/lib/pica/scripts";
-const ENV_DIR: &str = "/etc/pica/env.d";
 
 pub(super) struct TempDirGuard {
   path: PathBuf,
@@ -356,7 +350,8 @@ fn pkgfile_into(
     .map_err(|err| CliError::new(E_MANIFEST_INVALID, format!("invalid manifest: {err}")))?;
 
   let pkgname = required_manifest_field(&manifest, "pkgname")?;
-  let _appname = required_manifest_field(&manifest, "appname")?;
+  let appname = required_manifest_field(&manifest, "appname")?;
+  check_names(app, &pkgname, &appname)?;
   let pica_required = manifest.get_first("pica");
   let pkgver = required_manifest_field(&manifest, "pkgver")?;
   let pkgrel = manifest.get_first("pkgrel");
@@ -451,6 +446,21 @@ fn pkgfile_into(
   tx.mark_committed(app);
   tx.finish(app);
 
+  Ok(())
+}
+
+/// Refuses a name before it is joined onto any path on the device.
+///
+/// A repository install has already passed this at sync, but `-U` reaches here
+/// with nothing in between: the manifest is the only thing that names the
+/// package, and `pkgname` is about to pick a directory under the scripts root.
+fn check_names(app: &App, pkgname: &str, appname: &str) -> CliResult<()> {
+  if !is_valid_pkgname(pkgname) {
+    return Err(CliError::new(E_MANIFEST_INVALID, app.args(Key::InvalidPkgname, &[pkgname])));
+  }
+  if !is_valid_appname(appname) {
+    return Err(CliError::new(E_MANIFEST_INVALID, app.args(Key::InvalidAppname, &[appname])));
+  }
   Ok(())
 }
 
@@ -559,7 +569,7 @@ fn precheck_dependencies(app: &mut App, ctx: &InstallContext<'_>) -> CliResult<D
   let mut app_list = non_empty(ctx.manifest.get_array_for("app", ctx.pkgmgr));
   let lang = resolve_lang(&app.paths.conf_file);
   let i18n_template = ctx.manifest.get_first("app_i18n");
-  if !i18n_template.is_empty() && lang == "zh-cn" {
+  if !i18n_template.is_empty() && lang == DEFAULT_LUCI_I18N {
     app_list.push(i18n_template.replace("{lang}", &lang));
   }
   app_list = reorder_app_list(app_list);
@@ -3180,6 +3190,35 @@ arch = all
     fn path(&self, relative: &str) -> PathBuf {
       self.target.as_path().join(relative)
     }
+  }
+
+  #[test]
+  fn a_name_that_would_leave_the_scripts_directory_is_refused_before_anything_is_written() {
+    let mut fixture = PicaFixture::new();
+    let manifest =
+      format!("{MANIFEST_DEMO}pkgmgr = pica\n").replace("pkgname = demo", "pkgname = ../../evil");
+
+    let err = fixture
+      .install_without_containers(&manifest, &[("etc/demo.conf", "overlay\n")], &[], &[])
+      .expect_err("the name must be refused");
+
+    assert_eq!(err.code, E_MANIFEST_INVALID);
+    assert!(err.message.contains("../../evil"), "{}", err.message);
+    assert!(!fixture.path("etc/demo.conf").exists(), "nothing may be laid down");
+  }
+
+  #[test]
+  fn an_appname_a_selector_could_not_reach_is_refused() {
+    let mut fixture = PicaFixture::new();
+    let manifest =
+      format!("{MANIFEST_DEMO}pkgmgr = pica\n").replace("appname = demo", "appname = demo@alice");
+
+    let err = fixture
+      .install_without_containers(&manifest, &[("etc/demo.conf", "overlay\n")], &[], &[])
+      .expect_err("the name must be refused");
+
+    assert_eq!(err.code, E_MANIFEST_INVALID);
+    assert!(err.message.contains("demo@alice"), "{}", err.message);
   }
 
   #[test]
@@ -5831,7 +5870,10 @@ arch = all
   fn only_published_sizes_are_shown() {
     assert!(size_lines(IndexSizes::default()).is_empty(), "nothing published, nothing to say");
     // A zero is a feed declining to measure, not a package of no size.
-    assert!(size_lines(IndexSizes { installed: Some(0), download: Some(0) }).is_empty());
+    assert_eq!(
+      size_lines(IndexSizes { installed: Some(0), download: Some(0) }),
+      Vec::<String>::new()
+    );
 
     assert_eq!(
       size_lines(IndexSizes { installed: Some(2 * 1024 * 1024), download: Some(1536) }),

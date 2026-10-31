@@ -6,6 +6,7 @@ use crate::installed;
 use crate::state::read_json_file;
 use pica_pkg_core::constraint;
 use pica_pkg_core::manifest::{get_array_for, get_first as manifest_get_first};
+use pica_pkg_core::selector::Selector;
 use pica_pkg_core::version::{pkgver_cmp_key, pkgver_ge};
 use serde_json::Value;
 
@@ -51,12 +52,8 @@ pub fn all(app: &mut App) -> CliResult<()> {
       &manifest_get_first(manifest, "pkgrel"),
     );
 
-    let mut selector = appname;
-    if !branch.is_empty() {
-      selector.push('(');
-      selector.push_str(&branch);
-      selector.push(')');
-    }
+    let selector =
+      Selector { raw: String::new(), norm: String::new(), appname, branch }.to_canonical_string();
 
     candidates.push((pkgname.clone(), selector, installed_ver));
   }

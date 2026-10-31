@@ -15,7 +15,7 @@
 //! rewritten by anyone on the path.
 
 use crate::app::{CliError, CliResult, E_CONFIG_INVALID, E_POLICY_INVALID};
-use pica_pkg_core::repo::relative_path_problem;
+use pica_pkg_core::repo::{artifact_path_problem, is_supported_url, relative_path_problem};
 
 /// How far a redirect chain may go before the client gives up.
 pub(crate) const MAX_REDIRECTS: u32 = 5;
@@ -265,7 +265,32 @@ fn ipv4_octets(host: &str) -> Option<[u8; 4]> {
 /// Returns an error when `root` is not an absolute URL or `relative` is not a
 /// safe relative path.
 pub(crate) fn join_child(root: &str, relative: &str) -> CliResult<String> {
-  if let Some(reason) = relative_path_problem(relative) {
+  join_checked(root, relative, relative_path_problem(relative))
+}
+
+/// Where the artifact of an index entry is downloaded from.
+///
+/// An absolute `download_url` is used as written and a relative one is resolved
+/// against the source root, the same base the entry descriptor uses. An entry
+/// without one falls back to `<root>/packages/<filename>`, for indexes written
+/// before `pica-pack` published the field.
+///
+/// # Errors
+/// Returns an error when a relative `download_url` is not a safe artifact path.
+pub(crate) fn artifact_url(
+  root: &str,
+  download_url: Option<&str>,
+  filename: &str,
+) -> CliResult<String> {
+  match download_url {
+    Some(url) if is_supported_url(url) => Ok(url.to_string()),
+    Some(url) => join_checked(root, url, artifact_path_problem(url)),
+    None => Ok(format!("{}/packages/{filename}", root.trim_end_matches('/'))),
+  }
+}
+
+fn join_checked(root: &str, relative: &str, problem: Option<&str>) -> CliResult<String> {
+  if let Some(reason) = problem {
     return Err(CliError::new(
       E_CONFIG_INVALID,
       format!("{relative:?} is not a safe relative path: {reason}"),
@@ -366,6 +391,29 @@ pub(crate) fn resolve_location(current: &str, location: &str) -> CliResult<Strin
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn an_artifact_url_is_published_resolved_or_derived() {
+    let root = "https://example.com/r/";
+    assert_eq!(
+      artifact_url(root, Some("https://cdn.example.com/a.pkg.tar.gz"), "a.pkg.tar.gz")
+        .expect("absolute"),
+      "https://cdn.example.com/a.pkg.tar.gz"
+    );
+    assert_eq!(
+      artifact_url(root, Some("pica/a@b-1-all-pica.pkg.tar.gz"), "ignored").expect("relative"),
+      "https://example.com/r/pica/a@b-1-all-pica.pkg.tar.gz"
+    );
+    assert_eq!(
+      artifact_url(root, None, "a.pkg.tar.gz").expect("fallback"),
+      "https://example.com/r/packages/a.pkg.tar.gz"
+    );
+  }
+
+  #[test]
+  fn a_download_url_cannot_climb_out_of_the_source() {
+    assert!(artifact_url("https://example.com/r", Some("../a.pkg.tar.gz"), "a").is_err());
+  }
 
   #[test]
   fn a_local_source_may_be_plain_http_or_a_directory() {

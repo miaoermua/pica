@@ -650,7 +650,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
     let configuration = host.read().expect("read the configuration");
 
     assert!(configuration.is_empty());
-    assert!(configuration.files.is_empty());
+    assert_eq!(configuration.files, Vec::<std::path::PathBuf>::new());
   }
 
   #[test]

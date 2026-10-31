@@ -18,6 +18,7 @@ use crate::app::{
   parse_options, require_arg,
 };
 use crate::commands::{install, query, remove, setup, sync, upgrade};
+use crate::i18n::Key;
 use crate::lock::LockGuard;
 use crate::state::cleanup_pkg_cache;
 use crate::system::need_cmd;
@@ -102,7 +103,24 @@ fn main() {
   }
 }
 
+/// Refuses arguments a command would otherwise drop without a word: `-S a b`
+/// must not install `a` and report success.
+fn reject_extra_args(app: &App, args: &[String]) -> CliResult<()> {
+  let accepted = match args[0].as_str() {
+    "setup" | "-Su" | "-Syu" | "-Q" => 1,
+    "-S" | "-Qi" | "-Ql" | "-So" | "-Si" | "-Sp" | "-U" | "-R" => 2,
+    _ => return Ok(()),
+  };
+  match args.get(accepted) {
+    Some(extra) => {
+      Err(CliError::new(E_ARG_INVALID, app.args(Key::TooManyArguments, &[&args[0], extra])))
+    }
+    None => Ok(()),
+  }
+}
+
 fn run_command(app: &mut App, args: &[String]) -> CliResult<(&'static str, String)> {
+  reject_extra_args(app, args)?;
   let command = args[0].as_str();
   match command {
     "setup" => {
