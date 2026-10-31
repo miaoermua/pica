@@ -71,16 +71,26 @@ jobs:
           - target: x86_64-unknown-linux-musl
             arch: amd64
             toolchain: stable
+            musl_toolchain: ""
+            linker: ""
           - target: aarch64-unknown-linux-musl
             arch: arm64
             toolchain: stable
+            musl_toolchain: ""
+            linker: ""
           # Little-endian MIPS32r2, soft-float: ramips (mt7621/mt7628) and the
           # other mipsel_24kc routers. A tier-3 target since Rust 1.72, so it
           # has no prebuilt std: nightly builds one from rust-src.
+          #
+          # `cross` publishes images for the gnu MIPS targets only, so this one
+          # is not built in a container: a musl.cc toolchain supplies the linker
+          # and the libc that a tier-3 target has no rust-std component for.
           - target: mipsel-unknown-linux-musl
             arch: mipsel
             toolchain: nightly
             build_std: "-Zbuild-std=std,panic_abort"
+            musl_toolchain: mipsel-linux-musl-cross
+            linker: mipsel-linux-musl-gcc
 
     steps:
       - name: Checkout
@@ -98,15 +108,32 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cross
+        if: matrix.musl_toolchain == ''
         run: cargo install cross --git https://github.com/cross-rs/cross.git
 
-      - name: Build pica binaries
+      - name: Install the musl cross toolchain
+        if: matrix.musl_toolchain != ''
         run: |
-          cross +${{ matrix.toolchain }} build --release \
-            --target "${{ matrix.target }}" \
-            -p pica-pkg-cli \
-            -p pica-pkg-pack \
-            ${{ matrix.build_std }}
+          set -eu
+          name="${{ matrix.musl_toolchain }}"
+          curl -fsSL "https://musl.cc/${name}.tgz" -o "${RUNNER_TEMP}/${name}.tgz"
+          tar -xzf "${RUNNER_TEMP}/${name}.tgz" -C "$RUNNER_TEMP"
+          echo "${RUNNER_TEMP}/${name}/bin" >> "$GITHUB_PATH"
+
+      - name: Build pica binaries
+        env:
+          # rustc's default linker for this target is `cc`, the host compiler,
+          # which cannot link a mipsel object.
+          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
+        run: |
+          set -eu
+          args=(--release --target "${{ matrix.target }}"
+                -p pica-pkg-cli -p pica-pkg-pack ${{ matrix.build_std }})
+          if [ -n "${{ matrix.musl_toolchain }}" ]; then
+            cargo "+${{ matrix.toolchain }}" build "${args[@]}"
+          else
+            cross "+${{ matrix.toolchain }}" build "${args[@]}"
+          fi
 
       - name: Prepare artifacts
         id: prepare_artifacts
