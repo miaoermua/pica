@@ -176,6 +176,12 @@ jobs:
         env:
           PICA_TOOLCHAIN: ${{ runner.temp }}/toolchain
           PICA_CC: ${{ runner.temp }}/toolchain/bin/${{ matrix.linker }}
+          # The toolchain specs insert `-L %:getenv(STAGING_DIR /usr/lib)` and
+          # warn when it is unset. Unset also means the host /usr/lib joins the
+          # link line, which is exactly the kind of library a cross link must
+          # never see. Point it at a directory that does not exist: the toolchain
+          # carries everything, and installed packages are not part of this job.
+          STAGING_DIR: ${{ runner.temp }}/staging
         run: |
           set -eu
           echo "sysroot: $("$PICA_CC" -print-sysroot)"
@@ -200,6 +206,7 @@ jobs:
         env:
           PICA_TOOLCHAIN: ${{ runner.temp }}/toolchain
           PICA_CC: ${{ runner.temp }}/toolchain/bin/${{ matrix.linker }}
+          STAGING_DIR: ${{ runner.temp }}/staging
         run: |
           set -eu
           args=(--release --target "${{ matrix.target }}"
