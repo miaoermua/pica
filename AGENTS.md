@@ -21,7 +21,7 @@ cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|p
 cargo run -p pica-pkg-cli -- -Q
 ```
 
-- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和交叉构建：`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 用 `cross build`；`mipsel-unknown-linux-musl` 是 tier 3 且 cross 没有为 musl 的 MIPS 变体发布镜像（只有 gnu 的），所以在 runner 上装 musl.cc 的 `mipsel-linux-musl-cross` 工具链当链接器，直接 `cargo +nightly build -Zbuild-std=std,panic_abort`，因此代码里不能用 `AtomicU64` 这类 32 位 MIPS 没有的类型。
+- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和交叉构建：`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 用 `cross build`；`mipsel-unknown-linux-musl` 是 tier 3 且 cross 没有为 musl 的 MIPS 变体发布镜像（只有 gnu 的），所以在 runner 上下载 OpenWrt 官方的 `ramips/mt7621` toolchain（按 sha256 校验）当链接器（`mipsel-openwrt-linux-musl-gcc`），直接 `cargo +nightly build -Zbuild-std=std,panic_abort`，并加 `-C target-feature=+crt-static`——这个 target 默认动态链接，不加就会产出依赖设备 musl 与 `libgcc_s` 的产物。因此代码里不能用 `AtomicU64` 这类 32 位 MIPS 没有的类型。
 - `Makefile` 与 `installer.sh` 当前是空文件，没有可用目标。
 - workspace 级 lints：`unsafe_code = "forbid"`，clippy `all` + `pedantic` 均为 `warn`；三个 crate 都 `[lints] workspace = true`，pedantic 告警要处理而不是加 `#[allow]` 绕过。
 
