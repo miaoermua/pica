@@ -37,6 +37,8 @@
 //! be incomplete is exactly what this module exists to keep out of an answer.
 
 use crate::app::{CliError, CliResult, E_CONFIG_INVALID, E_IO};
+use crate::i18n::Key;
+use crate::i18n::tr;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -142,7 +144,7 @@ pub(crate) fn read(
       Ok(text) => text,
       Err(err) if err.kind() == ErrorKind::NotFound => continue,
       Err(err) => {
-        return Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display())));
+        return Err(CliError::new(E_IO, tr(Key::ReadFailed, &[&path.display(), &err])));
       }
     };
     parser.parse_file(&path, &text)?;
@@ -169,13 +171,12 @@ fn configuration_files(files: &[PathBuf], dirs: &[PathBuf]) -> CliResult<Vec<Pat
       Ok(entries) => entries,
       Err(err) if err.kind() == ErrorKind::NotFound => continue,
       Err(err) => {
-        return Err(CliError::new(E_IO, format!("read directory {} failed: {err}", dir.display())));
+        return Err(CliError::new(E_IO, tr(Key::ReadDirFailed, &[&dir.display(), &err])));
       }
     };
     for entry in entries {
-      let entry = entry.map_err(|err| {
-        CliError::new(E_IO, format!("read directory {} failed: {err}", dir.display()))
-      })?;
+      let entry = entry
+        .map_err(|err| CliError::new(E_IO, tr(Key::ReadDirFailed, &[&dir.display(), &err])))?;
       let name = entry.file_name();
       let Some(name) = name.to_str() else { continue };
       // apk reads the files that are not hidden and end in `.list`
@@ -196,7 +197,7 @@ fn machine_type(path: &Path) -> CliResult<Option<String>> {
   match fs::read_to_string(path) {
     Ok(text) => Ok(text.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_string)),
     Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-    Err(err) => Err(CliError::new(E_IO, format!("read {} failed: {err}", path.display()))),
+    Err(err) => Err(CliError::new(E_IO, tr(Key::ReadFailed, &[&path.display(), &err]))),
   }
 }
 
@@ -252,7 +253,7 @@ impl Parser {
     }
     let mut words = Words::new(line);
     let Some(first) = words.next() else {
-      return Err(self.invalid("no keyword or URL"));
+      return Err(self.invalid(tr(Key::ReposNoKeyword, &[])));
     };
     let mut named: Option<Layout> = None;
     let url = if keyword(first) {
@@ -262,21 +263,21 @@ impl Parser {
         "ndx" => named = Some(Layout::Named),
         "v2" => named = Some(Layout::V2),
         "v3" => named = Some(Layout::V3),
-        other => return Err(self.invalid(format!("unrecognized keyword: {other}"))),
+        other => return Err(self.invalid(tr(Key::ReposUnknownKeyword, &[&other]))),
       }
       words.next()
     } else {
       Some(first)
     };
     let Some(url) = url else {
-      return Err(self.invalid("no URL"));
+      return Err(self.invalid(tr(Key::ReposNoUrl, &[])));
     };
     // `@tag URL` tags the repository. The tag groups repositories for
     // installation, it does not change which index apk fetches, so it does not
     // reach the index check.
     let url = if url.starts_with('@') { words.next() } else { Some(url) };
     let Some(url) = url else {
-      return Err(self.invalid("no URL"));
+      return Err(self.invalid(tr(Key::ReposNoUrl, &[])));
     };
     // apk decides the layout from the URL as written and expands variables only
     // afterwards.
@@ -287,7 +288,7 @@ impl Parser {
     });
     let url = self.expand(url)?;
     if !is_url(&url) {
-      return Err(self.invalid(format!("invalid URL: {url}")));
+      return Err(self.invalid(tr(Key::ReposInvalidUrl, &[&url])));
     }
     let base = url.trim_end_matches('/').to_string();
     let components = self.expand(words.rest())?;
@@ -313,17 +314,17 @@ impl Parser {
       if option == "-default" {
         overwrite = false;
       } else {
-        return Err(self.invalid(format!("invalid option: {option}")));
+        return Err(self.invalid(tr(Key::ReposInvalidOption, &[&option])));
       }
     }
     let definition = words.rest();
     let Some((name, value)) = definition.split_once('=') else {
-      return Err(self.invalid(format!("invalid variable definition: {definition}")));
+      return Err(self.invalid(tr(Key::ReposInvalidVariable, &[&definition])));
     };
     // The name is checked before the value is expanded, the way
     // `apk_repoparser_parse_set` checks it: `APK_` is apk's own namespace.
     if name.starts_with("APK_") || !valid_variable_name(name) {
-      return Err(self.invalid(format!("invalid variable definition: {definition}")));
+      return Err(self.invalid(tr(Key::ReposInvalidVariable, &[&definition])));
     }
     let value = self.expand(value)?;
     if !overwrite && self.variables.contains_key(name) {
@@ -339,10 +340,7 @@ impl Parser {
       Layout::Named => url.to_string(),
       Layout::V2 | Layout::V3 => {
         let Some(arch) = &self.arch else {
-          return Err(self.invalid(format!(
-            "cannot tell which index {url} needs: {} does not name a machine type",
-            self.arch_file.display()
-          )));
+          return Err(self.invalid(tr(Key::ReposNoArch, &[&url, &self.arch_file.display()])));
         };
         let index = if layout == Layout::V2 { "APKINDEX.tar.gz" } else { "Packages.adb" };
         format!("{url}/{arch}/{index}")
@@ -375,7 +373,7 @@ impl Parser {
     while let Some((prefix, after)) = rest.split_once("${") {
       out.push_str(prefix);
       let Some((key, after)) = after.split_once('}') else {
-        return Err(self.invalid(format!("unterminated variable: {text}")));
+        return Err(self.invalid(tr(Key::ReposUnterminated, &[&text])));
       };
       // A length is a run of digits, and all of them have to be digits
       // (`apk_blob_pull_uint`): `${NAME:8x}` is not a length at all, and
@@ -388,11 +386,11 @@ impl Parser {
         Some((name, "")) => (name, Some(0)),
         Some((name, limit)) => match limit.parse::<usize>() {
           Ok(count) if limit.bytes().all(|byte| byte.is_ascii_digit()) => (name, Some(count)),
-          _ => return Err(self.invalid(format!("invalid variable length: {key}"))),
+          _ => return Err(self.invalid(tr(Key::ReposVariableLength, &[&key]))),
         },
       };
       let Some(value) = self.variables.get(name) else {
-        return Err(self.invalid(format!("undefined variable: {name}")));
+        return Err(self.invalid(tr(Key::ReposUndefined, &[&name])));
       };
       match count {
         Some(count) => out.extend(value.chars().take(count)),
@@ -650,7 +648,7 @@ https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/video/packages.ad
     let configuration = host.read().expect("read the configuration");
 
     assert!(configuration.is_empty());
-    assert!(configuration.files.is_empty());
+    assert_eq!(configuration.files, Vec::<std::path::PathBuf>::new());
   }
 
   #[test]

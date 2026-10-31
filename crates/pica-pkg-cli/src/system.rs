@@ -1,4 +1,6 @@
 use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_MISSING_COMMAND, E_RUNTIME};
+use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::source::{FetchPolicy, MAX_REDIRECTS, resolve_location};
 use std::env;
 use std::fs;
@@ -59,10 +61,7 @@ pub fn fetch_url(
   retry_delay_secs: u64,
 ) -> CliResult<Vec<u8>> {
   if timeout_secs == 0 {
-    return Err(CliError::new(
-      E_CONFIG_INVALID,
-      format!("invalid --fetch-timeout: {timeout_secs}"),
-    ));
+    return Err(CliError::new(E_CONFIG_INVALID, tr(Key::InvalidFetchTimeout, &[&timeout_secs])));
   }
 
   // Detected on first use: a `file://` source needs no downloader at all, and a
@@ -77,15 +76,14 @@ pub fn fetch_url(
 
     if let Some(path) = current.strip_prefix("file://") {
       return fs::read(path)
-        .map_err(|err| CliError::new(E_IO, format!("read file url failed: {err}")));
+        .map_err(|err| CliError::new(E_IO, tr(Key::ReadFileUrlFailed, &[&err])));
     }
 
     let tool = if let Some(detected) = tool {
       detected
     } else {
-      let detected = FetchTool::detect().ok_or_else(|| {
-        CliError::new(E_MISSING_COMMAND, "no fetch tool found (need uclient-fetch, wget, or curl)")
-      })?;
+      let detected = FetchTool::detect()
+        .ok_or_else(|| CliError::new(E_MISSING_COMMAND, tr(Key::NoFetchTool, &[])))?;
       tool = Some(detected);
       detected
     };
@@ -95,10 +93,7 @@ pub fn fetch_url(
       Hop::Redirect(location) => {
         followed += 1;
         if followed > MAX_REDIRECTS {
-          return Err(CliError::new(
-            E_RUNTIME,
-            format!("too many redirects (>{MAX_REDIRECTS}) starting at {url}"),
-          ));
+          return Err(CliError::new(E_RUNTIME, tr(Key::TooManyRedirects, &[&MAX_REDIRECTS, &url])));
         }
 
         let target = resolve_location(&current, &location)?;
@@ -185,9 +180,7 @@ fn with_retry(
 
   Err(CliError::new(
     E_RUNTIME,
-    format!(
-      "download failed after {max_attempts} attempts (timeout={timeout_secs}s): {url} detail=[{last_error}]"
-    ),
+    tr(Key::DownloadFailed, &[&max_attempts, &timeout_secs, &url, &last_error]),
   ))
 }
 
@@ -195,9 +188,9 @@ fn with_retry(
 /// or the `Location` it would have followed.
 fn curl_hop(url: &str, timeout: &str) -> CliResult<Hop> {
   let headers = tempfile::NamedTempFile::new()
-    .map_err(|err| CliError::new(E_IO, format!("temp file for headers failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::TempHeadersFailed, &[&err])))?;
   let body = tempfile::NamedTempFile::new()
-    .map_err(|err| CliError::new(E_IO, format!("temp file for body failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::TempBodyFailed, &[&err])))?;
 
   let header_path = headers.path().to_string_lossy().to_string();
   let body_path = body.path().to_string_lossy().to_string();
@@ -220,32 +213,30 @@ fn curl_hop(url: &str, timeout: &str) -> CliResult<Hop> {
       url,
     ])
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("curl failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::CurlFailed, &[&err])))?;
 
   if !output.status.success() {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    return Err(CliError::new(E_RUNTIME, format!("curl download failed: {detail}")));
+    return Err(CliError::new(E_RUNTIME, tr(Key::CurlDownloadFailed, &[&detail])));
   }
 
   let status: u16 = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
 
   if (300..400).contains(&status) {
     let raw_headers = fs::read_to_string(headers.path())
-      .map_err(|err| CliError::new(E_IO, format!("read redirect headers failed: {err}")))?;
+      .map_err(|err| CliError::new(E_IO, tr(Key::ReadRedirectHeadersFailed, &[&err])))?;
     return match last_location(&raw_headers) {
       Some(location) => Ok(Hop::Redirect(location)),
-      None => {
-        Err(CliError::new(E_RUNTIME, format!("HTTP {status} without a Location header: {url}")))
-      }
+      None => Err(CliError::new(E_RUNTIME, tr(Key::HttpNoLocation, &[&status, &url]))),
     };
   }
 
   if status >= 400 {
-    return Err(CliError::new(E_RUNTIME, format!("HTTP {status} for {url}")));
+    return Err(CliError::new(E_RUNTIME, tr(Key::HttpStatus, &[&status, &url])));
   }
 
-  let bytes = fs::read(body.path())
-    .map_err(|err| CliError::new(E_IO, format!("read download body failed: {err}")))?;
+  let bytes =
+    fs::read(body.path()).map_err(|err| CliError::new(E_IO, tr(Key::ReadBodyFailed, &[&err])))?;
   Ok(Hop::Body(bytes))
 }
 
@@ -253,7 +244,7 @@ fn curl_hop(url: &str, timeout: &str) -> CliResult<Hop> {
 /// without these options fall back to the tool's own redirect handling.
 fn wget_hop(url: &str, timeout: &str) -> CliResult<Hop> {
   let body = tempfile::NamedTempFile::new()
-    .map_err(|err| CliError::new(E_IO, format!("temp file for body failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::TempBodyFailed, &[&err])))?;
   let body_path = body.path().to_string_lossy().to_string();
 
   let output = Command::new("wget")
@@ -268,13 +259,13 @@ fn wget_hop(url: &str, timeout: &str) -> CliResult<Hop> {
       url,
     ])
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("wget failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::WgetFailed, &[&err])))?;
 
   let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
   if output.status.success() {
-    let bytes = fs::read(body.path())
-      .map_err(|err| CliError::new(E_IO, format!("read download body failed: {err}")))?;
+    let bytes =
+      fs::read(body.path()).map_err(|err| CliError::new(E_IO, tr(Key::ReadBodyFailed, &[&err])))?;
     return Ok(Hop::Body(bytes));
   }
 
@@ -292,7 +283,7 @@ fn wget_hop(url: &str, timeout: &str) -> CliResult<Hop> {
     return run_fetch("wget", &args).map(Hop::Body);
   }
 
-  Err(CliError::new(E_RUNTIME, format!("wget download failed: {stderr}")))
+  Err(CliError::new(E_RUNTIME, tr(Key::WgetDownloadFailed, &[&stderr])))
 }
 
 /// The last `Location:` header in a header block. Following the last one is
@@ -315,7 +306,7 @@ pub fn need_cmd(name: &str) -> CliResult<()> {
   if has_command(name) {
     Ok(())
   } else {
-    Err(CliError::new(E_MISSING_COMMAND, format!("missing required command: {name}")))
+    Err(CliError::new(E_MISSING_COMMAND, tr(Key::MissingCommand, &[&name])))
   }
 }
 
@@ -338,13 +329,10 @@ pub fn run_command_text(program: &str, args: &[&str]) -> CliResult<String> {
   let output = Command::new(program)
     .args(args)
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("{program} failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::CommandFailed, &[&program, &err])))?;
 
   if !output.status.success() {
-    return Err(CliError::new(
-      E_RUNTIME,
-      format!("{program} exited with status {}", output.status),
-    ));
+    return Err(CliError::new(E_RUNTIME, tr(Key::CommandExited, &[&program, &output.status])));
   }
 
   Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -354,13 +342,13 @@ pub fn run_command_capture_output(program: &str, args: &[&str]) -> CliResult<Vec
   let output = Command::new(program)
     .args(args)
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("{program} failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::CommandFailed, &[&program, &err])))?;
 
   if output.status.success() {
     Ok(output.stdout)
   } else {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    Err(CliError::new(E_RUNTIME, format!("{program} failed: {detail}")))
+    Err(CliError::new(E_RUNTIME, tr(Key::CommandFailed, &[&program, &detail])))
   }
 }
 
@@ -381,13 +369,13 @@ fn run_tar(flags: &[&str], after: &[&str], archive: &Path, target_dir: &Path) ->
     .arg("-C")
     .arg(target_dir)
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("tar extract failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::TarFailed, &[&err])))?;
 
   if output.status.success() {
     Ok(())
   } else {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    Err(CliError::new(E_RUNTIME, format!("tar extract failed: {}: {detail}", archive.display())))
+    Err(CliError::new(E_RUNTIME, tr(Key::TarExtractFailed, &[&archive.display(), &detail])))
   }
 }
 
@@ -395,13 +383,13 @@ fn run_fetch(command: &str, args: &[&str]) -> CliResult<Vec<u8>> {
   let output = Command::new(command)
     .args(args)
     .output()
-    .map_err(|err| CliError::new(E_IO, format!("{command} failed: {err}")))?;
+    .map_err(|err| CliError::new(E_IO, tr(Key::CommandFailed, &[&command, &err])))?;
 
   if output.status.success() {
     Ok(output.stdout)
   } else {
     let detail = stderr_or_stdout(&output.stdout, &output.stderr);
-    Err(CliError::new(E_RUNTIME, format!("{command} download failed: {detail}")))
+    Err(CliError::new(E_RUNTIME, tr(Key::FetcherDownloadFailed, &[&command, &detail])))
   }
 }
 
@@ -412,10 +400,10 @@ pub fn run_hook(app: &mut App, tmpdir: &Path, hook_rel: &str, label: &str) -> Cl
 
   let hook_path = tmpdir.join(hook_rel);
   if !hook_path.is_file() {
-    return Err(CliError::new(E_CONFIG_INVALID, format!("{label} hook not found: {hook_rel}")));
+    return Err(CliError::new(E_CONFIG_INVALID, tr(Key::HookNotFound, &[&label, &hook_rel])));
   }
 
-  app.log_info(format!("Running {label} hook: {hook_rel}"));
+  app.log_info(tr(Key::HookRunning, &[&label, &hook_rel]));
   run_command_capture_output("sh", &[hook_path.to_string_lossy().as_ref()]).map(|_| ())
 }
 
@@ -426,5 +414,5 @@ pub(crate) fn stderr_or_stdout(stdout: &[u8], stderr: &[u8]) -> String {
   }
 
   let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
-  if stdout_text.is_empty() { "unknown error".to_string() } else { stdout_text }
+  if stdout_text.is_empty() { tr(Key::UnknownError, &[]) } else { stdout_text }
 }

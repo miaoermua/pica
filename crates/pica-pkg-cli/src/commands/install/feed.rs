@@ -2,6 +2,8 @@ use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_IO, E_POLICY_INVALID, E_RUNTIME, FeedPolicy,
   prompt_yn,
 };
+use crate::i18n::Key;
+use crate::i18n::tr;
 use std::fs;
 use std::path::Path;
 
@@ -42,12 +44,7 @@ pub(crate) fn dependency_source(
     // will install.
     FeedPolicy::FeedOnly => {
       if declared.is_empty() {
-        return Err(CliError::new(
-          E_POLICY_INVALID,
-          "feed-only policy: the artifact declares no packages, and its packaged containers \
-           may not be used (declare them, or install with another --feed-policy)"
-            .to_string(),
-        ));
+        return Err(CliError::new(E_POLICY_INVALID, tr(Key::FeedOnlyNothingDeclared, &[])));
       }
       Ok(Some(DependencySource::Feeds))
     }
@@ -55,11 +52,7 @@ pub(crate) fn dependency_source(
     // ships none has no source left.
     FeedPolicy::PackagedOnly => {
       if !have_pkgs_dir {
-        return Err(CliError::new(
-          E_RUNTIME,
-          "packaged-only policy: the artifact ships no containers, and feeds may not be used"
-            .to_string(),
-        ));
+        return Err(CliError::new(E_RUNTIME, tr(Key::PackagedOnlyNoContainers, &[])));
       }
       Ok(Some(DependencySource::Containers))
     }
@@ -116,14 +109,8 @@ pub(crate) fn dependency_source(
         return Ok(Some(DependencySource::Feeds));
       }
 
-      let use_feeds = prompt_yn(
-        &format!(
-          "Found {available}/{total} declared packages in the {} feeds. Use feeds instead of the \
-           packaged containers?",
-          app.backend().as_str()
-        ),
-        true,
-      );
+      let use_feeds =
+        prompt_yn(&tr(Key::FeedsPrompt, &[&available, &total, &app.backend().as_str()]), true);
       Ok(Some(if use_feeds { DependencySource::Feeds } else { DependencySource::Containers }))
     }
   }
@@ -150,7 +137,7 @@ pub(crate) fn install_pkgs_dir(app: &App, label: &str, dir: &Path) -> CliResult<
   }
 
   let mut paths: Vec<std::path::PathBuf> = fs::read_dir(dir)
-    .map_err(|err| CliError::new(E_IO, format!("read {} failed: {err}", dir.display())))?
+    .map_err(|err| CliError::new(E_IO, tr(Key::ReadFailed, &[&dir.display(), &err])))?
     .flatten()
     .map(|entry| entry.path())
     .filter(|path| path.is_file())
@@ -160,7 +147,7 @@ pub(crate) fn install_pkgs_dir(app: &App, label: &str, dir: &Path) -> CliResult<
   if paths.is_empty() {
     return Err(CliError::new(
       E_CONFIG_INVALID,
-      format!("no packages found in {label} dir: {}", dir.display()),
+      tr(Key::NoPackagesInDir, &[&label, &dir.display()]),
     ));
   }
 
@@ -255,6 +242,8 @@ mod tests {
         pkgmgr: None,
         optional_deps: OptionalDeps::None,
         lang: None,
+        dry_run: false,
+        noconfirm: false,
       },
     )
   }

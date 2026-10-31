@@ -33,12 +33,12 @@ fn usage() {
      that combination's packages, flattened into pkgs/.\n\
      \n\
      Artifact filename:\n  \
-       <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-apk|-pica].pkg.tar.gz\n  \
+       <pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-opkg|-apk|-pica].pkg.tar.gz\n  \
        (the platform segment is omitted when platform = all)\n\
      \n\
      Output (one directory per backend):\n  \
        opkg -> <outdir>/opkg/    apk -> <outdir>/apk/    pica -> <outdir>/pica/\n  \
-       each with its own repo.json and SHA256SUMS"
+       each with its own index.json and SHA256SUMS; <outdir>/index.json lists them"
   );
 }
 

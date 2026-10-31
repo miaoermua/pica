@@ -9,21 +9,16 @@ use pica_pkg_core::error::{PicaError, PicaResult};
 use pica_pkg_core::io::{
   copy_dir_recursive, ensure_dir, make_temp_dir, resolve_script_dir_from_exe, write_atomic,
 };
+use pica_pkg_core::layout::{LICENSE, MANIFEST, PKGS, ROOT, SCRIPTS};
 use pica_pkg_core::manifest::{Manifest, SOURCE_AVAILABILITY_VALUES, is_valid_source_availability};
+use pica_pkg_core::naming::{is_valid_appname, is_valid_pkgname};
 use pica_pkg_core::repo::{
   BACKEND_INDEX_SCHEMA, BackendIndex, ENTRY_SCHEMA, EntryDescriptor, EntryManager, Package,
-  package_filename, parse_backend_index, parse_entry_descriptor,
+  artifact_path_problem, package_filename, parse_backend_index_skipping, parse_entry_descriptor,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// Directory names inside a pkgdir. See docs/standard.md.
-const MANIFEST: &str = "manifest";
-const SCRIPTS: &str = "scripts";
-pub(crate) const ROOT: &str = "root";
-const PKGS: &str = "pkgs";
-const LICENSE: &str = "LICENSE";
 
 pub(crate) struct BuildRequest<'a> {
   pub pkgdir: &'a Path,
@@ -65,7 +60,8 @@ pub(crate) fn main_build(
   check_source_availability(&manifest)?;
 
   let pkgname = manifest.require_non_empty("pkgname")?;
-  let _appname = manifest.require_non_empty("appname")?;
+  let appname = manifest.require_non_empty("appname")?;
+  check_names(&pkgname, &appname)?;
   let pkgver = manifest.require_non_empty("pkgver")?;
   let _pkg_os = manifest.require_non_empty("os")?;
   let pkgrel = manifest.get_first("pkgrel");
@@ -163,6 +159,22 @@ pub(crate) fn main_build(
     }
   }
 
+  Ok(())
+}
+
+/// Refuses a name the index and the device would refuse, before it reaches a
+/// filename.
+fn check_names(pkgname: &str, appname: &str) -> PicaResult<()> {
+  if !is_valid_pkgname(pkgname) {
+    return Err(PicaError::msg(format!(
+      "invalid pkgname {pkgname}: start with a letter or digit and use only letters, digits and . _ + - @"
+    )));
+  }
+  if !is_valid_appname(appname) {
+    return Err(PicaError::msg(format!(
+      "invalid appname {appname}: start with a letter or digit and use only letters, digits and . _ + -"
+    )));
+  }
   Ok(())
 }
 
@@ -617,7 +629,7 @@ fn write_repo_index(
     license: text("license"),
     source_availability: text("source_availability"),
     pica: text("pica").or_else(|| (!req.pica.is_empty()).then(|| req.pica.to_string())),
-    download_url: None,
+    download_url: published_download_url(req.output_dir, filename),
     size: Some(install_size),
     csize: Some(csize),
     manifest: Some(manifest.value.clone()),
@@ -629,14 +641,42 @@ fn write_repo_index(
   write_entry_descriptor(req)
 }
 
+/// Where a client finds this artifact, relative to the source root.
+///
+/// Artifacts sit next to their backend's index, so an output directory can be
+/// published as it is. A filename no relative address can carry (a version with
+/// a `:`, say) publishes nothing, and the client falls back to `packages/`.
+fn published_download_url(output_dir: &Path, filename: &str) -> Option<String> {
+  let dir = output_dir.file_name()?.to_str()?;
+  let path = format!("{dir}/{filename}");
+  match artifact_path_problem(&path) {
+    None => Some(path),
+    Some(reason) => {
+      msg2(format!("WARNING: no download_url for {filename}: {reason}"));
+      None
+    }
+  }
+}
+
 /// The index this backend already published, or an empty one to start from.
 ///
 /// A file that does not parse is replaced: it can only be the output of an
 /// older generator or a corrupt write, and appending to it would publish
-/// packages the client would refuse to read.
+/// packages the client would refuse to read. Entries with an invalid name are
+/// dropped on their own, the same way a client reading the index treats them.
 fn read_backend_index(path: &Path, mgr: &str) -> BackendIndex {
-  let parsed =
-    fs::read_to_string(path).ok().and_then(|content| parse_backend_index(&content, mgr).ok());
+  let parsed = fs::read_to_string(path)
+    .ok()
+    .and_then(|content| parse_backend_index_skipping(&content, mgr).ok())
+    .map(|(index, skipped)| {
+      for package in skipped {
+        msg2(format!(
+          "WARNING: dropped index entry: invalid {} {:?}",
+          package.field, package.value
+        ));
+      }
+      index
+    });
   parsed.unwrap_or(BackendIndex {
     schema: BACKEND_INDEX_SCHEMA,
     mgr: mgr.to_string(),
@@ -700,6 +740,50 @@ mod tests {
   fn build_with_manifest(root: &Path, manifest: &str) -> Result<(), String> {
     write_pkgdir(root, manifest);
     super::main_build(root, Some(root.join("out")), None).map_err(|err| err.to_string())
+  }
+
+  #[test]
+  fn an_output_directory_can_be_published_as_it_is() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkgdir = tmp.path().join("pkgdir");
+    let out = tmp.path().join("r");
+    write_pkgdir(
+      &pkgdir,
+      "pkgname = demo@alice\nappname = demo\npkgver = 1.0.0\nos = openwrt\ntargets = pica\n",
+    );
+    fs::create_dir_all(pkgdir.join("root/etc")).expect("mkdir root");
+    fs::write(pkgdir.join("root/etc/demo"), "demo\n").expect("write payload");
+
+    main_build(&pkgdir, Some(out.clone()), None).expect("build");
+
+    let text = fs::read_to_string(out.join("pica/index.json")).expect("read index");
+    let index = parse_backend_index(&text, "pica").expect("the index must accept its own address");
+    let package = &index.packages[0];
+    let address = package.download_url.as_deref().expect("a published address");
+    assert_eq!(address, format!("pica/{}", package.filename));
+    assert!(out.join(address).is_file(), "the address names the artifact the build wrote");
+  }
+
+  #[test]
+  fn a_name_that_could_leave_its_directory_stops_the_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let err = build_with_manifest(
+      tmp.path(),
+      "pkgname = ../evil\nappname = demo\npkgver = 1.0.0\nos = openwrt\n",
+    )
+    .expect_err("the name must be refused");
+    assert!(err.contains("invalid pkgname ../evil"), "{err}");
+  }
+
+  #[test]
+  fn an_appname_a_selector_could_not_reach_stops_the_build() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let err = build_with_manifest(
+      tmp.path(),
+      "pkgname = demo@alice\nappname = demo@alice\npkgver = 1.0.0\nos = openwrt\n",
+    )
+    .expect_err("the name must be refused");
+    assert!(err.contains("invalid appname demo@alice"), "{err}");
   }
 
   /// Builds a real `.ipk` so the unpack path is exercised rather than mocked:

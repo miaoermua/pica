@@ -14,12 +14,12 @@
 //! release keeps working without being rewritten.
 
 use crate::pkgmgr::PackageManagerKind;
-use pica_pkg_core::manifest::get_scalar;
-use serde_json::Value;
+use pica_pkg_core::layout::PKG_EXTENSION;
+use pica_pkg_core::model::db::DbEntry;
 
-/// File name suffix of a Pica artifact. Feed installs record the backend name
-/// in `pkgfile` instead, which is what makes that column a usable discriminator.
-const ARTIFACT_SUFFIX: &str = ".pkg.tar.gz";
+// A Pica artifact is recognised by `PKG_EXTENSION`. Feed installs record the
+// backend name in `pkgfile` instead, which is what makes that column a usable
+// discriminator.
 
 /// How Pica obtained an installed package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,15 +87,16 @@ pub enum PkgmgrOrigin {
 }
 
 impl PkgmgrOrigin {
-  /// Describes the origin for user-facing output.
+  /// Describes the origin for user-facing output, in the run's language.
   #[must_use]
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Self::Recorded => "recorded in pkgmgr",
-      Self::LegacySource => "inferred from the legacy source field",
-      Self::LegacyPkgfile => "inferred from the legacy pkgfile field",
-      Self::Default => "no backend recorded",
-    }
+  pub fn text(self) -> String {
+    let key = match self {
+      Self::Recorded => crate::i18n::Key::OriginRecorded,
+      Self::LegacySource => crate::i18n::Key::OriginLegacySource,
+      Self::LegacyPkgfile => crate::i18n::Key::OriginLegacyPkgfile,
+      Self::Default => crate::i18n::Key::OriginDefault,
+    };
+    crate::i18n::tr(key, &[])
   }
 }
 
@@ -115,14 +116,6 @@ impl EntryBackend {
   }
 }
 
-fn entry_manifest(entry: &Value) -> &Value {
-  entry.get("manifest").unwrap_or(&Value::Null)
-}
-
-fn entry_pkgfile(entry: &Value) -> &str {
-  entry.get("pkgfile").and_then(Value::as_str).unwrap_or("")
-}
-
 /// Resolves the backend that owns an entry.
 ///
 /// The ladder only falls through when a field is missing or unreadable, so a
@@ -138,19 +131,17 @@ fn entry_pkgfile(entry: &Value) -> &str {
 /// Each field is read with [`PackageManagerKind::parse_legacy`], because a row
 /// may name the backend with the spelling it had before it became `pica`.
 #[must_use]
-pub fn entry_backend(entry: &Value) -> EntryBackend {
-  let manifest = entry_manifest(entry);
-
-  if let Some(kind) = PackageManagerKind::parse_legacy(&get_scalar(manifest, "pkgmgr")) {
+pub fn entry_backend(entry: &DbEntry) -> EntryBackend {
+  if let Some(kind) = PackageManagerKind::parse_legacy(&entry.scalar("pkgmgr")) {
     return EntryBackend { kind, origin: PkgmgrOrigin::Recorded };
   }
-  if let Some(kind) = PackageManagerKind::parse_legacy(&get_scalar(manifest, "source")) {
+  if let Some(kind) = PackageManagerKind::parse_legacy(&entry.scalar("source")) {
     return EntryBackend { kind, origin: PkgmgrOrigin::LegacySource };
   }
-  if let Some(kind) = PackageManagerKind::parse_legacy(entry_pkgfile(entry)) {
+  if let Some(kind) = PackageManagerKind::parse_legacy(&entry.pkgfile) {
     return EntryBackend { kind, origin: PkgmgrOrigin::LegacyPkgfile };
   }
-  if entry_pkgfile(entry).ends_with(ARTIFACT_SUFFIX) {
+  if entry.pkgfile.ends_with(PKG_EXTENSION) {
     return EntryBackend { kind: PackageManagerKind::Pica, origin: PkgmgrOrigin::Default };
   }
 
@@ -163,13 +154,11 @@ pub fn entry_backend(entry: &Value) -> EntryBackend {
 /// channel value: an artifact path in `pkgfile` means Pica installed it from a
 /// repository, anything else came from the backend's feeds.
 #[must_use]
-pub fn entry_source(entry: &Value) -> EntrySource {
-  let manifest = entry_manifest(entry);
-
-  if let Some(source) = EntrySource::parse(&get_scalar(manifest, "source")) {
+pub fn entry_source(entry: &DbEntry) -> EntrySource {
+  if let Some(source) = EntrySource::parse(&entry.scalar("source")) {
     return source;
   }
-  if entry_pkgfile(entry).ends_with(ARTIFACT_SUFFIX) {
+  if entry.pkgfile.ends_with(PKG_EXTENSION) {
     return EntrySource::Repo;
   }
 
@@ -183,8 +172,8 @@ mod tests {
   use pretty_assertions::assert_eq;
   use serde_json::json;
 
-  fn entry(manifest: &serde_json::Value, pkgfile: &str) -> serde_json::Value {
-    json!({ "manifest": manifest, "pkgfile": pkgfile })
+  fn entry(manifest: &serde_json::Value, pkgfile: &str) -> pica_pkg_core::model::db::DbEntry {
+    serde_json::from_value(json!({ "manifest": manifest, "pkgfile": pkgfile })).expect("a record")
   }
 
   #[test]

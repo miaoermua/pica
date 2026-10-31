@@ -1,16 +1,16 @@
 use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_REPO_INVALID, ensure_dirs};
 use crate::i18n::Key;
+use crate::i18n::tr;
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::detect_platform;
 use crate::source::{self, FetchPolicy};
-use crate::state::{Transaction, read_json_file, repo_package_sets};
+use crate::state::{Transaction, read_json_file};
 use crate::system::fetch_url;
 use pica_pkg_core::io::now_unix_secs;
-use pica_pkg_core::repo::{parse_backend_index, parse_entry_descriptor};
+use pica_pkg_core::layout::SUPPORTED_PKGMGRS;
+use pica_pkg_core::model::local_index::LocalIndex;
+use pica_pkg_core::repo::{parse_backend_index_skipping, parse_entry_descriptor};
 use serde_json::{Value, json};
-
-/// Backends a source may advertise. Kept as text so an error can list them.
-const SUPPORTED_BACKENDS: &str = "opkg, apk, pica";
 
 /// Everything one sync publishes, built before a single byte is written.
 ///
@@ -125,7 +125,7 @@ pub fn build(app: &mut App, repos: &[Value]) -> CliResult<Plan> {
 
     index["repos"]
       .as_object_mut()
-      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, "index repos is not object"))?
+      .ok_or_else(|| CliError::new(E_CONFIG_INVALID, tr(Key::IndexReposNotObject, &[])))?
       .insert(name.to_string(), repo_obj.clone());
     caches.push((name.to_string(), repo_obj));
 
@@ -191,7 +191,7 @@ fn configured_backends(
         E_CONFIG_INVALID,
         app.args(
           Key::SyncUnsupportedBackend,
-          &[&index, name, &format!("{text:?}"), SUPPORTED_BACKENDS],
+          &[&index, name, &format!("{text:?}"), &SUPPORTED_PKGMGRS.join(", ")],
         ),
       )
     })?;
@@ -237,7 +237,7 @@ fn fetch_text(
 /// `index.json` is the only entry. A source that does not serve it is reported
 /// as such; there is no second format to fall back to.
 fn sync_source(
-  app: &App,
+  app: &mut App,
   name: &str,
   root: &str,
   wanted: &[String],
@@ -280,14 +280,20 @@ fn sync_source(
     // Relative to the descriptor's own location, never to a guess about the
     // deployment (GitHub raw, a Worker and a self-hosted prefix all differ).
     let url = source::join_sibling(&entry_url, path)?;
-    let text = fetch_text(app, name, &format!("{mgr} index"), &url, policy)?;
+    let text = fetch_text(app, name, &tr(Key::IndexLabel, &[&mgr]), &url, policy)?;
 
-    let parsed = parse_backend_index(&text, mgr).map_err(|error| {
+    let (parsed, skipped) = parse_backend_index_skipping(&text, mgr).map_err(|error| {
       CliError::new(
         E_REPO_INVALID,
         app.args(Key::SyncIndexInvalid, &[name, mgr, &url, &error.to_string()]),
       )
     })?;
+    for package in skipped {
+      app.warn_args(
+        Key::SyncPackageSkipped,
+        &[name, mgr, package.field, &format!("{:?}", package.value)],
+      );
+    }
 
     indexes.insert(
       mgr.clone(),
@@ -324,13 +330,13 @@ fn join_backends(backends: &[String]) -> String {
 }
 
 fn check_index_dependencies(app: &mut App) {
-  let Ok(index) = read_json_file(&app.paths.index_file) else {
+  let Ok(index) = crate::state::read_local_index(&app.paths) else {
     return;
   };
 
   let (manager_name, checked) = {
     let Ok(package_manager) = app.package_manager() else {
-      app.log_warn("skip dependency check: no supported package manager found");
+      app.log_warn(tr(Key::SyncDepCheckNoManager, &[]));
       return;
     };
     let checked = package_manager.update_index().and_then(|()| {
@@ -352,35 +358,26 @@ fn check_index_dependencies(app: &mut App) {
   let missing = match checked {
     Ok(missing) => missing,
     Err(err) => {
-      app.log_warn(format!("skip dependency check: {}", err.message));
+      app.log_warn(tr(Key::SyncDepCheckSkipped, &[&err.message]));
       return;
     }
   };
 
   for dep in &missing {
-    app.log_warn(format!("{manager_name} feed missing dependency: {dep}"));
+    app.log_warn(tr(Key::SyncFeedMissingDep, &[&manager_name, &dep]));
   }
   if !missing.is_empty() {
-    app.log_warn(format!("Some declared dependencies are missing in {manager_name} feeds"));
+    app.log_warn(tr(Key::SyncFeedMissingSome, &[&manager_name]));
   }
 }
 
-fn collect_declared_dependencies(index: &Value) -> Vec<String> {
+fn collect_declared_dependencies(index: &LocalIndex) -> Vec<String> {
   let mut values = Vec::new();
-
-  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
-    return values;
-  };
-
-  for repo in repos.values() {
-    for packages in repo_package_sets(repo) {
-      for package in packages {
-        let manifest = package.get("manifest").unwrap_or(&Value::Null);
-        append_dep_list(&mut values, manifest.get("base"));
-        append_dep_list(&mut values, manifest.get("kmod"));
-        append_dep_list(&mut values, manifest.get("app"));
-      }
-    }
+  for (_, _, package) in index.packages() {
+    let manifest = package.manifest.as_ref().unwrap_or(&Value::Null);
+    append_dep_list(&mut values, manifest.get("base"));
+    append_dep_list(&mut values, manifest.get("kmod"));
+    append_dep_list(&mut values, manifest.get("app"));
   }
 
   values.sort();
@@ -412,31 +409,39 @@ fn append_dep_list(output: &mut Vec<String>, value: Option<&Value>) {
 
 #[cfg(test)]
 mod tests {
-  use super::{append_dep_list, collect_declared_dependencies};
+  use super::{LocalIndex, append_dep_list, collect_declared_dependencies};
   use pretty_assertions::assert_eq;
   use serde_json::json;
 
   #[test]
   fn collect_declared_dependencies_merges_and_dedups() {
+    // A sync cache holds whole, validated entries; only their manifests matter here.
+    let pkg = |name: &str, manifest: serde_json::Value| {
+      json!({
+        "pkgname": name, "pkgver": "1", "pkgrel": "1", "pkgmgr": "pica", "platform": "all",
+        "arch": "all", "filename": "f", "sha256": "0", "manifest": manifest
+      })
+    };
     let index = json!({
         "repos": {
             "r1": {
                 "indexes": {
                     "pica": {"packages": [
-                        {"manifest": {"base": ["busybox", "dnsmasq"], "kmod": "kmod-tun", "app": ["luci-app-foo", "busybox"]}},
-                        {"manifest": {"base": ["dnsmasq"], "app": "foo"}}
+                        pkg("a", json!({"base": ["busybox", "dnsmasq"], "kmod": "kmod-tun", "app": ["luci-app-foo", "busybox"]})),
+                        pkg("b", json!({"base": ["dnsmasq"], "app": "foo"}))
                     ]}
                 }
             },
             "r2": {
                 "indexes": {
-                    "apk": {"packages": [{"manifest": {"base": "busybox", "kmod": ["kmod-tun"]}}]},
-                    "opkg": {"packages": [{"manifest": {"base": "rpcd"}}]}
+                    "apk": {"packages": [pkg("c", json!({"base": "busybox", "kmod": ["kmod-tun"]}))]},
+                    "opkg": {"packages": [pkg("d", json!({"base": "rpcd"}))]}
                 }
             }
         }
     });
 
+    let index: LocalIndex = serde_json::from_value(index).expect("a sync cache");
     assert_eq!(
       collect_declared_dependencies(&index),
       vec![

@@ -172,7 +172,7 @@ mod tests {
   fn parse_simple_selector() {
     let parsed = Selector::parse("hello").expect("parse selector");
     assert_eq!(parsed.appname, "hello");
-    assert!(parsed.branch.is_empty());
+    assert_eq!(parsed.branch, "");
   }
 
   #[test]

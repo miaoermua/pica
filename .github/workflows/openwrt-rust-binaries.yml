@@ -10,12 +10,40 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "**/*.md"
+      - "clippy.toml"
+      - "dprint.json"
+      - "rustfmt.toml"
       - ".github/workflows/openwrt-rust-binaries.yml"
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Markdown formatting
+        uses: dprint/check@v2.3
+
   test:
     name: test (workspace)
     runs-on: ubuntu-latest
@@ -30,50 +58,181 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --locked -- --nocapture
+        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
 
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: test
+    needs: [lint, test]
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            toolchain: stable
+            toolchain_url: ""
+            toolchain_sha256: ""
+            linker: ""
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            toolchain: stable
+            toolchain_url: ""
+            toolchain_sha256: ""
+            linker: ""
+          # Little-endian MIPS32r2, soft-float: ramips (mt7621/mt7628) and the
+          # other mipsel_24kc routers. A tier-3 target since Rust 1.72, so it
+          # has no prebuilt std: nightly builds one from rust-src.
+          #
+          # `cross` publishes images for the gnu MIPS targets only, so this one
+          # is not built in a container. The linker and the libc that a tier-3
+          # target has no rust-std component for come from OpenWrt's own
+          # toolchain, which is what the target devices run: x86_64-hosted,
+          # checksummed by the release, and carrying the `libc.a` and crt
+          # objects a static link needs.
+          - target: mipsel-unknown-linux-musl
+            arch: mipsel
+            toolchain: nightly
+            build_std: "-Zbuild-std=std,panic_abort"
+            toolchain_url: "https://downloads.openwrt.org/releases/25.12.6/targets/ramips/mt7621/openwrt-toolchain-25.12.6-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+            toolchain_sha256: "0521891369a3f9f8d85b35ef99e84fd533f7e6f1835a96b0f09d2b98d9d08946"
+            linker: mipsel-openwrt-linux-musl-gcc
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.target }}
+          toolchain: ${{ matrix.toolchain }}
+          # A tier-3 target cannot be added; its std comes from rust-src.
+          targets: ${{ matrix.build_std == '' && matrix.target || '' }}
+          components: ${{ matrix.build_std != '' && 'rust-src' || '' }}
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
       - name: Install cross
+        if: matrix.toolchain_url == ''
         run: cargo install cross --git https://github.com/cross-rs/cross.git
 
-      - name: Build pica binaries
+      # 48 MB from a single host, on every run. Cached by checksum, so a repeat
+      # build never touches the network and a mirror outage only costs one run.
+      - name: Cache the musl cross toolchain
+        if: matrix.toolchain_url != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/toolchain
+          key: pica-toolchain-${{ matrix.target }}-${{ matrix.toolchain_sha256 }}
+
+      - name: Install the musl cross toolchain
+        if: matrix.toolchain_url != ''
+        env:
+          TOOLCHAIN: ${{ runner.temp }}/toolchain
+          LINKER: ${{ matrix.linker }}
         run: |
-          cross build --release \
-            --target "${{ matrix.target }}" \
-            -p pica-pkg-cli \
-            -p pica-pkg-pack
+          set -eu
+          mkdir -p "$TOOLCHAIN"
+          if [ ! -x "$TOOLCHAIN/bin/$LINKER" ]; then
+            archive="${RUNNER_TEMP}/toolchain.tar.zst"
+            # --speed-limit turns a stalled transfer into a failure after 30s of
+            # near-zero progress, which is the case a plain --retry waits out
+            # forever; --retry-all-errors also covers the reset and timeout
+            # cases that --retry alone ignores.
+            curl -fsSL \
+              --connect-timeout 30 --max-time 900 \
+              --retry 5 --retry-delay 5 --retry-all-errors \
+              --speed-limit 8192 --speed-time 30 \
+              -o "$archive" "${{ matrix.toolchain_url }}"
+            echo "${{ matrix.toolchain_sha256 }}  ${archive}" | sha256sum -c -
+
+            # The archive holds <release>/toolchain-<triple>/…; strip both so
+            # that bin/, lib/ (crt*.o, libc.a) and the gcc internal lib/ land
+            # where the driver looks for them.
+            rm -rf "$TOOLCHAIN"
+            mkdir -p "$TOOLCHAIN"
+            tar --zstd -xf "$archive" -C "$TOOLCHAIN" --strip-components=2
+            rm -f "$archive"
+          fi
+
+          test -x "$TOOLCHAIN/bin/$LINKER"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+          # rustc passes -lunwind for every musl target, expecting the
+          # libunwind.a that rust-std ships in lib/self-contained for the tier-1
+          # ones. A tier-3 target has no rust-std at all, and OpenWrt's toolchain
+          # carries no libunwind either: the unwinder gcc itself uses is
+          # libgcc_eh.a, which exports the same _Unwind_* ABI that Rust's
+          # unwinder needs. Dropped next to libc.a so the driver's own -L finds
+          # it before -lunwind is reached.
+          gcc_lib=$(dirname "$(find "$TOOLCHAIN/lib/gcc" -name libgcc_eh.a -print -quit)")
+          cp -f "$gcc_lib/libgcc_eh.a" "$TOOLCHAIN/lib/libunwind.a"
+
+      # Costs a second, and turns a broken toolchain into an error here instead
+      # of "cannot find crt1.o" ten minutes into building std.
+      - name: Verify the cross toolchain
+        if: matrix.toolchain_url != ''
+        env:
+          PICA_TOOLCHAIN: ${{ runner.temp }}/toolchain
+          PICA_CC: ${{ runner.temp }}/toolchain/bin/${{ matrix.linker }}
+          # The toolchain specs insert `-L %:getenv(STAGING_DIR /usr/lib)` and
+          # warn when it is unset. Unset also means the host /usr/lib joins the
+          # link line, which is exactly the kind of library a cross link must
+          # never see. Point it at a directory that does not exist: the toolchain
+          # carries everything, and installed packages are not part of this job.
+          STAGING_DIR: ${{ runner.temp }}/staging
+        run: |
+          set -eu
+          echo "sysroot: $("$PICA_CC" -print-sysroot)"
+          for f in crt1.o crti.o crtbegin.o crtend.o crtn.o libc.a libunwind.a; do
+            path=$("$PICA_CC" -print-file-name="$f")
+            echo "$f -> $path"
+            case "$path" in
+              /*) test -f "$path" || { echo "::error::$f missing at $path"; exit 1; } ;;
+              *) echo "::error::$f not found by the driver"; exit 1 ;;
+            esac
+          done
+
+          # A one-line static link exercises the shim and everything under it.
+          tmp=$(mktemp -d)
+          printf 'int main(void) { return 0; }\n' > "$tmp/main.c"
+          "$GITHUB_WORKSPACE/.github/scripts/openwrt-linker.sh" \
+            -static -o "$tmp/main" "$tmp/main.c"
+          file "$tmp/main"
+          file "$tmp/main" | grep -q MIPS
+
+      - name: Build pica binaries
+        env:
+          PICA_TOOLCHAIN: ${{ runner.temp }}/toolchain
+          PICA_CC: ${{ runner.temp }}/toolchain/bin/${{ matrix.linker }}
+          STAGING_DIR: ${{ runner.temp }}/staging
+        run: |
+          set -eu
+          args=(--release --target "${{ matrix.target }}"
+                -p pica-pkg-cli -p pica-pkg-pack ${{ matrix.build_std }})
+
+          if [ "${{ matrix.toolchain_url }}" != "" ]; then
+            triple=$(printf '%s' "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+            # Not the toolchain's gcc directly: it takes the crt objects by bare
+            # name, which ld only searches for in the directory the toolchain
+            # was built in. The shim rewrites them to real paths first.
+            export "CARGO_TARGET_${triple}_LINKER=$GITHUB_WORKSPACE/.github/scripts/openwrt-linker.sh"
+            # This target defaults to dynamic linking, unlike the two musl
+            # targets above, so the artifact would depend on the device's musl
+            # and libgcc_s. Static, like every other artifact Pica publishes.
+            export "CARGO_TARGET_${triple}_RUSTFLAGS=-C target-feature=+crt-static"
+
+            cargo "+${{ matrix.toolchain }}" build "${args[@]}"
+          else
+            cross "+${{ matrix.toolchain }}" build "${args[@]}"
+          fi
 
       - name: Prepare artifacts
         id: prepare_artifacts
         run: |
           mkdir -p dist
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            arch=amd64
-          else
-            arch=arm64
-          fi
+          arch="${{ matrix.arch }}"
 
           cp "target/${{ matrix.target }}/release/pica" "dist/pica.${arch}"
           cp "target/${{ matrix.target }}/release/pica-pack" "dist/pica-pack.${arch}"

@@ -1,11 +1,10 @@
-use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_INDEX_INVALID, ensure_dirs};
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, ensure_dirs};
 use crate::i18n::Key;
 use crate::pkgmgr::PackageManagerKind;
 use crate::platform::{ArchVerdict, HostArches, check_arch, detect_os, detect_package_arches};
-use crate::state::{read_json_file, repo_package_sets};
+use crate::state::read_local_index;
+use pica_pkg_core::repo::Package;
 use pica_pkg_core::selector::Selector;
-use pica_pkg_core::version::pkgver_cmp_key;
-use serde_json::Value;
 use std::cell::OnceCell;
 
 pub(crate) fn find_pica_candidates_in_index(
@@ -48,30 +47,35 @@ fn arch_offerable(app: &App, host_arches: &OnceCell<HostArches>, pkg_arch: &str)
 /// which backends were searched keeps the client from quietly answering with
 /// the wrong artifact.
 #[must_use]
-pub(crate) fn not_found_hint(app: &App) -> String {
+pub(crate) fn not_found_hint(app: &App, selector: &str) -> String {
+  let near = Selector::parse(selector)
+    .map(|parsed| crate::commands::search::suggestions(app, &parsed.appname))
+    .unwrap_or_default();
+  let suggestion = if near.is_empty() {
+    String::new()
+  } else {
+    app.args(Key::NotFoundSuggest, &[&near.join(", ")])
+  };
+  format!("{}{suggestion}", sources_hint(app))
+}
+
+fn sources_hint(app: &App) -> String {
   let backend = app
     .package_manager()
     .map_or_else(|_| "unknown".to_string(), |manager| manager.kind().as_str().to_string());
 
   let unsynced = || app.args(Key::NotFoundHintSources, &[&backend]);
 
-  let Ok(index) = read_json_file(&app.paths.index_file) else {
+  let Ok(index) = read_local_index(&app.paths) else {
     return unsynced();
   };
-  let Some(repos) = index.get("repos").and_then(Value::as_object) else {
-    return unsynced();
-  };
-
-  if repos.is_empty() {
+  if index.repos.is_empty() {
     return unsynced();
   }
 
   let mut parts = Vec::new();
-  for (name, repo) in repos {
-    let Some(list) = repo.get("backends").and_then(Value::as_array) else {
-      continue;
-    };
-    let provided = list.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+  for (name, repo) in &index.repos {
+    let provided = repo.backends.join(", ");
     if provided.is_empty() {
       continue;
     }
@@ -82,6 +86,54 @@ pub(crate) fn not_found_hint(app: &App) -> String {
     return unsynced();
   }
   app.args(Key::NotFoundHintRepos, &[&backend, &parts.join("; ")])
+}
+
+/// Why an index entry cannot be installed on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotOffered {
+  Os,
+  Backend,
+  Arch,
+}
+
+impl NotOffered {
+  pub(crate) fn as_str(self) -> &'static str {
+    match self {
+      Self::Os => "os",
+      Self::Backend => "backend",
+      Self::Arch => "arch",
+    }
+  }
+}
+
+/// Whether `pkg` could be installed here, with the backend in use.
+pub(crate) fn offerable(
+  app: &App,
+  host_arches: &OnceCell<HostArches>,
+  host_os: &str,
+  host_backend: PackageManagerKind,
+  pkg: &Package,
+) -> Result<(), NotOffered> {
+  let pkg_os = pkg.os.as_deref().unwrap_or("");
+  if !(pkg_os.is_empty() || pkg_os == "all" || pkg_os == host_os) {
+    return Err(NotOffered::Os);
+  }
+  // Backend identity: a `pica` package ships a payload Pica installs itself
+  // and needs nothing from the host, so it matches anywhere. `opkg` and
+  // `apk` packages need their own backend to be the one in use here.
+  let backend_match = match PackageManagerKind::parse(&pkg.pkgmgr) {
+    Some(kind) => !kind.requires_system_binary() || host_backend == kind,
+    None => false,
+  };
+  if !backend_match {
+    return Err(NotOffered::Backend);
+  }
+  // An index publishes one entry per architecture, so this is what keeps a
+  // device from picking a sibling's artifact and failing the precheck.
+  if !arch_offerable(app, host_arches, &pkg.arch) {
+    return Err(NotOffered::Arch);
+  }
+  Ok(())
 }
 
 /// The search itself, judged against a host the caller names.
@@ -95,138 +147,66 @@ fn find_candidates_for_host(
 ) -> CliResult<Vec<RepoCandidate>> {
   ensure_dirs(&app.paths)?;
 
-  let index = read_json_file(&app.paths.index_file)?;
+  let index = read_local_index(&app.paths)?;
   let parsed = Selector::parse(selector).map_err(|err| CliError::new(E_CONFIG_INVALID, err))?;
   let host_os = detect_os();
   let host_backend = app.backend();
 
   let mut out = Vec::new();
-
-  let repos = index
-    .get("repos")
-    .and_then(Value::as_object)
-    .ok_or_else(|| CliError::new(E_INDEX_INVALID, "missing index: run 'pica -S' first"))?;
-
-  for (repo_name, repo_entry) in repos {
-    let repo_url = repo_entry.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-    let allow_insecure_http =
-      repo_entry.get("allow_insecure_http").and_then(Value::as_bool).unwrap_or(false);
-    // One index per backend, as the entry descriptor named them; the backend
-    // each package declares still decides whether it can be installed here.
-    let package_sets = repo_package_sets(repo_entry);
-    if package_sets.is_empty() {
+  for (repo_name, repo, pkg) in index.packages() {
+    if pkg.app_key() != parsed.appname {
+      continue;
+    }
+    let branch = pkg.branch.clone().unwrap_or_default();
+    if !parsed.branch.is_empty() && branch != parsed.branch {
       continue;
     }
 
-    for pkg in package_sets.iter().flat_map(|packages| packages.iter()) {
-      let pkgname = pkg.get("pkgname").and_then(Value::as_str).unwrap_or("").to_string();
-      let appname = pkg.get("appname").and_then(Value::as_str).unwrap_or(&pkgname).to_string();
-      let branch = pkg.get("branch").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkgver = pkg.get("pkgver").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkgrel = pkg.get("pkgrel").and_then(Value::as_str).unwrap_or("").to_string();
-      let protocol = pkg.get("protocol").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkg_url = pkg
-        .get("url")
-        .or_else(|| pkg.get("origin"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-      let luci_url = pkg.get("luci_url").and_then(Value::as_str).unwrap_or("").to_string();
-      let luci_desc = pkg.get("luci_desc").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkgmgr = pkg.get("pkgmgr").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkgdesc = pkg
-        .get("pkgdesc")
-        .and_then(Value::as_str)
-        .or_else(|| {
-          pkg.get("manifest").and_then(|manifest| manifest.get("pkgdesc")).and_then(Value::as_str)
-        })
-        .unwrap_or("")
-        .to_string();
-      let pkg_platform = pkg.get("platform").and_then(Value::as_str).unwrap_or("").to_string();
-      let pkg_arch = pkg.get("arch").and_then(Value::as_str).unwrap_or("").to_string();
-      let size = index_bytes(pkg, "size");
-      let csize = index_bytes(pkg, "csize");
-      let filename = pkg.get("filename").and_then(Value::as_str).unwrap_or("").to_string();
-      let download_url = pkg.get("download_url").and_then(Value::as_str).map(ToString::to_string);
-      let min_pica = pkg.get("pica").and_then(Value::as_str).map(ToString::to_string);
-      let sha256 = pkg.get("sha256").and_then(Value::as_str).unwrap_or("").to_string();
-
-      if appname != parsed.appname {
-        continue;
-      }
-      if !parsed.branch.is_empty() && branch != parsed.branch {
-        continue;
-      }
-
-      let pkg_os = pkg.get("os").and_then(Value::as_str).unwrap_or("").to_string();
-
-      let os_match = pkg_os.is_empty() || pkg_os == "all" || pkg_os == host_os;
-      if !os_match {
-        continue;
-      }
-
-      // Backend identity: a `pica` package ships a payload Pica installs itself
-      // and needs nothing from the host, so it matches anywhere. `opkg` and
-      // `apk` packages need their own backend to be the one in use here.
-      let backend_match = match PackageManagerKind::parse(&pkgmgr) {
-        Some(kind) => !kind.requires_system_binary() || host_backend == kind,
-        None => false,
-      };
-      if !backend_match {
-        continue;
-      }
-
-      // An index publishes one entry per architecture, so this is what keeps a
-      // device from picking a sibling's artifact and failing the precheck.
-      if !arch_offerable(app, host_arches, &pkg_arch) {
-        continue;
-      }
-
-      out.push(RepoCandidate {
-        cmpver: pkgver_cmp_key(&pkgver, &pkgrel),
-        repo: repo_name.clone(),
-        url: repo_url.clone(),
-        appname,
-        branch,
-        pkgver,
-        pkgrel,
-        protocol,
-        pkg_url,
-        luci_url,
-        luci_desc,
-        pkgmgr,
-        pkgdesc,
-        os: pkg_os,
-        platform: pkg_platform,
-        arch: pkg_arch,
-        size,
-        csize,
-        filename,
-        download_url,
-        min_pica,
-        sha256,
-        pkgname,
-        allow_insecure_http,
-      });
+    if offerable(app, host_arches, &host_os, host_backend, pkg).is_err() {
+      continue;
     }
+    let pkg_os = pkg.os.clone().unwrap_or_default();
+
+    let text = |value: &Option<String>| value.clone().unwrap_or_default();
+    out.push(RepoCandidate {
+      cmpver: pkg.version_key(),
+      repo: repo_name.to_string(),
+      url: repo.url.clone(),
+      appname: pkg.app_key().to_string(),
+      branch,
+      pkgver: pkg.pkgver.clone(),
+      pkgrel: pkg.pkgrel.clone(),
+      protocol: text(&pkg.protocol),
+      pkg_url: pkg.url.clone().or_else(|| pkg.origin.clone()).unwrap_or_default(),
+      luci_url: text(&pkg.luci_url),
+      luci_desc: text(&pkg.luci_desc),
+      pkgmgr: pkg.pkgmgr.clone(),
+      pkgdesc: pkg
+        .pkgdesc
+        .clone()
+        .or_else(|| {
+          pkg
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.get("pkgdesc"))
+            .and_then(|value| value.as_str().map(ToString::to_string))
+        })
+        .unwrap_or_default(),
+      os: pkg_os,
+      platform: pkg.platform.clone(),
+      arch: pkg.arch.clone(),
+      size: pkg.size,
+      csize: pkg.csize,
+      filename: pkg.filename.clone(),
+      download_url: pkg.download_url.clone(),
+      min_pica: pkg.pica.clone(),
+      sha256: pkg.sha256.clone(),
+      pkgname: pkg.pkgname.clone(),
+      allow_insecure_http: repo.allow_insecure_http,
+    });
   }
 
   Ok(out)
-}
-
-/// A byte figure the index records: `size` (installed volume) or `csize`
-/// (compressed artifact).
-///
-/// `None` means the index does not record the figure. A recorded 0 is returned
-/// as 0 and left for the caller to interpret — it is not folded into `None`
-/// here, because "the index says zero" and "the index says nothing" are
-/// different facts even when neither can be shown.
-fn index_bytes(pkg: &Value, key: &str) -> Option<u64> {
-  match pkg.get(key) {
-    Some(Value::Number(number)) => number.as_u64(),
-    Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
-    _ => None,
-  }
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +244,7 @@ pub(crate) struct RepoCandidate {
 mod tests {
   use super::*;
   use crate::app::{FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
-  use serde_json::json;
+  use serde_json::{Value, json};
   use std::fs;
   use std::path::Path;
 
@@ -294,10 +274,12 @@ mod tests {
       pkgmgr: None,
       optional_deps: OptionalDeps::None,
       lang: None,
+      dry_run: false,
+      noconfirm: false,
     };
 
     let mut app = App::new(paths, options);
-    app.select_package_manager(PackageManagerKind::Pica.as_str()).expect("force the pica backend");
+    app.with_backend_for_tests(PackageManagerKind::Pica);
     app
   }
 

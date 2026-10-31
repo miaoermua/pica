@@ -43,10 +43,10 @@
 `<suffix>` 只由 `pkgmgr` 单向生成，永不反向解析：
 
 | `pkgmgr` | `<suffix>` |
-| --- | --- |
-| `opkg` | `-opkg` |
-| `apk` | `-apk` |
-| `pica` | `-pica` |
+| -------- | ---------- |
+| `opkg`   | `-opkg`    |
+| `apk`    | `-apk`     |
+| `pica`   | `-pica`    |
 
 说明：
 
@@ -71,12 +71,12 @@
 
 `scripts/` 中约定的文件名与 `manifest` 的对应关系：
 
-| 文件 | `manifest` 字段 | 执行时机 |
-| --- | --- | --- |
-| `scripts/install` | `script_install` | 首次安装时执行 |
-| `scripts/update` | `script_update` | 覆盖安装/升级时执行 |
-| `scripts/remove` | `script_remove` | 卸载时执行 |
-| `scripts/.env` | — | 提供默认 `PICA_KEEP_SCRIPT_*` 策略 |
+| 文件              | `manifest` 字段  | 执行时机                           |
+| ----------------- | ---------------- | ---------------------------------- |
+| `scripts/install` | `script_install` | 首次安装时执行                     |
+| `scripts/update`  | `script_update`  | 覆盖安装/升级时执行                |
+| `scripts/remove`  | `script_remove`  | 卸载时执行                         |
+| `scripts/.env`    | —                | 提供默认 `PICA_KEEP_SCRIPT_*` 策略 |
 
 `root/` 内的路径必须是相对路径，且不得包含 `..`、不得以 `/` 开头；安装时若发现逃逸路径会直接拒绝该包。
 
@@ -120,10 +120,10 @@ Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交
 
 `pkgmgr = apk|opkg` 时，`pkgs/` 里的容器由系统包管理器安装。Pica 只把**归档解包后落在临时目录里的容器文件路径**交给后端，自己不打开它；“按名字从仓库安装”是另一种请求，两者不加同一个参数：
 
-| 请求 | 命令形态 | 信任来源 |
-| --- | --- | --- |
-| Pica 归档里的本地容器 | `apk add --allow-untrusted [--force-non-repository] -- <path>` | Pica 对归档自身的校验（`repo` 渠道安装时先比对 `repo.json` 的 `sha256`）；`--pkgmgr`/`-U` 手工指定的文件由操作者自己负责 |
-| 仓库包（`app/base/kmod` 清单） | `apk add -- <name>` | apk 自己的仓库与签名机制，Pica 不做任何放宽 |
+| 请求                           | 命令形态                                                       | 信任来源                                                                                                            |
+| ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Pica 归档里的本地容器          | `apk add --allow-untrusted [--force-non-repository] -- <path>` | Pica 对归档自身的校验（`repo` 渠道安装时先比对后端索引的 `sha256`）；`--pkgmgr`/`-U` 手工指定的文件由操作者自己负责 |
+| 仓库包（`app/base/kmod` 清单） | `apk add -- <name>`                                            | apk 自己的仓库与签名机制，Pica 不做任何放宽                                                                         |
 
 - **`--allow-untrusted`**：豁免 apk 对包签名的检查。Pica 归档里的 `.apk` 不一定由本机信任的密钥签名，所以要装就得放宽；请把它理解为“信任的是这个归档，而不是这个 `.apk` 的签名”。仓库包（按名字安装）永远不会带上这个参数。
 - **`--force-non-repository`**：apk-tools 3.x（OpenWrt 25.12 及以后）会拒绝安装不属于任何已配置仓库的软件包，本地文件因此需要显式允许；2.x 没有这个选项，传入未知选项会让命令直接失败，所以 Pica 先读 `apk --version` 的大版本号：**≥3 才加，2.x 不加，读不出来时按需要加处理**（读不出来时更可能遇上 3.x 的拒绝，而多传参数会以 `unrecognized option` 明确报错并提示改配置）。
@@ -144,15 +144,18 @@ Pica 不打开 `.ipk`/`.apk` 来安装、记账或求解依赖：容器一律交
 
 ## pica-pack 输出目录约定
 
-默认情况下（不传 `--outdir`），`pica-pack` 输出到 `pica-pack/bin/<pkgname>/<backend>/`：
+不传 `--outdir` 时，输出根目录是 `pica-pack` 可执行文件所在目录下的 `bin/<pkgname>/`：
 
 ```
-pica-pack/bin/<pkgname>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>-opkg.pkg.tar.gz
-pica-pack/bin/<pkgname>/apk/<pkgname>-<pkgver>-<pkgrel>-<arch>-apk.pkg.tar.gz
-pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
+<outdir>/index.json                 入口描述
+<outdir>/opkg/index.json            后端索引
+<outdir>/opkg/SHA256SUMS
+<outdir>/opkg/<pkgname>-<pkgver>-<pkgrel>-<arch>-opkg.pkg.tar.gz
+<outdir>/apk/...
+<outdir>/pica/...
 ```
 
-每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。
+每个后端都有自己的子目录。后端由目录表达，而不是从扩展名推断。输出根目录可以原样发布为软件源：索引条目的 `download_url` 写的是相对源根的 `<backend>/<filename>`。
 
 ## 软件源地址：根地址、入口描述与后端索引
 
@@ -201,7 +204,8 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 ## 下载地址与协议策略
 
-- `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，与入口描述里的 manager path 同一套校验。
+- `download_url` 可以是绝对 URL（`http` / `https` / `file`），也可以是相对路径：相对路径按源根地址解析，校验规则与入口描述里的 manager path 相同，另外允许 `@`、`+`、`~`，因为文件名里会出现它们。
+- 条目没有 `download_url` 时，下载地址回落为 `<root>/packages/<filename>`。`pica-pack` 写出的索引总是带这个字段（文件名含相对路径不允许的字符时除外，此时构建告警）。
 - 公网明文 HTTP 默认拒绝；本机回环、私有网段、链路本地地址允许明文 HTTP（局域网自建源就是这类）；每个源可用 `allow_insecure_http` 单独放行公网明文。远端源不得通过 `file://` 让客户端读本机文件，本地源（`file://` 根地址）不受此限。
 - 重定向逐跳检查：每一跳都按上述策略重新判定，最多 5 跳；`https` 不得重定向到 `http`。
 - `sha256` 校验失败即失败：不换用其他地址、不重试下一个源、不进入缓存。
@@ -212,6 +216,7 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 
 - `schema` 必须为 `1`，`mgr` 必须等于它在入口描述里的键
 - `packages` 必须为数组
+- `pkgname`、`appname` 必须符合「包命名」一节的字符集；不符合的条目被跳过并告警，其余条目照常同步
 - 每个 package 项必须包含非空字符串字段：
   - `pkgname`
   - `pkgver`
@@ -234,11 +239,12 @@ pica-pack/bin/<pkgname>/pica/<pkgname>-<pkgver>-<pkgrel>-<arch>-pica.pkg.tar.gz
 - 未识别的额外字段会被原样保留（`flatten`），不会在同步时丢失
 
 安装阶段（`-S <selector>`/`-Sp`）在下载后、写入缓存和安装前，必须校验下载文件 SHA-256 与索引条目的 `sha256` 一致，否则失败。
+
 - 可选 `download_url`（若提供）必须是 `http://`、`https://` 或 `file://`，或一条安全的相对路径（相对源根地址解析），用于覆盖默认下载路径
 
 同后端同名包在同一索引中只允许出现一次；`opkg`、`apk`、`pica` 三种后端的同名包可以并存，因为 `pkgmgr` 参与包身份。
 
-任一约束不满足，`pica -S` 会拒绝该源。
+除上述名字规则外，任一约束不满足，`pica -S` 都会拒绝该源。
 
 ## URL 安装
 
@@ -277,6 +283,7 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 - 渠道解析：`source` 为可识别渠道时直接用；否则按 `pkgfile` 是否为归档路径判定 `pica` 或 `feed`。
 - 第 2~5 档属于推断，`pica -R` 会打出 warning 说明后端来源；`-Qi` 展示的是归一化后的渠道与后端。
 - `-Qi` 只打印**有值**的字段：某字段在这条记录里为空（旧记录没有 `pkgver`、包本身没有 `license`）就整行省略，不打出“标签 + 空值”。空标签比省略更少信息，还会让人以为值曾经存在。`Name` 是唯一的例外——它是这条记录的标识，行行都有。字段取值的列宽固定为 16 字符，省略某行不会让下面的行错位。
+- **升级清理旧版独有文件**：升级（同 `pkgname` 再次安装）在新记录写入 `db.json` 之后，删除旧记录里有、新版本没有部署的路径。仍被其他 Pica 包记录的路径、被系统后端（`opkg`/`apk`）认领的路径不删。删除失败只告警，不回滚已经完成的升级。旧版本记录的目录若已为空也会删除。
 - `db.json` 是**已记录安装状态的唯一依据**：`-Qi`、`-R`、`-U` 只读它。同一状态目录下的 `install-report.json` 描述的是**最近一次尝试**（`precheck`、`dependency_diff` 等审计信息），其中的后端包可能已在同一次失败中被回滚。它只在数据库写成功之后才写，写失败只告警，所以报告可能比数据库旧；一次干净回滚的失败既不写库也不写报告，“没有报告”既不代表“没装”，也不代表“装成功过”。判断设备上装了什么、`-R` 能不能删，一律看 `db.json`。
 
 ## JSON 输出（显式开启）
@@ -285,8 +292,41 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
 
 可选参数：
 
-- `--json`：启用 JSON 输出（成功/失败）
+- `--json`：启用 JSON 输出（成功/失败）。`-Q`、`-Qi`、`-Ql`、`-Qs`、`-Qo`、`-Qu`、`-Si`、`-Ss`、`-Sl` 成功时输出一行描述查询结果的 JSON 对象，取代默认的 `{"ok": true, ...}`。
 - `--json-errors`：仅失败时输出 JSON
+
+### 错误码
+
+`--json-errors` 输出的 `code` 只会是下列值，不随界面语言变化：
+
+| `code`                   |
+| ------------------------ |
+| `E_RUNTIME`              |
+| `E_ARG_INVALID`          |
+| `E_IO`                   |
+| `E_JSON_INVALID`         |
+| `E_DB_INVALID`           |
+| `E_INDEX_INVALID`        |
+| `E_INDEX_UNAVAILABLE`    |
+| `E_CONFIG_INVALID`       |
+| `E_POLICY_INVALID`       |
+| `E_REPO_INVALID`         |
+| `E_MISSING_COMMAND`      |
+| `E_LOCK_BUSY`            |
+| `E_OPKG_INSTALL`         |
+| `E_OPKG_REMOVE`          |
+| `E_NO_SPACE`             |
+| `E_MANIFEST_INVALID`     |
+| `E_PACKAGE_INVALID`      |
+| `E_PLATFORM_UNSUPPORTED` |
+| `E_VERSION_INCOMPATIBLE` |
+| `E_INTEGRITY_INVALID`    |
+| `E_NOT_INTERACTIVE`      |
+| `E_PKGMGR_INSTALL`       |
+| `E_PKGMGR_REMOVE`        |
+| `E_CANCELLED`            |
+
+后端安装、卸载失败时，`apk` 报 `E_PKGMGR_INSTALL` / `E_PKGMGR_REMOVE`；`opkg` 保留旧名 `E_OPKG_INSTALL` / `E_OPKG_REMOVE`。用户在确认提示中回答"否"时报 `E_CANCELLED`，此时系统未做任何更改。
 
 ## 非交互与来源策略
 
@@ -300,6 +340,13 @@ pica -U https://example.invalid/pkgs/hello-0.2.8-1-all-opkg.pkg.tar.gz
   - `feed-only`
   - `packaged-only`
 - `--with-optional` / `--no-optional`：全装 / 全不装可选依赖（`?`），默认在终端上询问、非终端一个不装（见「可选依赖（`?`）」）。两者互斥。
+
+## 执行计划、确认与 `--dry-run`
+
+- 安装（`-S`、`-Sp`、`-U`）在依赖预检之后、第一次改动系统之前停一下：此时屏幕上已有事务标题、索引给出的大小、每个依赖的来源和载荷的文件数与字节数。`-So` 展示要交给后端的包名，`-R` 展示要删除的文件数和要交给后端卸载的包名，`-Su` 展示全部待升级的包及版本变化。
+- **确认**：stdin 是终端时询问 `Proceed? [Y/n]`；回答否则以 `E_CANCELLED` 退出，系统未做任何更改。`--noconfirm`（别名 `--yes`）、`--non-interactive`、stdin 不是终端时不询问，行为与引入确认之前一致。
+- **`--dry-run`**：展示计划后结束，退出码 0，不写 `db.json`、不写安装报告、不铺放文件、不调用后端的安装或卸载。解包、校验、依赖预检照常执行（预检可能刷新后端索引）。`setup` 与不带目标的 `-S`（同步）不接受 `--dry-run`，返回 `E_ARG_INVALID`。
+- **多个目标**：`-S`、`-Sp`、`-U`、`-R` 接受多个目标。先列出目标并确认一次，再逐个执行，每个目标是独立的事务；某个失败不影响后续目标，结束时汇总成功与失败数。有失败时以第一个失败的错误码退出。`-Si`、`-Qi`、`-Ql`、`-Qo`、`-So` 只接受一个参数，多余参数报 `E_ARG_INVALID`。
 
 ## 依赖索引：答不出来就不答
 
@@ -337,6 +384,8 @@ pica 自己回答"某个包在不在本机配置的源里"时（`-S` 的来源�
 - `arch`：OpenWrt/opkg 定义的架构字段（可通过 `opkg print-architecture` 查看），推荐统一使用 `all`
 
 `platform` 仍然保留，但它只用于应用商店/仓库展示与筛选，不作为安装的硬性门槛。
+
+没有包管理器能报告架构列表时（`pica` 后端且本机无 opkg/apk），`arch` 退回与 `uname -m` 比较。MIPS 内核的 `uname -m` 对大小端都只报 `mips`（或 `mips64`），而软件包把小端写作 `mipsel_*`；此时按 `pica` 二进制自身的字节序补全，小端设备按 `mipsel` / `mips64el` 比较。`uname` 字段本身仍与 `uname -m` 原样严格匹配，不做这种补全。
 
 在需要展示时（日志、查询）应同时展示 `os + platform + arch + uname`（若 `uname` 未提供则可省略）。
 
@@ -404,7 +453,6 @@ luci_url = https://github.com/openwrt/luci/tree/master/applications/luci-app-hel
 branch = stable
 protocol = luci
 luci_desc = LuCI plugin for hello service
-source = pica
 
 # Optional strong compatibility gate
 # uname = aarch64
@@ -535,18 +583,14 @@ luci = lua1
 - 如果包内无任何生命周期脚本，视为无生命周期包：安装/升级/卸载均不会触发脚本执行。
 - 载荷至少提供其一，否则构建与安装都会以“空包”拒绝：对每个后端而言，`scripts/` 与 `root/` 都算；`pkgs/<backend>/` 只对 `opkg`/`apk` 算。所以一个只放 `pkgs/opkg/` 的 `pkgdir` 能产出 opkg 包，但同一份 `targets` 里的 `pica` 产物会因为没有任何文件而被拒绝。
 - 可在 `scripts/.env` 中声明保留策略：`PICA_KEEP_SCRIPT_INSTALL/PICA_KEEP_SCRIPT_UPDATE/PICA_KEEP_SCRIPT_REMOVE/PICA_KEEP_SCRIPT_ALL`（布尔值）。
-- 升级时旧的一组保留脚本不是直接删除，而是先重命名到 `/usr/lib/pica/scripts/<pkgname>.rollback`，并在旁边写一份 `<pkgname>.rollback.json`：`schema` / `txid` / `pkgname` / `pkgver` / `pkgrel` / `state`。`state=pending` 在复制新脚本**之前**写入；`state=committed` 只在 `record_installation` 返回成功后写入，因此它同时证明数据库记录已落盘——这是 marker 与数据库之间唯一的对应关系，版本号相同并不能证明任何事。
-- 备份生命周期：安装成功 → 标 `committed` → 删除备份与 marker；安装失败（含之后 `root/` 部署失败）→ 本次写入的脚本被清掉、备份改回原名恢复、marker 一并删除。
-- 下一次安装如果发现遗留的 `.rollback`：`committed` 的**删除**（旧脚本已被取代）；`pending`、marker 缺失、marker 损坏或 schema 不认识的一律**移到了 `<pkgname>.rollback.<txid>` 并原样保留**，只告警并给出新路径——它可能是这些脚本的唯一副本，不能猜它已完成。marker **文件只要存在就随备份一起迁移**，解析失败也照样搬走、内容不动，不会被新备份覆盖；`committed` 的备份目录已删但 marker 删不掉时，本次升级**不做新备份**。只有 marker、没有对应备份目录时（两次改名之间中断，或 marker 删除失败），marker 会被改名为 `.orphan.<txid>` 保留；这个目标名同样先独占占位，占不到就保持原样、本次不备份。移走时目录目标名也用独占创建占位：那里已经有文件、空目录或非空目录时一律不改动它，按移走失败处理（本次升级不做备份，新脚本不随回滚删除）；marker 的目标名占不到时把备份目录移回原名，避免出现“目录走了、marker 留在原处”的错位。
-- 恢复失败时备份留在原处，路径写进错误信息，且不写进失败记录，`-R` 不会删它。marker 写不进去时，旧目录会被改回原名并继续安装（本次没有脚本回滚）；改回也失败则安装中止并报出备份路径。
-- 这套 marker 只解决"遗留备份如何安全分类与让路"，**不是完整的崩溃恢复**：进程在任意时刻被终止时，仍可能出现记录与磁盘不一致、需要人工处理的状态。
+- 升级时旧的一组保留脚本按整组替换：旧脚本先复制进本次事务的备份（与 `root/` 被覆盖文件用同一个备份目录 `/var/lib/pica/cache/backup/`），再清空目录写入新脚本；新版本不再保留的脚本因此不会残留。安装失败（含之后 `root/` 部署失败）时旧脚本随事务回滚放回，安装成功后备份随事务一起删除。
 - 每次命令事务结束都会打印 `正在清理 pica 缓存`，并清理 `/var/lib/pica/cache/pkgs/` 目录内容。
 
 - `type` 允许声明应用形态标签，便于 pica 在安装阶段做额外兼容检查。
 - `type = luci` 表示“该包包含/依赖 LuCI Web UI”。如果声明了 `type = luci`，必须同时声明 `luci = lua1|js2`。
 - `type = cli` 表示“该包提供纯命令行程序/脚本”。
 - 仅声明 `type = cli` 时，不需要 `luci = ...`。
-- `source` 用于记录安装来源（例如 `pica` / `opkg` / `local` / `url`），便于升级与排错。默认可不写；安装后 CLI 会在本地数据库里补全 `source`。
+- `source` 不需要写：安装时写入 `db.json` 的 `source` 由实际渠道决定，manifest 里的值不参与决策。
 
 ### 依赖版本约束（`app` / `base` / `kmod`）
 
@@ -598,13 +642,13 @@ kmod = kmod-tun>=0.1?
 
 装不装由 `--with-optional` / `--no-optional` 决定，默认是"能问就问"：
 
-| 情况 | 行为 |
-| --- | --- |
-| 默认、stdin 是终端 | 列出可选项，按编号、`all` 或回车跳过 |
+| 情况                                       | 行为                                                       |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| 默认、stdin 是终端                         | 列出可选项，按编号、`all` 或回车跳过                       |
 | 默认、stdin 不是终端或 `--non-interactive` | 一个不装；不是终端时在 stderr 说明可以用 `--with-optional` |
-| `--with-optional` | 所有可装的可选项都装，不询问、不需要终端 |
-| `--no-optional` | 一个不装，也不输出上一条提示 |
-| 两个一起给 | `E_ARG_INVALID`，不猜哪个优先 |
+| `--with-optional`                          | 所有可装的可选项都装，不询问、不需要终端                   |
+| `--no-optional`                            | 一个不装，也不输出上一条提示                               |
+| 两个一起给                                 | `E_ARG_INVALID`，不猜哪个优先                              |
 
 - "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
 - 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。已装但版本不满足声明的约束时，`outcome` 仍是 `installed_before`（这次安装确实不会动它），但选择器会写明"已装版本不满足声明的约束（约束原文）"，报告条目带 `bound_satisfied: false`——与预检条目同名同义，只写否定，键缺席即这次没有可比的版本。
@@ -659,17 +703,19 @@ luci-i18n-myapp-zh-cn # i18n
 pica 用两个字段承载“名字”，职责不同，不能混用：
 
 - `appname`：纯上游应用名，是命令行的选择键。`Package::app_key()` 取 `appname`（为空时回落到 `pkgname`）；`pica -S <app>` 收集候选时只按 `appname` 匹配，与它来自哪个源、`pkgname` 是什么无关。
-- `pkgname`：这个包在 pica 源里的唯一身份，原样写进产物文件名（`pica-pack` 只要求它非空，不校验字符集）。区分“谁做的 / 什么形态”的后缀只加在 `pkgname` 上。
+- `pkgname`：这个包在 pica 源里的唯一身份，原样写进产物文件名。区分“谁做的 / 什么形态”的后缀只加在 `pkgname` 上。
+
+字符集：两个名字都必须以 ASCII 字母或数字开头，其余字符只能是字母、数字和 `. _ + -`，长度不超过 128；`pkgname` 额外允许 `@`。`pica-pack` 构建、`pica -S` 同步、安装解包后都按这条规则检查：构建直接失败，同步跳过该条目并告警，安装报 `E_MANIFEST_INVALID`，都发生在写入任何文件之前。
 
 按“谁做的、做成什么形态”选择 `pkgname`：
 
-| 情况 | `pkgname` | `appname` |
-| --- | --- | --- |
-| 上游官方支持 OpenWrt / LuCI | `demo` | `demo` |
-| OpenWrt 官方社区打包 | `demo` | `demo` |
-| 只有二进制可用（上游没有现成的 OpenWrt 打包，pica 只是把可执行文件铺上去） | `demo-bin` | `demo` |
-| 第三方个人做的 | `demo@<用户名>` | `demo` |
-| 第三方社区 / 组织做的 | `demo@<组织名>` | `demo` |
+| 情况                                                                       | `pkgname`       | `appname` |
+| -------------------------------------------------------------------------- | --------------- | --------- |
+| 上游官方支持 OpenWrt / LuCI                                                | `demo`          | `demo`    |
+| OpenWrt 官方社区打包                                                       | `demo`          | `demo`    |
+| 只有二进制可用（上游没有现成的 OpenWrt 打包，pica 只是把可执行文件铺上去） | `demo-bin`      | `demo`    |
+| 第三方个人做的                                                             | `demo@<用户名>` | `demo`    |
+| 第三方社区 / 组织做的                                                      | `demo@<组织名>` | `demo`    |
 
 约定：
 
@@ -764,6 +810,7 @@ LICENSE
 app
 app(branch)
 app:branch
+app@branch
 ```
 
 约定：
@@ -799,7 +846,6 @@ platform = amd64
 uname = x86_64
 
 pica = 0.2.8
-source = pica
 
 type = luci
 luci = lua1

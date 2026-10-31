@@ -89,6 +89,7 @@ pub fn run(app: &mut App) -> CliResult<()> {
     return Ok(());
   };
   app.lang = lang;
+  lang.make_current();
   conf["language"] = json!(lang.code());
 
   let Some(repos) = choose_source(app, &conf)? else {
@@ -100,7 +101,7 @@ pub fn run(app: &mut App) -> CliResult<()> {
   save(app, &conf_path, &conf)
 }
 
-fn stdin_is_interactive() -> bool {
+pub(crate) fn stdin_is_interactive() -> bool {
   io::stdin().is_terminal() || env::var_os(ASSUME_TTY_ENV).is_some()
 }
 

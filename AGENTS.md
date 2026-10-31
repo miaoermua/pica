@@ -3,9 +3,9 @@
 Pica（Pica Is a Compact Archiver）是面向 OpenWrt 的紧凑包管理器，Rust workspace，产出两个二进制：
 
 - `pica`（`crates/pica-pkg-cli`）：设备端 CLI，负责同步、安装、升级、卸载、查询
-- `pica-pack`（`crates/pica-pkg-pack`）：构建端打包器，把 `pkgdir` 打成 `.pkg.tar.gz` 并生成 `repo.json` / `SHA256SUMS`
+- `pica-pack`（`crates/pica-pkg-pack`）：构建端打包器，把 `pkgdir` 打成 `.pkg.tar.gz` 并生成入口 `index.json`、后端 `index.json` 与 `SHA256SUMS`
 
-协议（包格式、文件名、`manifest`、`repo.json`、`db.json`）的权威文档是 `docs/standard.md`，内部机制说明在 `docs/developer.md`，实现在做/不做的清单在 `crates/README.md`。改代码前先读这三份中相关的一节，不要凭猜测改协议。
+协议（包格式、文件名、`manifest`、`index.json`、`db.json`）的权威文档是 `docs/standard.md`，内部机制说明在 `docs/developer.md`，实现在做/不做的清单在 `crates/README.md`。改代码前先读这三份中相关的一节，不要凭猜测改协议。
 
 ## 命令
 
@@ -21,15 +21,15 @@ cargo run -p pica-pkg-pack -- build <pkgdir> [--outdir DIR] [--pkgmgr opkg|apk|p
 cargo run -p pica-pkg-cli -- -Q
 ```
 
-- CI（`.github/workflows/openwrt-rust-binaries.yml`）只跑 `cargo test` 和 `cross build`（`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`），**不跑 fmt/clippy/dprint**，格式与 lint 必须本地自查。
+- CI（`.github/workflows/openwrt-rust-binaries.yml`）跑 `cargo fmt --check`、`cargo clippy -- -D warnings`、`dprint check`、`cargo test` 和交叉构建：`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 用 `cross build`；`mipsel-unknown-linux-musl` 是 tier 3 且 cross 没有为 musl 的 MIPS 变体发布镜像（只有 gnu 的），所以在 runner 上下载 OpenWrt 官方的 `ramips/mt7621` toolchain（按 sha256 校验）当链接器（`mipsel-openwrt-linux-musl-gcc`），直接 `cargo +nightly build -Zbuild-std=std,panic_abort`，并加 `-C target-feature=+crt-static`——这个 target 默认动态链接，不加就会产出依赖设备 musl 与 `libgcc_s` 的产物。因此代码里不能用 `AtomicU64` 这类 32 位 MIPS 没有的类型。
 - `Makefile` 与 `installer.sh` 当前是空文件，没有可用目标。
 - workspace 级 lints：`unsafe_code = "forbid"`，clippy `all` + `pedantic` 均为 `warn`；三个 crate 都 `[lints] workspace = true`，pedantic 告警要处理而不是加 `#[allow]` 绕过。
 
 ## 代码地图
 
 ```text
-crates/pica-pkg-core/src/     协议与共享类型：manifest.rs / repo.rs / version.rs / selector.rs
-                              / constraint.rs / io.rs / error.rs（无 CLI 依赖）
+crates/pica-pkg-core/src/     协议与共享类型：manifest.rs / repo.rs / layout.rs / naming.rs / version.rs
+                              / selector.rs / constraint.rs / io.rs / error.rs（无 CLI 依赖）
 crates/pica-pkg-cli/src/      main.rs（手写参数解析，不用 clap）、app.rs（路径与环境）、i18n.rs
     commands/                 install/{mod,pipeline,precheck,optional,feed}.rs、sync.rs、query.rs
                               、remove.rs、setup.rs、upgrade.rs
@@ -44,23 +44,23 @@ crates/pica-pkg-pack/src/     build.rs、matrix.rs、backend.rs、payload.rs、a
 
 ## 协议冻结：改这些等于改外部契约
 
-外部消费者是软件源仓库（`pica-pkg-repo` 的 CI 与已发布索引）和已装机的设备。下列任何一项变化都会让已发布的 `repo.json`/产物失配，动手前必须先与维护者确认，并优先找向后兼容的最小方案：
+外部消费者是软件源仓库（`pica-pkg-repo` 的 CI 与已发布索引）和已装机的设备。下列任何一项变化都会让已发布的索引/产物失配，动手前必须先与维护者确认，并优先找向后兼容的最小方案：
 
 - 产物文件名：`<pkgname>-<pkgver>-<pkgrel>-<platform>-<arch>[-opkg|-apk|-pica].pkg.tar.gz`，`platform = all` 时省略 platform 段；后缀只由 `pkgmgr` 单向生成，永不反向解析
 - 包内结构：`manifest`（必需）+ `scripts/` + `root/` + `pkgs/`（仅 opkg/apk）+ `LICENSE`
-- `repo.json`：`schema` 必须为 `2`，必需字段与 `filename` 一致性校验（见 `docs/standard.md`「repo.json 强约束」）；未识别字段要原样保留（flatten）
+- 源根 `index.json` 与后端 `index.json`：`schema` 必须为 `1`，必需字段与 `filename` 一致性校验（见 `docs/standard.md`「后端索引强约束」）；未识别字段要原样保留（flatten）
 - `db.json` 字段语义：`source`（渠道）与 `pkgmgr`（实际后端）职责不同，旧记录的解析阶梯不能变
 - 状态路径：`/etc/pica/pica.json`、`/etc/pica/env.d/`、`/var/lib/pica/{db.json,index.json,db.lck,cache/}`、`/usr/lib/pica/scripts/<pkgname>/`
 - `manifest` 字段名、`<key>@<backend>` 覆盖规则、`app_i18n` 的 `{lang}` 模板
-- 命名规则：`appname` 是选择键（纯上游应用名，不含 `@`），`pkgname` 是源内身份（`-bin` / `@<谁>` 只进 `pkgname`）
+- 命名规则：`appname` 是选择键（纯上游应用名，不含 `@`），`pkgname` 是源内身份（`-bin` / `@<谁>` 只进 `pkgname`）；字符集由 `pica_pkg_core::naming` 判定
 
-行为级修复同样要 bump 版本：三个 crate 的 `version` 同步改（当前 `0.4.4`）。
+行为级修复同样要 bump 版本：改根 `Cargo.toml` 的 `[workspace.package] version`（当前 `0.4.5`），`PICA_VERSION` 随之变化。
 
 ## 约定
 
 - **依赖最小化**（OpenWrt 体积敏感）：core/cli 只依赖 `serde`、`serde_json`、`sha2`、`tempfile`、`thiserror`；参数解析手写；不要引入 `clap`/`reqwest`/`tokio` 之类重依赖。系统能力交给系统工具：`opkg`/`apk`、`tar`、下载器 `curl` → `wget` → `uclient-fetch`。
 - **不做的事**（`crates/README.md` Non-goals）：不写回 `opkg`/`apk` 的已安装数据库、不做依赖求解、不解析容器格式（唯一例外是 `pica-pack` 为统计 `size` 读 `.ipk`/legacy `.apk`）。
-- **所有用户可见文本走 `src/i18n.rs`**：新增文案要在 `Key` 加变体、在 `english()` / `chinese()` 两张穷尽 `match` 各补一行、并加进 `ALL_KEYS`（有测试校验两表 `{n}` 占位符个数一致）。业务代码里不写语言判断、不写裸英文句子。包名、命令、配置键、协议字段、路径、`E_*` 错误码以及 `--help`/`--version`/`-Qi` 的字段名不翻译；第三方工具的原始错误文本作为参数塞进占位符，不能丢。
+- **所有用户可见文本走 `src/i18n.rs`**：新增文案要在 `Key` 加变体、在 `english()` / `chinese()` 两张穷尽 `match` 各补一行、并加进 `ALL_KEYS`（有测试校验两表 `{n}` 占位符个数一致）。业务代码里不写语言判断、不写裸英文句子（没有 `App` 时用 `i18n::tr`；测试 `no_sentence_is_written_outside_this_table` 会拦住裸句子）。包名、命令、配置键、协议字段、路径、`E_*` 错误码、JSON 输出以及 `--version`/`-Qi` 的字段名不翻译；第三方工具的原始错误文本作为参数塞进占位符，不能丢。
 - **输出诚实**：只打印真实发生的阶段和可信的数字。`size`/`csize` 缺失或为 `0` 就不报那一行（`0` 表示源没测量，不是不占空间）；统计不出来的容器（apk-tools 3.x 的 ADB）告警为未计量，不能记 0；实际写入量由安装结束时的 `Installed <n> files, <bytes>` 给出，两者不互相替代。
 - **错误显式**：用 `E_*` 错误码（`E_MANIFEST_INVALID`、`E_INDEX_UNAVAILABLE`、`E_INTEGRITY_INVALID` 等），不要用隐式兜底掩盖问题。读不到依赖索引是 `E_INDEX_UNAVAILABLE`，绝不能当成"源里没有这个包"。
 - **路径安全**：`root/` 内必须是相对路径、不含 `..`、不以 `/` 开头；符号链接原样保留且目标不得逃逸 `root/`。判定都在 `pica_pkg_core::io`：构建期用 `symlink_escapes_root`，安装期用 `install_payload` / `resolve_under`（错误文本 `escapes the target root`），两侧语义不能分叉。

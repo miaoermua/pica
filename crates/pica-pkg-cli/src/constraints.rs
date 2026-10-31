@@ -6,6 +6,8 @@
 //! same string to both makes one succeed and the other fail.
 
 use crate::app::App;
+use crate::i18n::Key;
+use crate::i18n::tr;
 use pica_pkg_core::constraint::Constraint;
 
 /// The manifest keys that declare dependencies, in the order they are checked.
@@ -20,8 +22,9 @@ pub(crate) const GROUPS: [&str; 3] = ["kmod", "base", "app"];
 /// It says the assertion did not hold and names no version: the bound is judged
 /// from a version pica read once, and the caller adds the declaration it was
 /// written as.
-pub(crate) const BOUND_UNMET: &str =
-  "the installed version does not satisfy the declared constraint";
+pub(crate) fn bound_unmet() -> String {
+  tr(Key::BoundUnmet, &[])
+}
 
 /// The bounds one declaration fails, or `None` when there is nothing to judge.
 ///
@@ -48,10 +51,7 @@ pub(crate) fn verdict(
   if constraint.is_met_by(&installed) {
     return Some(Vec::new());
   }
-  Some(vec![format!(
-    "{requester} requires {group}:{}, but {installed} is installed",
-    constraint.raw
-  )])
+  Some(vec![tr(Key::ConstraintUnmet, &[&requester, &group, &constraint.raw, &installed])])
 }
 
 /// The bounds in `constraints` that the installed system does not satisfy.

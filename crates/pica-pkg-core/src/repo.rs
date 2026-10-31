@@ -1,11 +1,10 @@
 use crate::error::{PicaError, PicaResult};
+pub use crate::layout::{PKG_EXTENSION, SUPPORTED_PKGMGRS};
 use crate::manifest::{SOURCE_AVAILABILITY_VALUES, is_valid_source_availability};
+use crate::naming::{is_valid_appname, is_valid_pkgname};
 use crate::version::pkgver_cmp_key;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-pub const PKG_EXTENSION: &str = ".pkg.tar.gz";
-pub const SUPPORTED_PKGMGRS: [&str; 3] = ["opkg", "apk", "pica"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
@@ -154,6 +153,60 @@ pub fn parse_entry_descriptor(content: &str) -> PicaResult<EntryDescriptor> {
 /// smuggle an `opkg` entry into its `apk` index, and a client never has to
 /// re-derive a backend from a filename.
 pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<BackendIndex> {
+  let parsed = parse_backend_envelope(content, expected_mgr)?;
+  check_packages(&parsed)?;
+  Ok(parsed)
+}
+
+/// An index entry left out because of its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedPackage {
+  /// The manifest field at fault: `pkgname` or `appname`.
+  pub field: &'static str,
+  /// The name as the index wrote it. It is untrusted text: quote it when
+  /// showing it.
+  pub value: String,
+}
+
+/// [`parse_backend_index`] for a reader that can use the rest of an index.
+///
+/// One entry with an unusable name says nothing about its neighbours, so it is
+/// left out and reported. Every other rule still fails the whole index.
+///
+/// # Errors
+/// Returns an error for the same reasons as [`parse_backend_index`], apart from
+/// a `pkgname` or `appname` that is present but invalid.
+pub fn parse_backend_index_skipping(
+  content: &str,
+  expected_mgr: &str,
+) -> PicaResult<(BackendIndex, Vec<SkippedPackage>)> {
+  let mut parsed = parse_backend_envelope(content, expected_mgr)?;
+
+  let mut skipped = Vec::new();
+  parsed.packages.retain(|package| match name_problem(package) {
+    Some(problem) => {
+      skipped.push(problem);
+      false
+    }
+    None => true,
+  });
+
+  check_packages(&parsed)?;
+  Ok((parsed, skipped))
+}
+
+/// The invalid name of an entry, if it has one. An empty `pkgname` is not a
+/// name problem: it is a missing required field.
+fn name_problem(package: &Package) -> Option<SkippedPackage> {
+  if !package.pkgname.is_empty() && !is_valid_pkgname(&package.pkgname) {
+    return Some(SkippedPackage { field: "pkgname", value: package.pkgname.clone() });
+  }
+  let appname = package.appname.as_deref().filter(|value| !value.is_empty())?;
+  (!is_valid_appname(appname))
+    .then(|| SkippedPackage { field: "appname", value: appname.to_string() })
+}
+
+fn parse_backend_envelope(content: &str, expected_mgr: &str) -> PicaResult<BackendIndex> {
   let mut parsed: BackendIndex = serde_json::from_str(content)?;
   if parsed.schema != BACKEND_INDEX_SCHEMA {
     return Err(PicaError::msg(format!(
@@ -168,15 +221,6 @@ pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<Back
     )));
   }
 
-  for pkg in &parsed.packages {
-    if pkg.pkgmgr != parsed.mgr {
-      return Err(PicaError::msg(format!(
-        "package {}: pkgmgr {} does not match the index's {}",
-        pkg.pkgname, pkg.pkgmgr, parsed.mgr
-      )));
-    }
-  }
-
   // `visibility` is the retired spelling of `source_availability`. It is not
   // unknown data to forward: an index re-serialized from this parse (the
   // client's cache, a packer's output) must not keep the old name alive. Drop
@@ -189,8 +233,20 @@ pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<Back
     }
   }
 
-  validate_packages(&parsed.packages)?;
   Ok(parsed)
+}
+
+fn check_packages(index: &BackendIndex) -> PicaResult<()> {
+  for pkg in &index.packages {
+    if pkg.pkgmgr != index.mgr {
+      return Err(PicaError::msg(format!(
+        "package {}: pkgmgr {} does not match the index's {}",
+        pkg.pkgname, pkg.pkgmgr, index.mgr
+      )));
+    }
+  }
+
+  validate_packages(&index.packages)
 }
 
 /// Whether `path` is a relative path a source may hand a client: no scheme, no
@@ -200,6 +256,19 @@ pub fn parse_backend_index(content: &str, expected_mgr: &str) -> PicaResult<Back
 /// printing a bare rejection.
 #[must_use]
 pub fn relative_path_problem(path: &str) -> Option<&'static str> {
+  path_problem(path, |_| false)
+}
+
+/// [`relative_path_problem`] for the path of an artifact.
+///
+/// An artifact's filename carries the `pkgname` and the version, so `@`, `+` and
+/// `~` have to be allowed. All three are legal in a URL path as they stand.
+#[must_use]
+pub fn artifact_path_problem(path: &str) -> Option<&'static str> {
+  path_problem(path, |ch| matches!(ch, '+' | '@' | '~'))
+}
+
+fn path_problem(path: &str, also: impl Fn(char) -> bool) -> Option<&'static str> {
   if path.is_empty() {
     return Some("empty path");
   }
@@ -226,9 +295,11 @@ pub fn relative_path_problem(path: &str) -> Option<&'static str> {
     if segment == "." || segment == ".." {
       return Some("must not contain . or ..");
     }
-    if !segment.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+    if !segment
+      .chars()
+      .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' || also(ch))
     {
-      return Some("may only use ASCII letters, digits, . _ and -");
+      return Some("may only use ASCII letters, digits and the punctuation allowed here");
     }
   }
 
@@ -240,7 +311,7 @@ fn validate_download_url(pkgname: &str, value: &str) -> PicaResult<()> {
     return Ok(());
   }
 
-  if let Some(reason) = relative_path_problem(value) {
+  if let Some(reason) = artifact_path_problem(value) {
     return Err(PicaError::msg(format!(
       "package {pkgname}: invalid download_url {value:?}: {reason}"
     )));
@@ -265,6 +336,18 @@ pub fn validate_packages(packages: &[Package]) -> PicaResult<()> {
       return Err(PicaError::msg(
         "package entry missing required string fields: pkgname/pkgver/pkgrel/platform/arch/filename/sha256",
       ));
+    }
+
+    if !is_valid_pkgname(&pkg.pkgname) {
+      return Err(PicaError::msg(format!("package {:?}: invalid pkgname", pkg.pkgname)));
+    }
+    if let Some(appname) = pkg.appname.as_deref().filter(|value| !value.is_empty()) {
+      if !is_valid_appname(appname) {
+        return Err(PicaError::msg(format!(
+          "package {}: invalid appname {appname:?}",
+          pkg.pkgname
+        )));
+      }
     }
 
     if !SUPPORTED_PKGMGRS.contains(&pkg.pkgmgr.as_str()) {
@@ -380,8 +463,9 @@ pub fn is_supported_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::{
-    BACKEND_INDEX_SCHEMA, Package, filename_suffix, package_filename, parse_backend_index,
-    parse_entry_descriptor, relative_path_problem,
+    BACKEND_INDEX_SCHEMA, Package, SkippedPackage, artifact_path_problem, filename_suffix,
+    package_filename, parse_backend_index, parse_backend_index_skipping, parse_entry_descriptor,
+    relative_path_problem,
   };
   use serde_json::{Value, json};
 
@@ -396,6 +480,73 @@ mod tests {
       "filename": filename,
       "sha256": "1".repeat(64),
     })
+  }
+
+  #[test]
+  fn an_artifact_path_may_carry_what_a_filename_carries() {
+    let path = "pica/ddns-go@immortalwrt-1.0+b~1-1-all-pica.pkg.tar.gz";
+    assert_eq!(artifact_path_problem(path), None);
+    assert!(relative_path_problem(path).is_some(), "a manager path stays as strict as it was");
+  }
+
+  #[test]
+  fn an_artifact_path_still_cannot_leave_the_source() {
+    for path in ["../demo.pkg.tar.gz", "/demo.pkg.tar.gz", "a/../b", "a%2fb", "a?b", "a:b"] {
+      assert!(artifact_path_problem(path).is_some(), "{path}");
+    }
+  }
+
+  #[test]
+  fn an_index_entry_with_an_unsafe_name_is_refused() {
+    let mut bad_pkgname = entry("x", "pica");
+    bad_pkgname["pkgname"] = json!("../evil");
+    let mut bad_appname = entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica");
+    bad_appname["appname"] = json!("hello@alice");
+
+    for package in [bad_pkgname, bad_appname] {
+      let index = json!({ "schema": 1, "mgr": "pica", "packages": [package] }).to_string();
+      let err = parse_backend_index(&index, "pica").expect_err("the name must be refused");
+      assert!(err.to_string().contains("invalid"), "{err}");
+    }
+  }
+
+  #[test]
+  fn an_entry_with_an_unsafe_name_costs_only_that_entry() {
+    let good = entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica");
+    let mut bad_pkgname = entry("x", "pica");
+    bad_pkgname["pkgname"] = json!("../evil");
+    let mut bad_appname = entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica");
+    bad_appname["appname"] = json!("hello@alice");
+    let index = json!({ "schema": 1, "mgr": "pica", "packages": [bad_pkgname, good, bad_appname] })
+      .to_string();
+
+    let (parsed, skipped) =
+      parse_backend_index_skipping(&index, "pica").expect("the rest is valid");
+
+    assert_eq!(parsed.packages.len(), 1);
+    assert_eq!(parsed.packages[0].pkgname, "hello");
+    assert_eq!(
+      skipped,
+      [
+        SkippedPackage { field: "pkgname", value: "../evil".to_string() },
+        SkippedPackage { field: "appname", value: "hello@alice".to_string() },
+      ]
+    );
+  }
+
+  #[test]
+  fn every_other_broken_rule_still_fails_the_whole_index() {
+    let mut missing_pkgname = entry("x.pkg.tar.gz", "pica");
+    missing_pkgname["pkgname"] = json!("");
+    let mut bad_sha = entry("hello-1.0.0-1-all-pica.pkg.tar.gz", "pica");
+    bad_sha["sha256"] = json!("nope");
+    let wrong_filename = entry("other-1.0.0-1-all-pica.pkg.tar.gz", "pica");
+    let other_backend = entry("hello-1.0.0-1-all-apk.pkg.tar.gz", "apk");
+
+    for package in [missing_pkgname, bad_sha, wrong_filename, other_backend] {
+      let index = json!({ "schema": 1, "mgr": "pica", "packages": [package] }).to_string();
+      assert!(parse_backend_index_skipping(&index, "pica").is_err(), "{index}");
+    }
   }
 
   #[test]
