@@ -1,7 +1,10 @@
 //! Installs one artifact: unpacking, checks and the order of the steps.
 //! See docs/architecture.md for the step table.
 
-use super::deps::{install_dependency_containers, precheck_dependencies, recheck_constraints};
+use super::deps::{
+  dependency_backend, install_dependency_containers, precheck_dependencies, recheck_constraints,
+  touches_package_manager,
+};
 use super::feed::DependencySource;
 use super::hooks::execute_scripts;
 use super::optional::Plan as OptionalPlan;
@@ -468,7 +471,22 @@ fn install_unpacked(
   validate_package(app, manifest, tmpdir, &pkg)?;
 
   // 3. Dependency precheck. Read-only, so a failure here has nothing to unwind.
-  let precheck = precheck_dependencies(app, &ctx)?;
+  //
+  // A `pica` artifact hands its dependencies to the host's manager: pica owns
+  // the files, the package database owns the dependencies, and neither solves
+  // the other's problem. The switch below covers steps 3 to 5b — every step that
+  // asks the backend about packages — and stops before anything writes
+  // `db.json`, so the record keeps saying `pica`. Moving a write inside this
+  // scope would credit `opkg` with files it never laid down.
+  //
+  // Asking who would install them reads no database, so it is safe to ask here;
+  // a `pica` artifact that declares nothing returns from the precheck without
+  // touching one (`touches_package_manager`).
+  let deps_from = dependency_backend(app, ctx.pkgmgr);
+  let precheck = match deps_from {
+    Some(kind) => app.with_backend(kind, |app| precheck_dependencies(app, &ctx, deps_from))?,
+    None => precheck_dependencies(app, &ctx, deps_from)?,
+  };
 
   // The plan is complete: the header, the sizes and where each dependency
   // comes from are on screen. Add what the payload writes, then stop for a dry
@@ -552,11 +570,22 @@ pub(super) fn run_install(
   //    database to snapshot; `pica` keeps its own record of the paths it wrote.
   //    Versions are kept, not just names: they are what tells a package this
   //    install added from one it upgraded.
-  if app.backend().requires_system_binary() {
+  // The executor is the artifact's own backend for `opkg`/`apk` artifacts and
+  // this host's manager for a `pica` one. `None` means nobody here installs a
+  // dependency, or that a `pica` artifact declared none and has no reason to
+  // touch a database at all.
+  let deps_from = if touches_package_manager(ctx.pkgmgr, &precheck.deps) {
+    dependency_backend(app, ctx.pkgmgr)
+  } else {
+    None
+  };
+  tx.deps_from = deps_from;
+
+  if let Some(kind) = deps_from.filter(|kind| kind.requires_system_binary()) {
     // Without a baseline there is nothing a rollback could undo, so an
     // unreadable list stops the install here — before anything is changed —
     // instead of letting it proceed with a record that can only be wrong.
-    let mut installed = app.package_manager()?.installed()?;
+    let mut installed = app.manager_for(kind)?.installed()?;
     installed.sort();
     tx.tx_before = Some(installed);
   }
@@ -564,10 +593,20 @@ pub(super) fn run_install(
   // 5. Dependency containers. Every phase records what it changed, including a
   //    phase that fails partway (see `install_phase`), so a later failure has
   //    something to roll back.
-  install_dependency_containers(app, ctx, precheck, tx)?;
+  match deps_from {
+    Some(kind) => app
+      .with_backend(kind, |app| install_dependency_containers(app, ctx, precheck, tx, deps_from))?,
+    None => install_dependency_containers(app, ctx, precheck, tx, deps_from)?,
+  }
 
   // 5b. The bounds the precheck could not judge yet.
-  recheck_constraints(app, ctx, precheck);
+  match deps_from {
+    Some(kind) => app.with_backend(kind, |app| {
+      recheck_constraints(app, ctx, precheck);
+      Ok(())
+    })?,
+    None => recheck_constraints(app, ctx, precheck),
+  }
 
   if !tx.tx_changed.is_empty() {
     let changes: Vec<String> = tx

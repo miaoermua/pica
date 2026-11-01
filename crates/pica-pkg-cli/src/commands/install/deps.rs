@@ -15,19 +15,36 @@ use pica_pkg_core::constraint::{self, Constraint};
 use pica_pkg_core::layout::{DEFAULT_LUCI_I18N, PKGS, ROOT};
 use serde_json::{Value, json};
 
-/// Whether the selected backend hands its dependency lists to something that
-/// installs them.
+/// Which backend installs this artifact's declared dependencies, if any.
 ///
-/// The question is concretely "does this backend have a system package manager
-/// to ask?". `pica` assumes none exists on the host — it unpacks its own
-/// containers and has nobody to hand a dependency list to — so the answer is
-/// `false` there by construction, not because a solver is missing. Owning files
-/// and having dependencies installed elsewhere stay separate questions, but only
-/// the first is a property of the artifact.
-/// Both call sites that ask it — the step 3 gate and the D3 check in
-/// `validate_package` — must agree, so the predicate lives in one place.
-pub(super) fn installs_declared_dependencies(pkgmgr: &str) -> bool {
-  PackageManagerKind::parse(pkgmgr).is_some_and(PackageManagerKind::requires_system_binary)
+/// `opkg` and `apk` artifacts answer with themselves. A `pica` artifact answers
+/// with this host's manager: pica resolves nothing, but `app`/`base`/`kmod` is
+/// still a request to a package database, and the only ones on a router belong
+/// to `opkg` or `apk`. Not solving dependencies and having them installed are
+/// different questions; only the first is pica's non-goal.
+///
+/// The declarations themselves are read in the artifact's own backend scope
+/// (`ctx.pkgmgr`), so `base@pica` means "only when built for pica" and is never
+/// silently dropped because the host happens to run opkg.
+///
+/// `None` means nothing here can install them: the host has no system package
+/// manager, which is the case `pica` exists for. The artifact still installs.
+pub(super) fn dependency_backend(app: &App, pkgmgr: &str) -> Option<PackageManagerKind> {
+  let kind = PackageManagerKind::parse(pkgmgr)?;
+  if kind.requires_system_binary() {
+    return Some(kind);
+  }
+  app.system_backend()
+}
+
+/// Whether this install has any dependency work at all.
+///
+/// A `pica` artifact borrows the package manager for the dependencies it names
+/// and for nothing else, so one that declares none must leave the host's
+/// database alone: no index refresh, no installed list, no rollback baseline.
+pub(super) fn touches_package_manager(pkgmgr: &str, deps: &DeclaredDeps) -> bool {
+  pkgmgr != PackageManagerKind::Pica.as_str()
+    || !(deps.kmod.is_empty() && deps.base.is_empty() && deps.app.is_empty())
 }
 
 pub(super) fn non_empty(items: Vec<String>) -> Vec<String> {
@@ -76,17 +93,24 @@ pub(super) fn declares_required(deps: &DeclaredDeps) -> bool {
 pub(super) fn precheck_dependencies(
   app: &mut App,
   ctx: &InstallContext<'_>,
+  deps_from: Option<PackageManagerKind>,
 ) -> CliResult<DependencyPrecheck> {
   let pkgs_dir = ctx.tmpdir.join(PKGS);
 
-  // Under `pica` there is no feed to consult and no resolver to run. A package
-  // with required dependencies was already refused by `validate_package`; only
-  // optional ones can still be there, and they are recorded as unavailable
-  // instead of being dropped, so the report says the manifest asked for them.
-  if !installs_declared_dependencies(ctx.pkgmgr) {
+  // Nothing on this host can install a dependency: no `opkg`, no `apk`. The
+  // artifact still installs — serving such a host is what `pica` is for — but a
+  // declaration that cannot be honoured is named, not passed over.
+  if deps_from.is_none() {
     let declared_app = non_empty(ctx.manifest.get_array_for("app", ctx.pkgmgr));
-    let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &declared_app)?;
+    let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, None, &declared_app)?;
+    let mut uninstallable = required_names(&deps.kmod);
+    uninstallable.extend(required_names(&deps.base));
+    uninstallable.extend(required_names(&deps.app));
+    if !uninstallable.is_empty() {
+      app.log_warn(tr(Key::DependenciesUninstalled, &[&uninstallable.join(" ")]));
+    }
     let optional = OptionalPlan::unavailable(&deps, super::optional::PICA_CANNOT_INSTALL);
+    optional.warn_skipped(app);
     return Ok(DependencyPrecheck {
       report: json!({"kmod": [], "base": [], "app": []}),
       deps,
@@ -109,7 +133,22 @@ pub(super) fn precheck_dependencies(
   // between packages is detected — so it must not be called one.
   app.log_info(tr(Key::CheckingDeps, &[]));
 
-  let deps = DeclaredDeps::parse(ctx.manifest, ctx.pkgmgr, &app_list)?;
+  let deps = DeclaredDeps::parse(
+    ctx.manifest,
+    ctx.pkgmgr,
+    deps_from.map(PackageManagerKind::as_str),
+    &app_list,
+  )?;
+
+  if !touches_package_manager(ctx.pkgmgr, &deps) {
+    let optional = OptionalPlan::unavailable(&deps, super::optional::PICA_CANNOT_INSTALL);
+    return Ok(DependencyPrecheck {
+      report: json!({"kmod": [], "base": [], "app": []}),
+      deps,
+      source: None,
+      optional,
+    });
+  }
 
   ensure_index(app, &deps)?;
 
@@ -117,7 +156,7 @@ pub(super) fn precheck_dependencies(
   let missing = summarize_missing_precheck(&report);
   if !missing.is_empty() {
     app.log_warn(tr(Key::DepPrecheckMissing, &[&missing.join(" ")]));
-    let hint = pica_package_hint(app, &missing);
+    let hint = format!("{}{}", pica_package_hint(app, &missing), other_backend_hint(deps_from));
     return Err(CliError::new(E_RUNTIME, tr(Key::DepPrecheckFailed, &[&missing.join(" "), &hint])));
   }
 
@@ -169,6 +208,32 @@ pub(super) fn pica_package_hint(app: &App, missing: &[String]) -> String {
     return String::new();
   }
   tr(Key::DepIsPicaPackage, &[&found.join(" ")])
+}
+
+/// Names a second system package manager this host has and this install did not
+/// search.
+///
+/// One install has one executor: `App::system_backend` picks `apk` or `opkg` and
+/// the precheck asks that database alone. A dependency only the other one
+/// publishes therefore comes back "missing" — true of the database that was
+/// asked, false of the host. Naming it turns "missing kmod-tun" into something
+/// to do: the manager is right there, and `--pkgmgr` moves the install onto it.
+///
+/// Searching both is the thing this deliberately does not do. Two databases can
+/// each carry the package, and pica could not then say which one's files the
+/// artifact is running against — nor which one to ask when it is removed.
+fn other_backend_hint(deps_from: Option<PackageManagerKind>) -> String {
+  let Some(from) = deps_from else {
+    return String::new();
+  };
+  let Some(other) = crate::pkgmgr::available_kinds()
+    .into_iter()
+    .find(|kind| kind.requires_system_binary() && *kind != from)
+  else {
+    return String::new();
+  };
+  let (other, from) = (other.as_str(), from.as_str());
+  tr(Key::DepPrecheckOtherBackend, &[&other, &from])
 }
 
 /// The container-or-feeds decision, taken once in the precheck.
@@ -305,16 +370,23 @@ pub(super) fn install_dependency_containers(
   ctx: &InstallContext<'_>,
   precheck: &DependencyPrecheck,
   tx: &mut InstallTransaction,
+  deps_from: Option<PackageManagerKind>,
 ) -> CliResult<()> {
   let pkgs_dir = ctx.tmpdir.join(PKGS);
 
-  if !installs_declared_dependencies(ctx.pkgmgr) {
-    if pkgs_dir.is_dir() {
-      return Err(CliError::new(
-        E_PACKAGE_INVALID,
-        tr(Key::PicaArtifactWithPkgs, &[&PKGS, &ROOT, &ROOT]),
-      ));
-    }
+  // A `pica` artifact never carries containers, whoever installs its
+  // dependencies: pica reads no container format, and the dependencies it
+  // declares come from the feeds the host's manager already knows.
+  if ctx.pkgmgr == PackageManagerKind::Pica.as_str() && pkgs_dir.is_dir() {
+    return Err(CliError::new(
+      E_PACKAGE_INVALID,
+      tr(Key::PicaArtifactWithPkgs, &[&PKGS, &ROOT, &ROOT]),
+    ));
+  }
+
+  // Nobody to install them: the precheck already warned, and the artifact's own
+  // files are `deploy_payload`'s business.
+  if deps_from.is_none() {
     return Ok(());
   }
 

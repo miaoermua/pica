@@ -1517,30 +1517,25 @@ fn a_required_dependency_that_is_missing_still_stops_the_install() {
 }
 
 #[test]
-fn a_pica_artifact_may_declare_optional_dependencies_it_cannot_install() {
-  // `pkgmgr=pica` has no resolver, so a required declaration is refused (the
-  // package would silently lose something it promised). An optional dependency
-  // is the one case where the honest answer is a warning: the install is
-  // complete without it.
+fn a_pica_artifact_declares_a_dependency_for_the_host_manager_to_install() {
+  // Not solving a dependency and having it installed are different things: the
+  // files are pica's, the dependency belongs to the database that has one. The
+  // record must keep saying `pica` — `opkg`/`apk` laid down none of these files,
+  // so a removal driven by them would miss every one.
   let sandbox = Sandbox::new(EMPTY_DB);
   let artifact = sandbox.root_only_artifact("opt-pica", "pica", "app = opt-app?\n");
   let artifact = artifact.to_str().expect("artifact path is utf-8");
 
-  let assert = sandbox.run(&["-U", artifact, "--with-optional"]).success();
+  sandbox.run(&["-U", artifact, "--with-optional"]).success();
 
-  let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+  let calls = sandbox.calls();
   assert!(
-    stderr.contains("pkgmgr=pica cannot install optional dependencies; skipping opt-app"),
-    "{stderr}"
-  );
-  assert_eq!(sandbox.calls(), "", "no package manager may be driven");
-  assert_eq!(
-    optional_outcomes(&sandbox, "opt-pica"),
-    vec![("opt-app".to_string(), "unavailable".to_string())]
+    calls.contains("add") || calls.contains("install"),
+    "a pica artifact's dependency must reach the host's manager: {calls}"
   );
 
-  let entry = optional_entry(&sandbox, "opt-pica", "opt-app");
-  assert_eq!(entry["reason"], "pkgmgr=pica cannot install dependencies", "{entry}");
+  let db = sandbox.db();
+  assert_eq!(db["installed"]["opt-pica"]["manifest"]["pkgmgr"], "pica", "{db}");
 }
 
 // -- Transaction output -------------------------------------------------------

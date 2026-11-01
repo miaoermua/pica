@@ -177,6 +177,10 @@ pub struct App {
   /// or auto-detection; everything later changes it only for a scope, through
   /// [`App::with_backend`], which puts the previous one back.
   backend: crate::pkgmgr::PackageManagerKind,
+  /// The backend that installs dependencies for an artifact whose own backend
+  /// cannot — see [`App::system_backend`]. Kept apart from `backend` because the
+  /// install switches `backend` to the artifact's backend while it runs.
+  system_backend: Option<crate::pkgmgr::PackageManagerKind>,
   /// The `apk_force_non_repository` setting, read by
   /// [`App::apply_backend_config`]. Until then the default stands, which is what
   /// the tests and the probing paths see.
@@ -201,6 +205,7 @@ impl App {
       paths,
       options,
       managers: crate::pkgmgr::package_manager_for(backend).into_iter().collect(),
+      system_backend: backend.requires_system_binary().then_some(backend),
       backend,
       apk_force_non_repository,
       json_last_phase: String::new(),
@@ -281,6 +286,27 @@ impl App {
     found.flatten().ok_or_else(|| CliError::new(E_MISSING_COMMAND, tr(Key::NoPackageManager, &[])))
   }
 
+  /// The manager for `kind`, whether or not it is this run's backend.
+  ///
+  /// A `pica` artifact's dependencies are installed by the host's manager while
+  /// `pica` owns the files. Switching the backend of the run for that would
+  /// record `opkg` as the owner of a `pica` package, so the dependency path asks
+  /// for the manager by name instead.
+  pub fn manager_for(
+    &self,
+    kind: crate::pkgmgr::PackageManagerKind,
+  ) -> CliResult<&dyn crate::pkgmgr::PackageManager> {
+    if !kind.requires_system_binary() {
+      return Err(CliError::new(E_MISSING_COMMAND, tr(Key::NoPackageManager, &[])));
+    }
+    self
+      .managers
+      .iter()
+      .find(|manager| manager.as_ref().kind() == kind)
+      .map(AsRef::as_ref)
+      .ok_or_else(|| CliError::new(E_MISSING_COMMAND, tr(Key::NoPackageManager, &[])))
+  }
+
   /// Backend identity of this invocation, including the Pica-native `pica`.
   #[must_use]
   pub fn backend(&self) -> crate::pkgmgr::PackageManagerKind {
@@ -338,6 +364,7 @@ impl App {
   #[cfg(test)]
   pub(crate) fn with_backend_for_tests(&mut self, kind: crate::pkgmgr::PackageManagerKind) {
     self.backend = kind;
+    self.refresh_system_backend();
   }
 
   fn ensure_manager(&mut self, kind: crate::pkgmgr::PackageManagerKind) -> CliResult<()> {
@@ -376,13 +403,41 @@ impl App {
     if self.backend.requires_system_binary() {
       self.ensure_manager(self.backend)?;
     }
-    if let Some(value) = self.options.pkgmgr.clone() {
-      return self.set_backend(&value);
-    }
-    if let Some(value) = conf_get_pkgmgr(&self.paths.conf_file) {
-      return self.set_backend(&value);
-    }
-    Ok(())
+    let result = match self.options.pkgmgr.clone() {
+      Some(value) => self.set_backend(&value),
+      None => match conf_get_pkgmgr(&self.paths.conf_file) {
+        Some(value) => self.set_backend(&value),
+        None => Ok(()),
+      },
+    };
+    self.refresh_system_backend();
+    result
+  }
+
+  /// The backend that installs dependencies when the artifact's own backend
+  /// cannot: `opkg`/`apk` artifacts use their own manager, a `pica` artifact
+  /// borrows this host's.
+  ///
+  /// It follows the run's backend selection — `--pkgmgr`, then the config file,
+  /// then auto-detection — and falls back to whatever manager this build
+  /// detected when that selection is `pica` itself. Reading `self.backend` here
+  /// would be wrong: the install switches it to the artifact's backend.
+  #[must_use]
+  pub fn system_backend(&self) -> Option<crate::pkgmgr::PackageManagerKind> {
+    self.system_backend
+  }
+
+  /// Recomputes [`App::system_backend`] from the current selection.
+  fn refresh_system_backend(&mut self) {
+    self.system_backend = if self.backend.requires_system_binary() {
+      Some(self.backend)
+    } else {
+      self
+        .managers
+        .iter()
+        .map(|manager| manager.as_ref().kind())
+        .find(|kind| kind.requires_system_binary())
+    };
   }
 
   pub fn set_phase(&mut self, phase: &str) {

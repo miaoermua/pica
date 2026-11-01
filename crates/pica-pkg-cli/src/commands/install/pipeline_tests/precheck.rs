@@ -112,27 +112,29 @@ fn a_pica_artifact_must_not_carry_containers() {
 }
 
 #[test]
-fn pica_rejects_a_package_that_declares_dependencies() {
+fn pica_installs_a_dependency_this_host_cannot_install() {
   let mut fixture = PicaFixture::new();
 
-  let err = fixture
-    .install(
+  // `pica` resolves nothing, but a declared dependency is still a request to a
+  // package database. This host has neither `opkg` nor `apk`, so the artifact
+  // installs, its files land, the record stays `pica`, and the dependency it
+  // could not honour is named on stderr instead of being dropped in silence.
+  fixture
+    .install_without_containers(
       &format!("{MANIFEST_DEMO}pkgmgr = pica\nbase = luci-base\n"),
       &[("etc/demo.conf", "overlay\n")],
       &[],
       &[],
     )
-    .expect_err("D3: pica cannot resolve dependencies");
+    .expect("a dependency nobody can install must not refuse the artifact");
 
-  assert!(err.message.contains("cannot resolve dependencies"), "{}", err.message);
-  assert!(
-    err.message.contains("pkgmgr=opkg"),
-    "the message must suggest a backend that can install them: {}",
-    err.message
+  assert!(fixture.path("etc/demo.conf").exists());
+  let record = db_record(&fixture.app, "demo").expect("the install is recorded");
+  assert_eq!(record["manifest"]["pkgmgr"], "pica", "ownership stays with pica: {record}");
+  assert_eq!(
+    record["manifest"]["source"], "pica",
+    "the dependency backend must not be recorded as the source: {record}"
   );
-  assert_eq!(err.code, E_PACKAGE_INVALID);
-  assert!(!fixture.path("etc/demo.conf").exists(), "validation runs before anything is written");
-  assert!(db_record(&fixture.app, "demo").is_none());
 }
 
 #[test]
@@ -274,4 +276,75 @@ fn a_container_is_named_as_one_instead_of_as_a_broken_archive() {
     "the reader should not have to decode a tar error: {}",
     err.message
   );
+}
+
+/// The bound has to be judged against what the feed offers, not only against
+/// what is installed.
+///
+/// A package that is not installed yet was never compared: the precheck saw the
+/// name in the feed, let the install proceed, the backend put 1.5 on the device,
+/// and only the post-install recheck noticed — after the files were written.
+#[test]
+fn a_bound_the_feeds_cannot_meet_is_refused_before_the_install() {
+  let work = tempfile::tempdir().expect("temp dir");
+  let mut app = test_app(work.path());
+  app.use_manager(Box::new(IndexStub::new(true).offering("libdemo", "1.5")));
+
+  let manifest = Manifest::from_text("pkgname = demo\n").expect("manifest parses");
+  let deps = declarations(&[], &["libdemo>=2.0"], &[]);
+
+  let err = build_precheck_report(&mut app, &manifest, Path::new(""), &deps)
+    .expect_err("a feed offering only 1.5 cannot satisfy >=2.0");
+  assert_eq!(err.code, E_VERSION_INCOMPATIBLE, "{err:?}");
+  assert!(err.message.contains("libdemo"), "{err:?}");
+}
+
+#[test]
+fn a_bound_the_feeds_meet_is_recorded_as_satisfied() {
+  let work = tempfile::tempdir().expect("temp dir");
+  let mut app = test_app(work.path());
+  app.use_manager(Box::new(
+    IndexStub::new(true).offering("libdemo", "1.5").offering("libdemo", "2.1"),
+  ));
+
+  let manifest = Manifest::from_text("pkgname = demo\n").expect("manifest parses");
+  let deps = declarations(&[], &["libdemo>=2.0"], &[]);
+
+  let report = build_precheck_report(&mut app, &manifest, Path::new(""), &deps)
+    .expect("the newest candidate satisfies the bound");
+  assert_eq!(report["base"][0]["bound_satisfied"], json!(true), "{report}");
+}
+
+/// An optional dependency the feeds cannot satisfy still installs: the manifest
+/// itself said the artifact works without it.
+#[test]
+fn an_optional_bound_the_feeds_cannot_meet_only_warns() {
+  let work = tempfile::tempdir().expect("temp dir");
+  let mut app = test_app(work.path());
+  app.use_manager(Box::new(IndexStub::new(true).offering("libdemo", "1.5")));
+
+  let manifest = Manifest::from_text("pkgname = demo\n").expect("manifest parses");
+  let deps = declarations(&[], &["libdemo>=2.0?"], &[]);
+
+  let report = build_precheck_report(&mut app, &manifest, Path::new(""), &deps)
+    .expect("an optional bound may go unmet");
+  assert_eq!(report["base"][0]["bound_satisfied"], json!(false), "{report}");
+  assert_eq!(report["base"][0]["constraint"], ">=2.0", "{report}");
+}
+
+/// The disk side of the same judgement, kept so the new feed check cannot
+/// replace it: an old version already installed is refused just as before.
+#[test]
+fn an_installed_version_below_the_bound_is_refused() {
+  let work = tempfile::tempdir().expect("temp dir");
+  let mut app = test_app(work.path());
+  app.use_manager(Box::new(IndexStub::new(true).with_installed("libdemo", "1.0")));
+
+  let manifest = Manifest::from_text("pkgname = demo\n").expect("manifest parses");
+  let deps = declarations(&[], &["libdemo>=2.0"], &[]);
+
+  let err = build_precheck_report(&mut app, &manifest, Path::new(""), &deps)
+    .expect_err("an installed 1.0 cannot satisfy >=2.0");
+  assert_eq!(err.code, E_VERSION_INCOMPATIBLE, "{err:?}");
+  assert!(err.message.contains("1.0"), "{err:?}");
 }

@@ -566,9 +566,10 @@ luci = lua1
   - 两个后端名字不同时：`base = <依赖名>` + `base@apk = <该依赖在 apk 源里的名字>`。名字通常相同，只有确实不同才需要写这一行。
   - 只有 opkg 需要它时：只写 `base@opkg = <该依赖在 opkg 源里的名字>`，不写裸 `base`（见下面的选型指导）。
 - `<key>@<backend> =`（空值）表示该后端这组一个都不装。空值之所以有意义，是因为读取侧把它当成“没有依赖”而不是“一个名字为空的依赖”：`get_array_for` 对存在但为空的键返回 `[""]`，而 `constraint::parse_all` 会跳过空项——跳过这一步，空值就成了非法声明。
-- 解析顺序为 `<key>@<backend>` → `<key>` → 空。
+- 解析顺序为 `<key>@<backend>` → `<key>` → 空。**`pica` 产物例外**：它读两个作用域——自己的 `@pica` 与执行者的 `@opkg`/`@apk`——合并去重，执行者在前（见下条）。
 - 选型：**只有某个后端该装这条依赖** → 不写裸 key，只写 `<key>@<那个后端>`；**某后端不该装、其他后端照旧** → 写裸 key，再加 `<key>@<那个后端> =`（空）遮蔽。
-- 这两种写法都能在 `targets` 含 `pica` 时通过构建检查：`pica-pack` 只读 `get_array_for(key, "pica")`。前者没有裸 key 可回落，得到空列表；后者读到空值，被空项过滤掉。两者都不会触发“pica 不能声明依赖”的报错。
+- `pica` 产物同样可以声明依赖，而且读**两个作用域**：`@pica` 说这个产物要哪些包，执行者的 `@opkg`/`@apk` 说那台机器的库要什么版本。两者合并后按名字去重，**执行者的条目排在前**，否则 `constraint::resolve` 会保留先到的裸名字、把版本下限丢掉。两个作用域都不存在时才回落到裸 key。
+- 所以同一个 pica 产物可以同时写 `base@pica = ca-bundle`、`base@opkg = ca-bundle>=20230311`、`base@apk = ca-bundle>=20240201`：opkg 机器上按 opkg 那条判，apk 机器上按 apk 那条判，两个库版本号不同也能各自约束。**执行**交给宿主机的 `opkg`/`apk`，`db.json` 仍记 `pica`；本机两个都没有时产物照常安装，未装上的依赖逐条告警。`pica` 只是不求解，不代表不许声明。
 - `app_i18n` 允许包含 `{lang}` 占位符，pica 根据配置 `i18n` 选择实际 i18n 包名（当前仅 `zh-cn` 时参与安装/卸载）。
 - `url` 用于记录程序来源（建议直接填仓库/项目地址，如 GitHub URL）。
 - `luci_url` 用于记录 LuCI 插件来源（可选；仅 LuCI 包建议填写）。
@@ -650,7 +651,9 @@ kmod = kmod-tun>=0.1?
 | `--no-optional`                            | 一个不装，也不输出上一条提示                               |
 | 两个一起给                                 | `E_ARG_INVALID`，不猜哪个优先                              |
 
-- "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：必需依赖仍直接拒绝整包，可选依赖只 warning 并跳过。
+- "可装"按来源判定：`feed-policy` 选了 `pkgs/` 时，源里的可选包不算可装（会和容器重复安装），标为 unavailable；`kmod` 例外，始终走源。`pkgmgr=pica` 没有解析器：`app`/`base`/`kmod` 交给本机的系统包管理器安装；本机既无 `opkg` 也无 `apk` 时（这正是 `pica` 存在的场景），产物照常安装，未装上的必需依赖逐条告警，可选依赖标为 unavailable 并跳过。
+- 版本约束永远不进后端命令行——opkg 不认 `pkg>=ver`，apk 认的又是另一套写法，同一个字符串在两边意思不同。pica 自己判两次：装**之前**拿源里最高候选版本判（`feed_candidates`），不满足直接以 `E_VERSION_INCOMPATIBLE` 拒绝，什么都不写；装**之后**再拿盘上实装版本判一次，不满足只告警——容器已经落盘，pica 不改后端选的版本。
+- 一次安装只有一个执行者（`--pkgmgr` → 配置 → 自动探测，apk 优先于 opkg），另一个库不参与判定。依赖只存在于另一个库时会报 `missing` 并附一句“本机还装有 X，可用 `--pkgmgr X` 重试”——不静默跨库检索，因为两个库可能都有这个包，pica 说不清制品实际用的是谁的文件。
 - 已安装的可选项只展示、不重装；报告中的 `outcome` 区分 `installed`（本次装入）、`installed_before`（本来就有）、`declined`（没选）、`unavailable`（装不了）、`installed_with_pkgs`（随 `pkgs/` 一起装）。已装但版本不满足声明的约束时，`outcome` 仍是 `installed_before`（这次安装确实不会动它），但选择器会写明"已装版本不满足声明的约束（约束原文）"，报告条目带 `bound_satisfied: false`——与预检条目同名同义，只写否定，键缺席即这次没有可比的版本。
 - 选择器里的两个尺寸都来自后端自己的源索引，且只描述**这个包本身**、不含它的依赖：`Download` 是下载的包文件大小（opkg 列表的 `Size`、apk 的 `file-size`），`Installed` 是解包后的大小（`Installed-Size` / `installed-size`）。取的是后端真正会装的那个版本（裸包名 = 源里最高版本），两个数字互不推导：源里没写、或写成 `0`（apk 的 ADB 容器就是这样），就显示 `Unknown`。已安装与随 `pkgs/` 一起装的可选项没有下载动作，不显示尺寸。
 - 报告写在 `install-report` 的 `precheck.optional`（数组，每项含 `group` / `name` / `optional` / `outcome`，带约束时含 `constraint`，源里报了尺寸时含 `download_size` / `installed_size`，单位字节）。`reason` 只出现在 `unavailable` 条目上，值与 stderr 上那句是同一个 `&'static str`，取值为：`this artifact installs its dependencies from pkgs/`（这次安装用容器，源里的包不能混装）、`packaged in the artifact, but this install uses the feeds`（反过来）、`this install has no dependency source`、`the feeds could not be read`、`not available from the feeds`，以及 `pkgmgr=pica` 的 `pkgmgr=pica cannot install dependencies`。其他条目既没有空串也没有 `null`。它是 `precheck` 里的新增键，旧的读取方按原有 `kmod` / `base` / `app` 字段照常工作。

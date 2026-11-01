@@ -82,7 +82,6 @@ pub(crate) fn main_build(
   let pkgs_dir = pkgdir.join(PKGS);
   check_pica_ships_no_containers(&pkgs_dir)?;
   check_unbuilt_backends(&pkgs_dir, &backends)?;
-  check_pica_declares_no_dependencies(&manifest, &backends)?;
 
   if !has_payload(pkgdir, &pkgs_dir, &backends) {
     let mut wanted = vec![format!("{SCRIPTS}/"), format!("{ROOT}/")];
@@ -244,35 +243,6 @@ fn check_unbuilt_backends(pkgs_dir: &Path, backends: &[BuildBackend]) -> PicaRes
     if known && !selected {
       return Err(PicaError::msg(format!(
         "{PKGS}/{name}/ present but {name} is not in targets; add it to targets or remove the directory"
-      )));
-    }
-  }
-
-  Ok(())
-}
-
-/// Pica owns its files but does not resolve dependencies, so a `pica` target
-/// that declares any would ship a package whose dependencies nobody installs.
-/// Both the build and the install reject that combination (D3).
-fn check_pica_declares_no_dependencies(
-  manifest: &Manifest,
-  backends: &[BuildBackend],
-) -> PicaResult<()> {
-  if !backends.contains(&BuildBackend::Pica) {
-    return Ok(());
-  }
-
-  for key in ["app", "base", "kmod"] {
-    let declared: Vec<String> = manifest
-      .get_array_for(key, BuildBackend::Pica.as_str())
-      .into_iter()
-      .filter(|item| !item.trim().is_empty())
-      .collect();
-    if !declared.is_empty() {
-      return Err(PicaError::msg(format!(
-        "`{key}` declares {} but the pica backend cannot resolve dependencies; \
-         build it with `targets = opkg` or `targets = apk`, or declare the dependency per backend (`{key}@opkg = ...`)",
-        declared.join(" ")
       )));
     }
   }
@@ -1341,21 +1311,21 @@ mod tests {
   }
 
   #[test]
-  fn pica_target_with_declared_dependencies_fails() {
+  fn pica_target_keeps_the_dependencies_it_declares() {
+    // pica resolves nothing, but a declaration is a request to the host's
+    // package database, not a promise pica makes. Building must keep the line
+    // so the installer can still hand it to opkg/apk: `app`/`base`/`kmod` are
+    // not in `OWNED_KEYS`, which is what this asserts.
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
     fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
 
-    let err =
-      build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase = luci-base\n"))
-        .expect_err("pica cannot resolve dependencies");
-    assert!(err.contains("cannot resolve dependencies"), "{err}");
-    assert!(err.contains("targets = opkg"), "the message must suggest opkg/apk: {err}");
-    assert!(err.contains("base@opkg"), "the message must offer the scoped form: {err}");
-    // `@` is the only per-backend separator (`BACKEND_SCOPE`); a dotted key is
-    // never looked up, so suggesting one would send the reader to a dead end.
-    assert!(!err.contains("base.opkg"), "the scoped form is not dot-separated: {err}");
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase = luci-base\n"))
+      .expect("a pica target may declare a dependency");
+
+    let manifest = fs::read_to_string(root.join("manifest")).expect("read built manifest");
+    assert!(manifest.contains("base = luci-base"), "the declaration must survive the build");
   }
 
   #[test]
@@ -1407,20 +1377,20 @@ mod tests {
   }
 
   #[test]
-  fn a_pica_scoped_dependency_is_still_refused() {
-    // The scope applies to pica too: it is not a way to sneak a dependency past
-    // the non-goal check, only a way to say "pica installs none of these".
+  fn a_pica_scoped_dependency_survives_the_build() {
+    // The scope keeps its meaning for pica too: `base@pica` is read by a pica
+    // artifact and handed to the host's manager. Rewriting it away would lose
+    // the only spelling that says "only when this artifact is built for pica".
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("root/etc")).expect("mkdir root");
     fs::write(root.join("root/etc/demo.conf"), "x\n").expect("write config");
 
-    let err = build_with_manifest(
-      &root,
-      &format!("{BASE_MANIFEST}targets = pica\nbase@pica = luci-base\n"),
-    )
-    .expect_err("a pica-scoped dependency is still a dependency pica cannot resolve");
-    assert!(err.contains("cannot resolve dependencies"), "{err}");
+    build_with_manifest(&root, &format!("{BASE_MANIFEST}targets = pica\nbase@pica = luci-base\n"))
+      .expect("a pica-scoped dependency is still a declaration");
+
+    let manifest = fs::read_to_string(root.join("manifest")).expect("read built manifest");
+    assert!(manifest.contains("base@pica = luci-base"), "{manifest}");
   }
 
   #[test]

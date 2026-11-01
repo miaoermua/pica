@@ -15,12 +15,12 @@ use super::pipeline::{
   IndexSizes, InstallContext, ScriptConfig, install_summary, pkgfile_into, size_lines,
   transaction_header,
 };
-use super::precheck::DeclaredDeps;
+use super::precheck::{DeclaredDeps, build_precheck_report};
 use super::transaction::InstallTransaction;
+use crate::app::{App, CliError, CliResult, E_CONFIG_INVALID, E_MANIFEST_INVALID, E_RUNTIME};
 use crate::app::{
-  App, CliError, CliResult, E_CONFIG_INVALID, E_MANIFEST_INVALID, E_PACKAGE_INVALID, E_RUNTIME,
+  E_INDEX_UNAVAILABLE, E_VERSION_INCOMPATIBLE, FeedPolicy, JsonMode, OptionalDeps, Options, Paths,
 };
-use crate::app::{E_INDEX_UNAVAILABLE, FeedPolicy, JsonMode, OptionalDeps, Options, Paths};
 use crate::i18n::Lang;
 use crate::installed::EntrySource;
 use crate::pkgmgr::FeedCandidate;
@@ -82,11 +82,36 @@ fn test_app(root: &Path) -> App {
   app
 }
 
-/// A backend that answers the one question `ensure_index` asks: whether the
-/// index can be made readable. `readable: false` is what unreachable feeds
-/// look like from the precheck's side; nothing else is answered.
+/// A backend that answers the questions the precheck asks, without a filesystem:
+/// whether the index can be made readable, which names and versions the feeds
+/// list, and which are installed. `readable: false` is what unreachable feeds
+/// look like from the precheck's side; anything not put in `offers`/`installed`
+/// simply is not there.
 struct IndexStub {
   readable: bool,
+  /// `(name, version)` the feeds list, newest last — `feed_candidates` hands
+  /// back every entry for the name, as the real backends do.
+  offers: Vec<(&'static str, &'static str)>,
+  /// `(name, version)` already on the device.
+  installed: Vec<(&'static str, &'static str)>,
+}
+
+impl IndexStub {
+  fn new(readable: bool) -> Self {
+    Self { readable, offers: Vec::new(), installed: Vec::new() }
+  }
+
+  /// The feeds list `name` at `version`.
+  fn offering(mut self, name: &'static str, version: &'static str) -> Self {
+    self.offers.push((name, version));
+    self
+  }
+
+  /// The device already has `name` at `version`.
+  fn with_installed(mut self, name: &'static str, version: &'static str) -> Self {
+    self.installed.push((name, version));
+    self
+  }
 }
 
 impl crate::pkgmgr::PackageManager for IndexStub {
@@ -101,20 +126,35 @@ impl crate::pkgmgr::PackageManager for IndexStub {
     Err(CliError::new(E_INDEX_UNAVAILABLE, "apk update failed (exit 1): Network unreachable"))
   }
 
-  fn package_exists(&self, _name: &str) -> CliResult<bool> {
-    Ok(false)
+  fn package_exists(&self, name: &str) -> CliResult<bool> {
+    Ok(self.offers.iter().any(|(offered, _)| *offered == name))
   }
 
-  fn feed_candidates(&self, _name: &str) -> CliResult<Vec<FeedCandidate>> {
-    Ok(Vec::new())
+  fn feed_candidates(&self, name: &str) -> CliResult<Vec<FeedCandidate>> {
+    Ok(
+      self
+        .offers
+        .iter()
+        .filter(|(offered, _)| *offered == name)
+        .map(|(_, version)| FeedCandidate {
+          version: (*version).to_string(),
+          download: None,
+          installed: None,
+        })
+        .collect(),
+    )
   }
 
-  fn is_installed(&self, _name: &str) -> bool {
-    false
+  fn is_installed(&self, name: &str) -> bool {
+    self.installed.iter().any(|(installed, _)| *installed == name)
   }
 
-  fn installed_version(&self, _name: &str) -> Option<String> {
-    None
+  fn installed_version(&self, name: &str) -> Option<String> {
+    self
+      .installed
+      .iter()
+      .find(|(installed, _)| *installed == name)
+      .map(|(_, version)| (*version).to_string())
   }
 
   fn install(&self, _label: &str, _targets: &[String]) -> CliResult<()> {
@@ -151,7 +191,7 @@ fn declarations(kmod: &[&str], base: &[&str], app: &[&str]) -> DeclaredDeps {
 
 fn app_with_index(work: &Path, readable: bool) -> App {
   let mut app = test_app(work);
-  app.use_manager(Box::new(IndexStub { readable }));
+  app.use_manager(Box::new(IndexStub::new(readable)));
   app
 }
 

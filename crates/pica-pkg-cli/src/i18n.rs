@@ -296,6 +296,8 @@ pub(crate) enum Key {
   MkdirFailed,
   InvalidApkForceSetting,
   ConstraintUnmet,
+  ConstraintUnmetInFeed,
+  DepPrecheckOtherBackend,
   LockBeingTaken,
   LockWithoutPid,
   UnknownArg,
@@ -358,6 +360,7 @@ pub(crate) enum Key {
   OptionalIndexUnavailable,
   CheckingDeps,
   DepPrecheckMissing,
+  DependenciesUninstalled,
   DepPrecheckFailed,
   InstallingOptional,
   DepIsPicaPackage,
@@ -405,8 +408,6 @@ pub(crate) enum Key {
   ArchFamilyMatch,
   ArchUnchecked,
   UnsupportedArch,
-  PicaCannotResolveDeps,
-  PicaSkipsOptional,
   UnsupportedUname,
   UnsupportedOs,
   PackageEmpty,
@@ -693,6 +694,13 @@ fn english(key: Key) -> &'static str {
       "invalid \"apk_force_non_repository\" in {0}: expected true or false, found {1}"
     }
     Key::ConstraintUnmet => "{0} requires {1}:{2}, but {3} is installed",
+    Key::ConstraintUnmetInFeed => {
+      "{0} requires {1}:{2}, but the feeds offer only {3}"
+    }
+    Key::DepPrecheckOtherBackend => {
+      "; {0} is installed on this host but was not searched, only {1} was — \
+       retry with --pkgmgr {0}"
+    }
     Key::LockBeingTaken => "a lock being taken",
     Key::LockWithoutPid => "a lock without a pid",
     Key::UnknownArg => "unknown arg: {0}",
@@ -765,6 +773,9 @@ fn english(key: Key) -> &'static str {
     }
     Key::CheckingDeps => "Checking declared dependencies...",
     Key::DepPrecheckMissing => "dependency precheck: missing {0}",
+    Key::DependenciesUninstalled => {
+      "no opkg or apk on this host, so these dependencies were not installed: {0}"
+    }
     Key::DepPrecheckFailed => "dependency precheck failed, missing: {0}{1}",
     Key::InstallingOptional => "Installing {0} optional dependencies on request",
     Key::DepIsPicaPackage => {
@@ -834,10 +845,6 @@ fn english(key: Key) -> &'static str {
       "cannot determine this host's package architecture, so arch={0} was not checked ({1})"
     }
     Key::UnsupportedArch => "unsupported arch: pkg={0} ({1})",
-    Key::PicaCannotResolveDeps => {
-      "package declares {0} but pkgmgr={1} cannot resolve dependencies; rebuild it with pkgmgr=opkg or pkgmgr=apk, or drop the dependency"
-    }
-    Key::PicaSkipsOptional => "pkgmgr={0} cannot install optional dependencies; skipping {1}",
     Key::UnsupportedUname => "unsupported uname: pkg={0} host={1}",
     Key::UnsupportedOs => "unsupported os: pkg={0} host={1}",
     Key::PackageEmpty => {
@@ -1112,6 +1119,8 @@ fn chinese(key: Key) -> &'static str {
       "{0} 中的 \"apk_force_non_repository\" 无效：应为 true 或 false，实际为 {1}"
     }
     Key::ConstraintUnmet => "{0} 要求 {1}:{2}，但已安装的是 {3}",
+    Key::ConstraintUnmetInFeed => "{0} 要求 {1}:{2}，但软件源里最高只有 {3}",
+    Key::DepPrecheckOtherBackend => "；本机还装有 {0}，本次只查了 {1}，可用 --pkgmgr {0} 重试",
     Key::LockBeingTaken => "一把正在获取中的锁",
     Key::LockWithoutPid => "一把没有 pid 的锁",
     Key::UnknownArg => "未知参数：{0}",
@@ -1178,6 +1187,7 @@ fn chinese(key: Key) -> &'static str {
     Key::OptionalIndexUnavailable => "依赖索引不可用，无法提供可选依赖：{0}",
     Key::CheckingDeps => "正在检查声明的依赖...",
     Key::DepPrecheckMissing => "依赖预检：缺少 {0}",
+    Key::DependenciesUninstalled => "本机没有 opkg 或 apk，这些依赖未安装：{0}",
     Key::DepPrecheckFailed => "依赖预检失败，缺少：{0}{1}",
     Key::InstallingOptional => "按要求安装 {0} 个可选依赖",
     Key::DepIsPicaPackage => {
@@ -1237,10 +1247,6 @@ fn chinese(key: Key) -> &'static str {
     Key::ArchFamilyMatch => "架构 {0} 仅凭同族匹配被接受（{1}）",
     Key::ArchUnchecked => "无法确定本机的软件包架构，因此未检查 arch={0}（{1}）",
     Key::UnsupportedArch => "不支持的架构：pkg={0}（{1}）",
-    Key::PicaCannotResolveDeps => {
-      "软件包声明了 {0}，但 pkgmgr={1} 无法解析依赖；请用 pkgmgr=opkg 或 pkgmgr=apk 重新打包，或去掉该依赖"
-    }
-    Key::PicaSkipsOptional => "pkgmgr={0} 无法安装可选依赖；跳过 {1}",
     Key::UnsupportedUname => "不支持的 uname：pkg={0} host={1}",
     Key::UnsupportedOs => "不支持的系统：pkg={0} host={1}",
     Key::PackageEmpty => "软件包为空：不含 root/ 或 scripts/，pkgs/ 中也没有软件包",
@@ -1771,6 +1777,8 @@ mod tests {
     Key::MkdirFailed,
     Key::InvalidApkForceSetting,
     Key::ConstraintUnmet,
+    Key::ConstraintUnmetInFeed,
+    Key::DepPrecheckOtherBackend,
     Key::LockBeingTaken,
     Key::LockWithoutPid,
     Key::UnknownArg,
@@ -1833,6 +1841,7 @@ mod tests {
     Key::OptionalIndexUnavailable,
     Key::CheckingDeps,
     Key::DepPrecheckMissing,
+    Key::DependenciesUninstalled,
     Key::DepPrecheckFailed,
     Key::InstallingOptional,
     Key::DepIsPicaPackage,
@@ -1880,8 +1889,6 @@ mod tests {
     Key::ArchFamilyMatch,
     Key::ArchUnchecked,
     Key::UnsupportedArch,
-    Key::PicaCannotResolveDeps,
-    Key::PicaSkipsOptional,
     Key::UnsupportedUname,
     Key::UnsupportedOs,
     Key::PackageEmpty,

@@ -9,6 +9,7 @@ use crate::app::App;
 use crate::i18n::Key;
 use crate::i18n::tr;
 use pica_pkg_core::constraint::Constraint;
+use pica_pkg_core::version;
 
 /// The manifest keys that declare dependencies, in the order they are checked.
 ///
@@ -52,6 +53,42 @@ pub(crate) fn verdict(
     return Some(Vec::new());
   }
   Some(vec![tr(Key::ConstraintUnmet, &[&requester, &group, &constraint.raw, &installed])])
+}
+
+/// The bounds one declaration fails against the version the feeds would install.
+///
+/// [`verdict`] judges what is already on disk. This judges what the backend
+/// would fetch, which is the only answer there is for a package that is not
+/// installed yet — and the one that decides whether the install can go ahead at
+/// all. Without it a bound stayed unchecked until the container had already been
+/// written: `libfoo>=2.0` against a feed offering only 1.5 installed 1.5 and
+/// warned afterwards, which is not a constraint but a note.
+///
+/// `None` is the absence of a verdict, never a pass: no bound was declared, or
+/// the feeds list no candidate to compare against. A feed that cannot be read is
+/// not a version, so it cannot be said to satisfy anything.
+pub(crate) fn feed_verdict(
+  app: &App,
+  requester: &str,
+  group: &str,
+  constraint: &Constraint,
+) -> Option<Vec<String>> {
+  if !constraint.has_bound() {
+    return None;
+  }
+  let package_manager = app.package_manager().ok()?;
+  let newest = package_manager
+    .feed_candidates(&constraint.name)
+    .ok()?
+    .into_iter()
+    .max_by(|a, b| version::pkgver_cmp(&a.version, &b.version))?;
+  if constraint.is_met_by(&newest.version) {
+    return Some(Vec::new());
+  }
+  Some(vec![tr(
+    Key::ConstraintUnmetInFeed,
+    &[&requester, &group, &constraint.raw, &newest.version],
+  )])
 }
 
 /// The bounds in `constraints` that the installed system does not satisfy.

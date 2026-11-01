@@ -134,6 +134,24 @@ impl Manifest {
     get_array_for(&self.value, key, backend)
   }
 
+  /// Whether `<key>@<backend>` is present, without [`Self::get_array_for`]'s
+  /// fallback to the bare key.
+  ///
+  /// A caller that reads several scopes and merges them has to tell "no entry
+  /// for this backend" from "an entry that says nothing": the first leaves the
+  /// bare key in charge, the second is a decision. Emptiness cannot answer
+  /// that — `base@opkg =` is a present, empty list.
+  #[must_use]
+  pub fn has_for(&self, key: &str, backend: &str) -> bool {
+    self.value.get(scoped_key(key, backend)).is_some()
+  }
+
+  /// The scoped list alone: `<key>@<backend>`, never the bare `<key>`.
+  #[must_use]
+  pub fn get_array_scoped(&self, key: &str, backend: &str) -> Vec<String> {
+    get_array(&self.value, &scoped_key(key, backend))
+  }
+
   #[must_use]
   pub fn targets(&self) -> Vec<String> {
     split_targets(&self.get_array("targets"))

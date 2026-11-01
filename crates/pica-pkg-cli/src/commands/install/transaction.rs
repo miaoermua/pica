@@ -25,6 +25,11 @@ pub(super) struct InstallTransaction {
   /// taken before step 5. Names alone cannot tell a dependency this install
   /// added from one it upgraded.
   pub(super) tx_before: Option<Vec<(String, String)>>,
+  /// The backend that installs this artifact's dependencies, when that is not
+  /// the backend that owns the files: a `pica` artifact's dependencies belong
+  /// to the host's `opkg`/`apk`. Every dependency query and the rollback below
+  /// ask that manager, so those installs are accounted for and can be undone.
+  pub(super) deps_from: Option<crate::pkgmgr::PackageManagerKind>,
   /// Packages step 5 added, diffed against `tx_before` after every phase.
   /// Rollback removes exactly these.
   pub(super) tx_added: Vec<String>,
@@ -62,6 +67,7 @@ impl InstallTransaction {
   pub(super) fn new() -> Self {
     Self {
       tx_before: None,
+      deps_from: None,
       tx_added: Vec::new(),
       tx_changed: Vec::new(),
       app_added: Vec::new(),
@@ -182,13 +188,15 @@ impl InstallTransaction {
     let Some(before) = &self.tx_before else {
       return;
     };
-    let mut after = match app.package_manager().and_then(crate::pkgmgr::PackageManager::installed) {
-      Ok(after) => after,
-      Err(err) => {
-        app.log_warn(tr(Key::InstalledListUnreadable, &[&err.message]));
-        return;
-      }
-    };
+    let manager = self.deps_from.unwrap_or_else(|| app.backend());
+    let mut after =
+      match app.manager_for(manager).and_then(crate::pkgmgr::PackageManager::installed) {
+        Ok(after) => after,
+        Err(err) => {
+          app.log_warn(tr(Key::InstalledListUnreadable, &[&err.message]));
+          return;
+        }
+      };
     after.sort();
 
     let mut added = Vec::new();
@@ -302,9 +310,9 @@ impl InstallTransaction {
       self.executed_hooks.clear();
     }
 
-    if app.backend().requires_system_binary() {
+    if let Some(kind) = self.deps_from.filter(|kind| kind.requires_system_binary()) {
       for name in std::mem::take(&mut self.tx_added).into_iter().rev() {
-        if let Err(err) = app.package_manager().and_then(|manager| manager.remove(&name)) {
+        if let Err(err) = app.manager_for(kind).and_then(|manager| manager.remove(&name)) {
           leftovers.push(format!("pkg:{name} ({})", err.message));
         }
       }

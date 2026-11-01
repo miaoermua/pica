@@ -1,4 +1,3 @@
-use super::deps::installs_declared_dependencies;
 use super::pipeline::PackageFields;
 use crate::app::{
   App, CliError, CliResult, E_CONFIG_INVALID, E_MANIFEST_INVALID, E_PACKAGE_INVALID,
@@ -93,28 +92,72 @@ pub(crate) struct DeclaredDeps {
 }
 
 impl DeclaredDeps {
-  /// Parses `kmod`, `base` and `app` for `backend`.
+  /// Parses `kmod`, `base` and `app` for `backend`, taking `deps_from` into
+  /// account when a different backend installs them.
+  ///
+  /// A pica artifact is the case this exists for. Its own scope (`@pica`) says
+  /// which packages the artifact needs at all; the scope of the manager that
+  /// will install them (`@opkg`, `@apk`) says which version that manager has to
+  /// provide. Both apply, so both are read, and the executor's entries come
+  /// first so its bound survives [`constraint::resolve`]'s name deduplication —
+  /// the opposite order would drop the version and keep the bare name.
+  ///
+  /// The bare key stays the fallback, for the manifest that names a backend
+  /// neither scope does. When neither scope is present the read is exactly
+  /// [`Manifest::get_array_for`], so an artifact that writes no scopes behaves
+  /// as it always has.
   ///
   /// `app_decls` is passed in because the app list is not only the manifest's:
   /// `app_i18n` adds one name at install time, and the caller is the only place
   /// that knows whether it applies to this install.
-  pub(crate) fn parse(manifest: &Manifest, backend: &str, app_decls: &[String]) -> CliResult<Self> {
+  pub(crate) fn parse(
+    manifest: &Manifest,
+    backend: &str,
+    deps_from: Option<&str>,
+    app_decls: &[String],
+  ) -> CliResult<Self> {
     Ok(Self {
-      kmod: parse_group(&manifest.get_array_for("kmod", backend), "kmod")?,
-      base: parse_group(&manifest.get_array_for("base", backend), "base")?,
+      kmod: parse_group(&declared(manifest, "kmod", backend, deps_from), "kmod")?,
+      base: parse_group(&declared(manifest, "base", backend, deps_from), "base")?,
       app: parse_group(app_decls, "app")?,
     })
   }
 }
 
+/// The declarations that apply to this install, across the two scopes.
+///
+/// `own` is the artifact's backend, `from` the backend that installs the
+/// dependencies. With no executor, or the same one twice, there is one scope and
+/// nothing to merge — the read is [`Manifest::get_array_for`] verbatim.
+fn declared(manifest: &Manifest, key: &str, own: &str, from: Option<&str>) -> Vec<String> {
+  let Some(from) = from.filter(|from| *from != own) else {
+    return manifest.get_array_for(key, own);
+  };
+
+  let (own_present, from_present) = (manifest.has_for(key, own), manifest.has_for(key, from));
+  if !own_present && !from_present {
+    // Neither backend was mentioned: the bare key is what the manifest meant.
+    return manifest.get_array_for(key, own);
+  }
+
+  let mut merged = if from_present { manifest.get_array_scoped(key, from) } else { Vec::new() };
+  if own_present {
+    merged.extend(manifest.get_array_scoped(key, own));
+  }
+  merged
+}
+
 /// The status of every declaration in `deps`, in the order they were declared.
 ///
-/// A bound is enforced here only when the dependency is already installed: that
-/// is the one case where pica knows which version the backend will leave alone.
-/// A dependency that is not installed yet may still arrive at the right version,
-/// so the bound is recorded in the report and checked again after step 5 (see
-/// `pipeline::recheck_constraints`). What is never done is putting the bound on
-/// the backend's command line — the name is all a backend is asked for.
+/// A bound is judged twice over, because there are two versions it could fail
+/// against: the one already on disk, and the one the feeds would install. The
+/// second is the one that decides whether the install may run at all — a feed
+/// that offers only 1.5 for a `>=2.0` declaration is a refusal here, not a
+/// warning after the files are written. A dependency that passes both is
+/// re-checked once more after step 5 (see `pipeline::recheck_constraints`),
+/// because the backend may still install something else than the candidate pica
+/// read. What is never done is putting the bound on the backend's command line —
+/// the name is all a backend is asked for.
 ///
 /// An optional declaration that is missing or too old is recorded and warned
 /// about, never raised to an error: the manifest itself said the install may
@@ -140,13 +183,22 @@ fn dep_entries(
       }
       Err(err) => return Err(err),
     };
-    // Only an installed dependency has a version on disk to compare against; for
-    // the rest the bound travels to the post-install recheck instead. `None`
-    // therefore means "not asked", which is why the key is omitted rather than
-    // written as `false`; `Some(None)` means it was asked and the backend would
-    // not say which version is installed.
-    let bound = (status == "installed" && dep.has_bound())
-      .then(|| crate::constraints::verdict(app, requester, group, dep));
+    // Only an installed dependency has a version on disk to compare against;
+    // one the feeds would supply is judged against what they offer instead, so
+    // a bound the feeds cannot meet stops the install before anything is
+    // written. `None` therefore means "not asked", which is why the key is
+    // omitted rather than written as `false`; `Some(None)` means it was asked
+    // and the backend would not say which version is installed.
+    let bound = match status.as_str() {
+      "installed" => {
+        dep.has_bound().then(|| crate::constraints::verdict(app, requester, group, dep))
+      }
+      // `feed_verdict` already answers `None` when there is nothing to judge, so
+      // the mapping only says which of the two readings this is: a version the
+      // feeds offer, not an installed one whose version could not be read.
+      "feed" => crate::constraints::feed_verdict(app, requester, group, dep).map(Some),
+      _ => None,
+    };
     match &bound {
       Some(Some(violations)) => {
         if let Some(message) = violations.first() {
@@ -304,52 +356,6 @@ fn check_package_arch(app: &mut App, pkg: &PackageFields) -> CliResult<()> {
   }
 }
 
-/// Refuses declarations the chosen backend cannot resolve.
-///
-/// The `pica` backend owns files but does not resolve dependencies, so a
-/// package that declares any would install cleanly while silently skipping
-/// them. The predicate is shared with the install-time gate in `pipeline`, so
-/// the check and the gate cannot disagree about who installs these.
-///
-/// Only required declarations are refused. An optional one is a suggestion the
-/// backend cannot take up, which is exactly the "unavailable, warn and skip"
-/// case: refusing the whole artifact would make it mandatory.
-fn check_resolvable_dependencies(
-  app: &mut App,
-  manifest: &Manifest,
-  pkg: &PackageFields,
-) -> CliResult<()> {
-  if installs_declared_dependencies(&pkg.pkgmgr) {
-    return Ok(());
-  }
-
-  let mut required = Vec::new();
-  let mut optional = Vec::new();
-  for key in ["app", "base", "kmod"] {
-    let Ok(constraints) = constraint::resolve(&manifest.get_array_for(key, &pkg.pkgmgr)) else {
-      // The same list is parsed again, with the manifest key in the error, by
-      // `DeclaredDeps::parse`. Not repeating that here keeps one message.
-      continue;
-    };
-    for dep in constraints {
-      if dep.optional { optional.push(dep.raw) } else { required.push(dep.raw) }
-    }
-  }
-
-  if !required.is_empty() {
-    return Err(CliError::new(
-      E_PACKAGE_INVALID,
-      tr(Key::PicaCannotResolveDeps, &[&required.join(" "), &pkg.pkgmgr]),
-    ));
-  }
-
-  if !optional.is_empty() {
-    app.log_warn(tr(Key::PicaSkipsOptional, &[&pkg.pkgmgr, &optional.join(" ")]));
-  }
-
-  Ok(())
-}
-
 pub(super) fn validate_package(
   app: &mut App,
   manifest: &Manifest,
@@ -376,8 +382,6 @@ pub(super) fn validate_package(
   }
 
   check_package_arch(app, pkg)?;
-
-  check_resolvable_dependencies(app, manifest, pkg)?;
 
   // `pkgmgr` is validated while resolving the backend; re-checking it here would
   // duplicate the rule in two places and let them drift.
@@ -422,4 +426,69 @@ pub(super) fn validate_package(
   // sides.
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{DeclaredDeps, declared};
+  use pica_pkg_core::manifest::Manifest;
+
+  fn manifest(text: &str) -> Manifest {
+    Manifest::from_text(text).expect("manifest parses")
+  }
+
+  /// A pica artifact can only say what it needs (`@pica`); the version a manager
+  /// has to provide lives in that manager's scope. Both are read, or a bound is
+  /// impossible to write for an artifact whose backend is not the one installing.
+  #[test]
+  fn both_scopes_are_read_and_the_executor_bound_survives() {
+    let manifest = manifest("base@pica = ca-bundle\nbase@opkg = ca-bundle>=20230311\n");
+
+    let deps = DeclaredDeps::parse(&manifest, "pica", Some("opkg"), &[]).expect("parses");
+    assert_eq!(deps.base.len(), 1, "one dependency, not two: {:?}", deps.base);
+    assert_eq!(deps.base[0].name, "ca-bundle");
+    assert_eq!(
+      deps.base[0].requirement(),
+      ">=20230311",
+      "the executor's bound must win the name, or the version is lost"
+    );
+
+    // The same artifact on an apk host: `@apk` was never written, so the pica
+    // scope is all there is — the bound is absent, not transferred.
+    let deps = DeclaredDeps::parse(&manifest, "pica", Some("apk"), &[]).expect("parses");
+    assert_eq!(deps.base.len(), 1);
+    assert_eq!(deps.base[0].requirement(), "");
+  }
+
+  #[test]
+  fn a_manifest_with_no_scope_reads_the_bare_key() {
+    let manifest = manifest("base = ca-bundle\n");
+
+    for from in [None, Some("opkg"), Some("apk")] {
+      assert_eq!(
+        declared(&manifest, "base", "pica", from),
+        vec!["ca-bundle".to_string()],
+        "from={from:?}"
+      );
+    }
+  }
+
+  /// An `opkg` artifact is not reading a second scope at all: its backend is the
+  /// executor, so the merge is a no-op and the old lookup stands.
+  #[test]
+  fn an_artifact_whose_backend_is_the_executor_reads_one_scope() {
+    let manifest = manifest("base@pica = ca-bundle\nbase@opkg = ca-bundle>=1\n");
+
+    assert_eq!(declared(&manifest, "base", "opkg", Some("opkg")), vec!["ca-bundle>=1".to_string()]);
+  }
+
+  /// `base@opkg =` is "nothing from opkg", not "forget what pica asked for".
+  #[test]
+  fn an_empty_executor_scope_does_not_erase_the_artifact_scope() {
+    let manifest = manifest("base@pica = ca-bundle\nbase@opkg =\n");
+
+    let deps = DeclaredDeps::parse(&manifest, "pica", Some("opkg"), &[]).expect("parses");
+    assert_eq!(deps.base.len(), 1);
+    assert_eq!(deps.base[0].name, "ca-bundle");
+  }
 }
