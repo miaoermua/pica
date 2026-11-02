@@ -74,12 +74,14 @@ jobs:
             toolchain_url: ""
             toolchain_sha256: ""
             linker: ""
+            pack: true
           - target: aarch64-unknown-linux-musl
             arch: arm64
             toolchain: stable
             toolchain_url: ""
             toolchain_sha256: ""
             linker: ""
+            pack: true
           # Little-endian MIPS32r2, soft-float: ramips (mt7621/mt7628) and the
           # other mipsel_24kc routers. A tier-3 target since Rust 1.72, so it
           # has no prebuilt std: nightly builds one from rust-src.
@@ -97,6 +99,11 @@ jobs:
             toolchain_url: "https://downloads.openwrt.org/releases/25.12.6/targets/ramips/mt7621/openwrt-toolchain-25.12.6-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
             toolchain_sha256: "0521891369a3f9f8d85b35ef99e84fd533f7e6f1835a96b0f09d2b98d9d08946"
             linker: mipsel-openwrt-linux-musl-gcc
+            # Only `pica`. Packing on a 24kc router means building multi-megabyte
+            # archives with a soft-float CPU and a few dozen megabytes of RAM
+            # left, so the binary is published and pica-pack is not: whoever has
+            # to pack for mipsel does it on a cross host, not on the device.
+            pack: false
 
     steps:
       - name: Checkout
@@ -209,8 +216,10 @@ jobs:
           STAGING_DIR: ${{ runner.temp }}/staging
         run: |
           set -eu
-          args=(--release --target "${{ matrix.target }}"
-                -p pica-pkg-cli -p pica-pkg-pack ${{ matrix.build_std }})
+          args=(--release --target "${{ matrix.target }}" -p pica-pkg-cli ${{ matrix.build_std }})
+          if [ "${{ matrix.pack }}" = "true" ]; then
+            args+=(-p pica-pkg-pack)
+          fi
 
           if [ "${{ matrix.toolchain_url }}" != "" ]; then
             triple=$(printf '%s' "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
@@ -235,7 +244,9 @@ jobs:
           arch="${{ matrix.arch }}"
 
           cp "target/${{ matrix.target }}/release/pica" "dist/pica.${arch}"
-          cp "target/${{ matrix.target }}/release/pica-pack" "dist/pica-pack.${arch}"
+          if [ "${{ matrix.pack }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/pica-pack" "dist/pica-pack.${arch}"
+          fi
           echo "arch=${arch}" >> "$GITHUB_OUTPUT"
 
       - name: Upload pica artifact
@@ -245,6 +256,7 @@ jobs:
           path: dist/pica.${{ steps.prepare_artifacts.outputs.arch }}
 
       - name: Upload pica-pack artifact
+        if: matrix.pack == true
         uses: actions/upload-artifact@v4
         with:
           name: pica-pack.${{ steps.prepare_artifacts.outputs.arch }}

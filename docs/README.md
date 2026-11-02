@@ -8,4 +8,4 @@
 | [standard.md](./standard.md)         | 打包者、源维护者 | 包格式与索引协议（权威） |
 | [developer.md](./developer.md)       | 开发者           | 内部机制                 |
 
-社区规范见 [CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md)。
+社区规范见 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。

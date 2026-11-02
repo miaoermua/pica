@@ -12,6 +12,32 @@ Pica 喜鹊是一款紧凑的 OpenWrt 包管理器。
 
 Pica 简单紧凑而不落后，借鉴 Arch 系包管理器的滚动更新机制，在不同 OpenWrt 分支上提供一致的包管理体验。
 
+## 安装
+
+设备上执行（需要 root，或者用 `--dir` 装到别处）：
+
+```sh
+wget -O /tmp/pica-installer.sh https://raw.githubusercontent.com/miaoermua/pica/main/installer.sh
+sh /tmp/pica-installer.sh
+```
+
+脚本按 `opkg print-architecture` → `apk --print-arch` → `uname -m` 的顺序判定架构，下载对应的
+`pica.amd64` / `pica.arm64` / `pica.mipsel`，确认是 ELF 后原子替换到 `/usr/bin/pica`，最后提示
+执行 `pica setup` 配置软件源。
+
+```sh
+sh installer.sh --version v0.4.7                 # 装指定版本
+sh installer.sh --mirror https://gh-proxy.org/   # 走镜像下载
+sh installer.sh --dir /tmp/pica --dry-run        # 只看会做什么
+sh installer.sh --uninstall                      # 移除二进制，保留配置与记账
+```
+
+也可以手动装：从 [Releases](https://github.com/miaoermua/pica/releases) 下 `pica.<arch>`，
+`chmod +x` 后放进 `/usr/bin`。`pica-pack` 只提供 amd64 与 arm64 两个架构——24kc 软浮点路由器上
+打包没有实用价值，需要为 mipsel 打包时在交叉编译机上做。
+
+运行需要 `tar` 和一个下载器（`curl` / `wget` / `uclient-fetch`）。
+
 ## 特性
 
 > 说明：目前版本可用但部分内容还没固定下方案，随时可能破坏性更新覆盖且不兼容旧版方案，请勿用于生产环境。
