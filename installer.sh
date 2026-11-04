@@ -145,9 +145,18 @@ fetch() {
 
 # A 200 from a captive portal or a proxy error page is still a file; only the
 # ELF magic says the download is the binary that was asked for.
+#
+# Read with `head` and matched by the shell, not hex-dumped: BusyBox builds drop
+# `od` as readily as they keep it, and an installer that needs a tool the device
+# may not have fails after the download instead of before it. `?ELF` is exactly
+# four characters — the first is 0x7f, which glob matches as `?`, and `head -c`
+# hands the bytes through untouched.
 is_elf() {
-  magic=$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-  [ "$magic" = "7f454c46" ]
+  magic=$(head -c 4 "$1" 2>/dev/null)
+  case "$magic" in
+    ?ELF) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 if [ "$UNINSTALL" = 1 ]; then
