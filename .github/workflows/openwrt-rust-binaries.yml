@@ -42,7 +42,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check Markdown formatting
-        uses: dprint/check@v2.3
+        uses: dprint/check@v2.6
 
   test:
     name: test (workspace)
