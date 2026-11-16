@@ -128,7 +128,7 @@ jobs:
       # build never touches the network and a mirror outage only costs one run.
       - name: Cache the musl cross toolchain
         if: matrix.toolchain_url != ''
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/toolchain
           key: pica-toolchain-${{ matrix.target }}-${{ matrix.toolchain_sha256 }}
