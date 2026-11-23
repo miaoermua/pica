@@ -250,14 +250,14 @@ jobs:
           echo "arch=${arch}" >> "$GITHUB_OUTPUT"
 
       - name: Upload pica artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pica.${{ steps.prepare_artifacts.outputs.arch }}
           path: dist/pica.${{ steps.prepare_artifacts.outputs.arch }}
 
       - name: Upload pica-pack artifact
         if: matrix.pack == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pica-pack.${{ steps.prepare_artifacts.outputs.arch }}
           path: dist/pica-pack.${{ steps.prepare_artifacts.outputs.arch }}
